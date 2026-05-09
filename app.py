@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V9.1 - Clean Signal Engine Fixed Export", layout="wide")
-APP_VERSION = "V9.1"
+st.set_page_config(page_title="SwingHunter V9.2 - Banked Signal Engine", layout="wide")
+APP_VERSION = "V9.2"
 
 # ==========================================================
 # 1. Security
@@ -43,6 +43,7 @@ MOMENTUM_TICKERS = {
 }
 
 NOTIONAL_PER_TRADE = 1000.0
+DEFAULT_STARTING_BANK = 50000.0
 
 
 # ==========================================================
@@ -245,9 +246,26 @@ def evaluate_candidate(
                 order_type = "BUY STOP LIMIT"
                 setup = "Near Resistance Breakout"
 
-        # 2) Shallow pullback in leader
-        if order_type is None and last_p > ema21 and (last_p / ema8 - 1) < 0.035:
-            base = ema8 if rs5 > params.rs5_min else ema21
+        # 2) Pullback in a confirmed leader.
+        # V9.2: do NOT remove TSLA/COIN/etc. Instead, make pullbacks higher-quality:
+        # trend must be orderly, relative strength meaningful, and not a falling knife.
+        higher_low_3 = False
+        try:
+            higher_low_3 = bool(l.iloc[-1] > l.iloc[-2] > l.iloc[-3])
+        except Exception:
+            higher_low_3 = False
+
+        pullback_quality_ok = (
+            last_p > ema8 > ema21
+            and rs20 > max(params.rs20_min, 5)
+            and rs5 > -2
+            and 45 <= rsi <= 74
+            and run20 <= 30
+            and higher_low_3
+        )
+
+        if order_type is None and pullback_quality_ok and (last_p / ema8 - 1) < 0.025:
+            base = ema8
             entry = min(round(base * 1.003, 2), round(last_p * 0.995, 2))
             if last_p > entry:
                 order_type = "BUY LIMIT"
@@ -368,8 +386,17 @@ def run_clean_signal_backtest(
     data: pd.DataFrame,
     months: int,
     params: StrategyParams,
+    starting_bank: float = DEFAULT_STARTING_BANK,
     diagnostics_top_n: int = 20
 ):
+    """
+    Banked signal test:
+    - Every new trade uses $1,000 from the bank.
+    - If the bank does not have $1,000 available, no new position is opened.
+    - When a position closes, $1,000 + PnL returns to the bank.
+    - No adding to a ticker that is already open.
+    - Sell always closes 100% of the position.
+    """
     prices = get_panel(data, "Close")
     highs = get_panel(data, "High")
     lows = get_panel(data, "Low")
@@ -379,18 +406,29 @@ def run_clean_signal_backtest(
     start_idx = max(220, len(prices) - requested_days)
     end_idx = len(prices) - 1
 
+    cash_bank = float(starting_bank)
     open_positions = {}  # ticker -> position
     pending_orders = {}  # ticker -> candidate from yesterday
 
     trade_log = []
-    equity_curve = []
-    dates = []
+    equity_rows = []
     pending_created = 0
     pending_filled = 0
     pending_expired = 0
+    pending_rejected_no_cash = 0
     next_trade_id = 1
+    turnover = 0.0
+    max_open_positions = 0
 
-    cumulative_pnl = 0.0
+    def current_open_value(i):
+        value = 0.0
+        for ticker, pos in open_positions.items():
+            try:
+                close_p = float(prices[ticker].iloc[i])
+                value += NOTIONAL_PER_TRADE * (close_p / pos["entry"])
+            except Exception:
+                value += NOTIONAL_PER_TRADE
+        return value
 
     for i in range(start_idx, end_idx):
         date = prices.index[i]
@@ -402,6 +440,11 @@ def run_clean_signal_backtest(
         processed = set()
         for ticker, order in list(pending_orders.items()):
             if ticker in open_positions:
+                processed.add(ticker)
+                continue
+
+            if cash_bank < NOTIONAL_PER_TRADE:
+                pending_rejected_no_cash += 1
                 processed.add(ticker)
                 continue
 
@@ -420,6 +463,9 @@ def run_clean_signal_backtest(
             fill_price = execute_pending_order(order, open_p, high_p, low_p)
 
             if fill_price is not None:
+                cash_bank -= NOTIONAL_PER_TRADE
+                turnover += NOTIONAL_PER_TRADE
+
                 open_positions[ticker] = {
                     "trade_id": next_trade_id,
                     "ticker": ticker,
@@ -433,7 +479,6 @@ def run_clean_signal_backtest(
                     "risk_pct": (fill_price - order["stop"]) / fill_price * 100,
                     "target_pct": (order["target"] / fill_price - 1) * 100,
                     "score": order["score"],
-                    "max_close": fill_price
                 }
                 pending_filled += 1
                 next_trade_id += 1
@@ -481,7 +526,7 @@ def run_clean_signal_backtest(
             if exit_reason and exit_price:
                 ret_pct = (exit_price / pos["entry"] - 1) * 100
                 pnl = NOTIONAL_PER_TRADE * ret_pct / 100
-                cumulative_pnl += pnl
+                cash_bank += NOTIONAL_PER_TRADE + pnl
 
                 # QQQ benchmark for same holding window
                 try:
@@ -518,19 +563,22 @@ def run_clean_signal_backtest(
             open_positions.pop(ticker, None)
 
         # ----------------------------------------------
-        # 3) Equity curve = closed PnL + mark-to-market open positions
+        # 3) Bank equity curve
         # ----------------------------------------------
-        open_unrealized = 0.0
-        for ticker, pos in open_positions.items():
-            try:
-                close_p = float(prices[ticker].iloc[i])
-                ret_pct = (close_p / pos["entry"] - 1) * 100
-                open_unrealized += NOTIONAL_PER_TRADE * ret_pct / 100
-            except Exception:
-                pass
+        open_value = current_open_value(i)
+        total_equity = cash_bank + open_value
+        open_capital = len(open_positions) * NOTIONAL_PER_TRADE
+        max_open_positions = max(max_open_positions, len(open_positions))
 
-        equity_curve.append(cumulative_pnl + open_unrealized)
-        dates.append(date_str)
+        equity_rows.append({
+            "Date": date_str,
+            "Cash Bank": cash_bank,
+            "Open Value": open_value,
+            "Total Equity": total_equity,
+            "Open Positions": len(open_positions),
+            "Open Capital": open_capital,
+            "Exposure %": (open_value / total_equity * 100) if total_equity > 0 else 0
+        })
 
         # ----------------------------------------------
         # 4) Generate next-day orders
@@ -556,13 +604,14 @@ def run_clean_signal_backtest(
             except Exception:
                 continue
 
-        # Unlimited $1000 signals are allowed, but we still rank and avoid junk.
-        # Each ticker can have only one open position.
+        # Rank candidates, then create as many pending orders as bank can realistically support.
         candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
 
-        for cand in candidates:
-            pending_orders[cand["ticker"]] = cand
-            pending_created += 1
+        available_slots = int(cash_bank // NOTIONAL_PER_TRADE) - len(pending_orders)
+        if available_slots > 0:
+            for cand in candidates[:available_slots]:
+                pending_orders[cand["ticker"]] = cand
+                pending_created += 1
 
     # Final close of any remaining positions
     final_date = prices.index[end_idx].strftime("%Y-%m-%d")
@@ -571,7 +620,7 @@ def run_clean_signal_backtest(
             final_close = float(prices[ticker].iloc[end_idx])
             ret_pct = (final_close / pos["entry"] - 1) * 100
             pnl = NOTIONAL_PER_TRADE * ret_pct / 100
-            cumulative_pnl += pnl
+            cash_bank += NOTIONAL_PER_TRADE + pnl
 
             try:
                 q_entry = float(prices["QQQ"].loc[pd.to_datetime(pos["entry_date"])])
@@ -604,7 +653,16 @@ def run_clean_signal_backtest(
             pass
 
     df_trades = pd.DataFrame(trade_log)
-    df_equity = pd.DataFrame({"Date": dates, "Signal Equity PnL": equity_curve}).set_index("Date")
+    df_equity = pd.DataFrame(equity_rows).set_index("Date") if equity_rows else pd.DataFrame()
+
+    if not df_equity.empty:
+        # After final liquidation, add final point.
+        df_equity.loc[final_date, "Cash Bank"] = cash_bank
+        df_equity.loc[final_date, "Open Value"] = 0.0
+        df_equity.loc[final_date, "Total Equity"] = cash_bank
+        df_equity.loc[final_date, "Open Positions"] = 0
+        df_equity.loc[final_date, "Open Capital"] = 0
+        df_equity.loc[final_date, "Exposure %"] = 0.0
 
     if not df_trades.empty:
         wins = int((df_trades["PnL $1000"] > 0).sum())
@@ -624,20 +682,28 @@ def run_clean_signal_backtest(
 
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
     win_rate = wins / max(1, wins + losses) * 100
+    ending_bank = cash_bank
+    roi = (ending_bank / starting_bank - 1) * 100 if starting_bank else 0
 
     if not df_equity.empty:
-        running_max = df_equity["Signal Equity PnL"].cummax()
-        drawdown = df_equity["Signal Equity PnL"] - running_max
-        max_dd_dollars = float(drawdown.min())
+        running_max = df_equity["Total Equity"].cummax()
+        drawdown_pct = (df_equity["Total Equity"] / running_max - 1) * 100
+        max_dd_pct = float(drawdown_pct.min())
+        avg_exposure_pct = float(df_equity["Exposure %"].mean())
     else:
-        max_dd_dollars = 0.0
+        max_dd_pct = 0.0
+        avg_exposure_pct = 0.0
 
-    # QQQ buy-and-hold for period
+    # QQQ buy-and-hold on starting bank for period
     try:
         q = prices["QQQ"].iloc[start_idx:end_idx].dropna()
-        qqq_buyhold = (float(q.iloc[-1]) / float(q.iloc[0]) - 1) * 100 if len(q) > 1 else np.nan
+        qqq_buyhold_pct = (float(q.iloc[-1]) / float(q.iloc[0]) - 1) * 100 if len(q) > 1 else np.nan
+        qqq_buyhold_value = starting_bank * (1 + qqq_buyhold_pct / 100)
+        qqq_buyhold_pnl = qqq_buyhold_value - starting_bank
     except Exception:
-        qqq_buyhold = np.nan
+        qqq_buyhold_pct = np.nan
+        qqq_buyhold_value = np.nan
+        qqq_buyhold_pnl = np.nan
 
     # Ticker summary
     if not df_trades.empty:
@@ -658,44 +724,40 @@ def run_clean_signal_backtest(
     else:
         ticker_summary = pd.DataFrame()
 
-    total_notional = len(df_trades) * NOTIONAL_PER_TRADE
-    signal_return_on_allocated = (total_pnl / total_notional * 100) if total_notional else 0.0
-    qqq_same_windows_return_on_allocated = (qqq_same_window_pnl / total_notional * 100) if total_notional else 0.0
-    edge_vs_qqq_pnl = total_pnl - qqq_same_window_pnl
-    edge_vs_qqq_pct = signal_return_on_allocated - qqq_same_windows_return_on_allocated
-
     metrics = {
         "App Version": APP_VERSION,
         "Months": months,
-        "Notional Per Signal": NOTIONAL_PER_TRADE,
-        "Total Notional Tested": round(total_notional, 2),
+        "Starting Bank": round(starting_bank, 2),
+        "Ending Bank": round(ending_bank, 2),
+        "Bank ROI %": round(roi, 2),
+        "Trade Size": NOTIONAL_PER_TRADE,
         "Max Risk %": params.max_risk_pct,
         "Target %": params.target_pct,
         "Trades": len(df_trades),
         "Wins": wins,
         "Losses": losses,
         "Win Rate %": round(win_rate, 2),
-        "Total PnL $1000 Signals": round(total_pnl, 2),
-        "Signal Return on Allocated Capital %": round(signal_return_on_allocated, 2),
+        "Total PnL": round(total_pnl, 2),
         "Average Trade Return %": round(avg_return, 2),
         "Average Win %": round(avg_win, 2),
         "Average Loss %": round(avg_loss, 2),
         "Profit Factor": round(profit_factor, 2) if np.isfinite(profit_factor) else "∞",
-        "Max Drawdown $": round(max_dd_dollars, 2),
-        "QQQ Buy & Hold %": round(qqq_buyhold, 2) if np.isfinite(qqq_buyhold) else "",
+        "Max Drawdown %": round(max_dd_pct, 2),
+        "Average Exposure %": round(avg_exposure_pct, 2),
+        "Max Open Positions": max_open_positions,
+        "Turnover": round(turnover, 2),
+        "QQQ Buy & Hold %": round(qqq_buyhold_pct, 2) if np.isfinite(qqq_buyhold_pct) else "",
+        "QQQ Buy & Hold Ending Value": round(qqq_buyhold_value, 2) if np.isfinite(qqq_buyhold_value) else "",
+        "QQQ Buy & Hold PnL": round(qqq_buyhold_pnl, 2) if np.isfinite(qqq_buyhold_pnl) else "",
         "QQQ Same Windows PnL": round(qqq_same_window_pnl, 2),
-        "QQQ Same Windows Return on Allocated Capital %": round(qqq_same_windows_return_on_allocated, 2),
         "QQQ Same Windows Avg %": round(qqq_same_window_avg, 2),
-        "Edge vs QQQ Same Windows PnL": round(edge_vs_qqq_pnl, 2),
-        "Edge vs QQQ Same Windows %": round(edge_vs_qqq_pct, 2),
         "Pending Orders Created": pending_created,
         "Pending Orders Filled": pending_filled,
         "Pending Orders Expired": pending_expired,
+        "Pending Rejected No Cash": pending_rejected_no_cash,
     }
 
     return df_equity, df_trades, ticker_summary, metrics
-
-
 # ==========================================================
 # 7. Live Daily Dashboard
 # ==========================================================
@@ -791,14 +853,15 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V9.1 — Clean Signal Engine Fixed Export</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V9.2 — Banked Signal Engine</h1>", unsafe_allow_html=True)
     st.info(
-        "V9 בודקת איתותים נקיים: כל כניסה היא $1,000 תאורטי, אין קופה ואין גודל פוזיציה. "
-        "אי אפשר להיכנס שוב לאותו טיקר בזמן שהוא כבר פתוח. כל יציאה מוכרת 100%."
+        "V9.2 בודקת בצורה שיותר דומה למה שתיארת: יש בנק, כל כניסה משתמשת ב-$1,000, "
+        "אם אין כסף פנוי לא נכנסים, לא מוסיפים למניה שכבר פתוחה, ובמכירה כל הכסף חוזר לבנק."
     )
 
     st.sidebar.header("הגדרות קצרות")
     months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 24, 12)
+    starting_bank = st.sidebar.number_input("בנק התחלתי ($)", value=50000, step=5000)
     max_risk_pct = st.sidebar.slider("סיכון מקסימלי לעסקה (%)", 4.0, 15.0, 9.5, 0.5)
     target_pct = st.sidebar.slider("יעד רווח לעסקה (%)", 6.0, 18.0, 10.0, 0.5)
 
@@ -833,7 +896,7 @@ else:
 
     with tab_backtest:
         st.markdown(
-            f"### 🧪 Signal Backtest — {months} חודשים — $1,000 תאורטי לכל איתות"
+            f"### 🧪 Banked Signal Backtest — {months} חודשים — בנק ${starting_bank:,.0f} — $1,000 לכל כניסה"
         )
 
         if st.button("⚙️ הרץ בדיקת איתותים", type="primary"):
@@ -842,28 +905,29 @@ else:
                 df_equity, df_trades, ticker_summary, metrics = run_clean_signal_backtest(
                     data,
                     months,
-                    params
+                    params,
+                    starting_bank=float(starting_bank)
                 )
 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total PnL", f"${metrics['Total PnL $1000 Signals']:,.0f}")
-                c2.metric("Signal Return", f"{metrics['Signal Return on Allocated Capital %']:.2f}%")
+                c1.metric("בנק סופי", f"${metrics['Ending Bank']:,.0f}", f"{metrics['Bank ROI %']:.2f}%")
+                c2.metric("Total PnL", f"${metrics['Total PnL']:,.0f}")
                 c3.metric("Profit Factor", metrics["Profit Factor"])
                 c4.metric("Win Rate", f"{metrics['Win Rate %']:.1f}%")
 
                 c5, c6, c7, c8 = st.columns(4)
                 c5.metric("Trades", metrics["Trades"])
                 c6.metric("Avg Win / Loss", f"{metrics['Average Win %']:.2f}% / {metrics['Average Loss %']:.2f}%")
-                c7.metric("Edge vs QQQ same windows", f"${metrics['Edge vs QQQ Same Windows PnL']:,.0f}", f"{metrics['Edge vs QQQ Same Windows %']:.2f}%")
-                c8.metric("QQQ Buy&Hold", f"{metrics['QQQ Buy & Hold %']}%")
+                c7.metric("Max Drawdown", f"{metrics['Max Drawdown %']:.2f}%")
+                c8.metric("QQQ Buy&Hold", f"{metrics['QQQ Buy & Hold %']}%", f"${metrics['QQQ Buy & Hold PnL']:,.0f}")
 
                 st.caption(
-                    f"בדיקה מנורמלת: {metrics['Trades']} עסקאות × $1,000 = "
-                    f"${metrics['Total Notional Tested']:,.0f} חשיפה תאורטית מצטברת. "
-                    f"QQQ באותם חלונות עשה {metrics['QQQ Same Windows Return on Allocated Capital %']:.2f}%."
+                    f"מודל בנק: מתחילים עם ${metrics['Starting Bank']:,.0f}. "
+                    f"כל עסקה משתמשת ב-$1,000 בלבד. כשהיא נמכרת, $1,000 + רווח/הפסד חוזר לבנק. "
+                    f"Turnover מצטבר: ${metrics['Turnover']:,.0f}. חשיפה ממוצעת: {metrics['Average Exposure %']:.1f}%."
                 )
 
-                st.markdown("#### 📈 Signal Equity Curve")
+                st.markdown("#### 📈 Bank Equity Curve")
                 st.line_chart(df_equity)
 
                 zip_bytes = build_zip_report(df_equity, df_trades, ticker_summary, metrics)
