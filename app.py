@@ -10,7 +10,9 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V7.2 - Diagnostics 7/12", layout="wide")
+st.set_page_config(page_title="SwingHunter V7.4 - Leader Recovery + Smarter Diagnostics", layout="wide")
+
+APP_VERSION = "V7.4"
 
 # ==========================================================
 # 1. Security + Settings
@@ -32,6 +34,11 @@ WATCHLIST = [
     'PYPL','AFRM','SHOP','BABA','MELI','WMT','TGT','COST','HD','UBER','ABNB','SPOT',
     'DKNG','DIS','NKE','SBUX','MCD','JPM','BAC','GS','MS','V','MA','LLY','NVO','UNH','CAT','BA','MRNA'
 ]
+
+MOMENTUM_TICKERS = {
+    'AMD','NVDA','TSLA','DDOG','NET','QCOM','CRWD','PANW','AVGO','AMZN',
+    'MSTR','COIN','SMCI','PLTR','ARM','MU','MRVL','TSM','META','GOOGL'
+}
 
 HISTORY_FILE = "swinghunter_history.csv"
 
@@ -58,6 +65,11 @@ class StrategyParams:
     tp1_fraction: float
     runner_target_pct: float
     use_trailing_runner: bool
+    min_atr_pct: float
+    momentum_bonus: int
+    allow_leader_recovery: bool
+    leader_recovery_rs20_min: float
+    leader_recovery_20d_min: float
     max_positions_default: int
 
 
@@ -82,6 +94,11 @@ def get_params(mode: str) -> StrategyParams:
             tp1_fraction=0.50,
             runner_target_pct=0.12,
             use_trailing_runner=True,
+            min_atr_pct=1.8,
+            momentum_bonus=5,
+            allow_leader_recovery=False,
+            leader_recovery_rs20_min=12.0,
+            leader_recovery_20d_min=10.0,
             max_positions_default=4,
         )
 
@@ -105,11 +122,15 @@ def get_params(mode: str) -> StrategyParams:
             tp1_fraction=0.50,
             runner_target_pct=0.12,
             use_trailing_runner=True,
+            min_atr_pct=1.2,
+            momentum_bonus=12,
+            allow_leader_recovery=True,
+            leader_recovery_rs20_min=6.0,
+            leader_recovery_20d_min=5.0,
             max_positions_default=7,
         )
 
-    # V7.1 change: Balanced is now truly active, not pseudo-conservative.
-    # TP1 lowered to 7%, runner lowered to 15%, entry thresholds relaxed.
+    # V7.4: Balanced keeps 7/12 exits, adds Leader Recovery, weighted R/R, ATR filter, and richer diagnostics.
     return StrategyParams(
         mode="Balanced",
         armed_threshold=68,
@@ -117,8 +138,8 @@ def get_params(mode: str) -> StrategyParams:
         building_threshold=38,
         min_rr=1.20,
         max_risk_pct=9.0,
-        allow_bear_market_orders=True,
-        bear_market_min_edge=50,
+        allow_bear_market_orders=True,  # Controlled: orders in BEAR only if Edge Score is strong enough
+        bear_market_min_edge=60,
         rs5_min=1.2,
         rs20_min=3.5,
         overbought_rsi=82,
@@ -127,10 +148,27 @@ def get_params(mode: str) -> StrategyParams:
         stop_atr_pullback=1.9,
         tp1_pct=0.07,
         tp1_fraction=0.50,
-        runner_target_pct=0.15,
+        runner_target_pct=0.12,
         use_trailing_runner=True,
+        min_atr_pct=1.4,
+        momentum_bonus=10,
+        allow_leader_recovery=True,
+        leader_recovery_rs20_min=8.0,
+        leader_recovery_20d_min=6.0,
         max_positions_default=6,
     )
+
+
+def weighted_reward_pct(params: StrategyParams) -> float:
+    """Expected reward percentage based on partial TP1 + runner target."""
+    return params.tp1_pct * params.tp1_fraction + params.runner_target_pct * (1 - params.tp1_fraction)
+
+
+def calc_rr_from_weighted_reward(entry: float, stop: float, params: StrategyParams) -> float:
+    risk = entry - stop
+    if risk <= 0:
+        return 0.0
+    return (entry * weighted_reward_pct(params)) / risk
 
 # ==========================================================
 # 3. Utility Functions
@@ -351,13 +389,28 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
     watch_days, score_trend = get_setup_persistence(ticker)
     earn_status, earn_days = get_earnings_status(ticker)
 
+    atr_pct = (atr_val / last_price) * 100 if last_price else np.nan
+
+    leader_recovery = (
+        params.allow_leader_recovery
+        and last_price < sma200
+        and rs_20d > params.leader_recovery_rs20_min
+        and change_20d > params.leader_recovery_20d_min
+        and last_price > ema8
+        and last_price > ema21
+    )
+
     setup_score = 0
     if last_price > sma200:
         setup_score += 15
+    elif leader_recovery:
+        setup_score += 12  # recovery leaders are allowed even below SMA200
     if last_price > ema21:
         setup_score += 10
     if dist_to_res < 4.5:
         setup_score += 15
+    if ticker in MOMENTUM_TICKERS:
+        setup_score += params.momentum_bonus
 
     edge_score = 0
     edge_notes = []
@@ -378,16 +431,21 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
     if watch_days >= 2 and score_trend > 0:
         edge_score += 15
         edge_notes.append("Building Pressure")
+    if leader_recovery:
+        edge_score += 25
+        edge_notes.append("Leader Recovery")
 
     final_rank = setup_score + edge_score
     setup_type = "No Setup"
 
     if earn_status == "DANGER":
         icon, decision, reject_reason, final_rank = "⚠️", "DANGER", f"דוח קרוב בעוד {earn_days} ימים", 0
-    elif rsi_val > params.overbought_rsi or change_20d > params.max_20d_run:
+    elif (rsi_val > params.overbought_rsi or change_20d > params.max_20d_run) and not leader_recovery:
         icon, decision, reject_reason, final_rank = "🔥", "חם מדי", "מתוח מדי / סכנת רדיפה", min(final_rank, 30)
     elif market_trend == "BEAR" and (not params.allow_bear_market_orders or edge_score < params.bear_market_min_edge):
         icon, decision, reject_reason, final_rank = "🔴", "Dormant", "Market BEAR + Edge לא מספיק", min(final_rank, 40)
+    elif atr_pct < params.min_atr_pct and ticker not in MOMENTUM_TICKERS and edge_score < 35:
+        icon, decision, reject_reason, final_rank = "🔴", "Dormant", f"ATR% נמוך מדי ({atr_pct:.1f}%)", min(final_rank, 40)
     elif final_rank >= params.armed_threshold and edge_notes:
         icon, decision = "🟢", "ARMED"
     elif final_rank >= params.actionable_threshold and edge_notes:
@@ -403,6 +461,8 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
         setup_type = "Failed Breakdown Recovery"
     elif drift:
         setup_type = "Post-Event Drift"
+    elif leader_recovery:
+        setup_type = "Leader Recovery"
     elif "RS Leader" in edge_notes and last_price > ema21:
         setup_type = "RS Pullback"
     elif last_price > res_20d:
@@ -426,6 +486,22 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
                 reject_reason = "כבר פרצה. לא רודפים."
                 icon, decision = "🟡", "Building Pressure"
 
+        elif setup_type == "Leader Recovery":
+            # Recovery leaders are allowed below SMA200 if RS is exceptional.
+            # Use shallow EMA8 pullback; if too extended, use a next-day stop above yesterday's high.
+            shallow_entry = round(min(ema8 * 1.003, last_price * 0.99), 2)
+            momentum_entry = round(prev_high * 1.002, 2)
+            if last_price > shallow_entry and (last_price / ema8 - 1) < 0.055:
+                entry = shallow_entry
+                p_type = "BUY LIMIT"
+                e_disp = f"{entry} (Leader Recovery EMA8 pullback)"
+            elif last_price < momentum_entry:
+                entry = momentum_entry
+                p_type = "BUY STOP LIMIT"
+                e_disp = f"Recovery stop {entry} / Lmt {round(entry * 1.006, 2)}"
+            else:
+                reject_reason = "Leader Recovery מתוחה מדי ללא נקודת כניסה נקייה"
+
         elif setup_type in ["Failed Breakdown Recovery", "RS Pullback"]:
             # Dynamic pullback: high-edge RS leaders can use EMA8 shallow pullback.
             if edge_score >= 55 and "RS Leader" in edge_notes:
@@ -446,7 +522,7 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
             trigger_plan = f"Buy Stop above trigger {round((res_20d if setup_type != 'Post-Event Drift' else event_high) * 1.002, 2)}"
 
         if p_type and entry > 0:
-            if setup_type in ["Pre-Breakout Compression", "Post-Event Drift", "Momentum Breakout"]:
+            if setup_type in ["Pre-Breakout Compression", "Post-Event Drift", "Momentum Breakout", "Leader Recovery"]:
                 stop = round(entry - params.stop_atr_breakout * atr_val, 2)
             elif setup_type == "Failed Breakdown Recovery":
                 stop = round(reclaimed_level * 0.985, 2)
@@ -456,7 +532,7 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
             risk_per_share = entry - stop
             if risk_per_share > 0:
                 risk_pct = risk_per_share / entry * 100
-                rr = (entry * params.tp1_pct) / risk_per_share
+                rr = calc_rr_from_weighted_reward(entry, stop, params)
                 if risk_pct <= params.max_risk_pct and rr >= params.min_rr:
                     shares = int(investment_budget / entry)
                     if shares > 0:
@@ -501,6 +577,8 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
             "RS (5D)": f"{round(rs_5d, 1)}%",
             "RS (20D)": f"{round(rs_20d, 1)}%",
             "RSI": int(rsi_val) if np.isfinite(rsi_val) else None,
+            "ATR%": f"{round(atr_pct, 1)}%",
+            "20D Run": f"{round(change_20d, 1)}%",
             "Trigger Plan": trigger_plan,
             "Edge Notes": " + ".join(edge_notes) if edge_notes else "None",
             "סיבת פסילה": reject_reason
@@ -531,6 +609,7 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
     blockers = Counter()
     orders_possible = 0
     leader_days = 0
+    leader_recovery_days = 0
     near_resistance_days = 0
     already_triggered_days = 0
     days_above_ema8 = 0
@@ -575,9 +654,7 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
             if last_p > ema21:
                 days_above_ema21 += 1
 
-            if last_p < sma200:
-                blockers["Below SMA200"] += 1
-                continue
+            below_sma200 = last_p < sma200
 
             spy_sma20 = spy_slice.rolling(20).mean().iloc[-1]
             market_bull = float(spy_slice.iloc[-1]) > float(spy_sma20)
@@ -601,14 +678,28 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
                 and last_p > ema8
                 and last_p > ema21
             )
+            leader_recovery = (
+                params.allow_leader_recovery
+                and below_sma200
+                and rs20 > params.leader_recovery_rs20_min
+                and chg20 > params.leader_recovery_20d_min
+                and last_p > ema8
+                and last_p > ema21
+            )
             if strong_leader:
                 leader_days += 1
+            if leader_recovery:
+                leader_recovery_days += 1
 
-            if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not strong_leader:
+            if below_sma200 and not leader_recovery:
+                blockers["Below SMA200"] += 1
+                continue
+
+            if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not (strong_leader or leader_recovery):
                 blockers["Overextended filter"] += 1
                 continue
 
-            if not edge_ok and not strong_leader:
+            if not edge_ok and not (strong_leader or leader_recovery):
                 blockers["Weak relative strength"] += 1
                 continue
 
@@ -624,6 +715,21 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
                 else:
                     already_triggered_days += 1
                     blockers["Already above breakout trigger"] += 1
+
+            elif leader_recovery:
+                # Leader Recovery: do not auto-reject below SMA200 when RS is exceptional.
+                shallow_entry = round(min(ema8 * 1.003, last_p * 0.99), 2)
+                momentum_entry = round(prev_hi * 1.002, 2)
+                if last_p > shallow_entry and (last_p / ema8 - 1) < 0.055:
+                    entry = shallow_entry
+                    stop = round(entry - params.stop_atr_breakout * atr, 2)
+                    possible = True
+                elif last_p < momentum_entry:
+                    entry = momentum_entry
+                    stop = round(entry - params.stop_atr_breakout * atr, 2)
+                    possible = True
+                else:
+                    blockers["Leader Recovery too extended / no clean entry"] += 1
 
             elif strong_leader:
                 # Leader Mode: shallow EMA8 pullback or stop above yesterday high.
@@ -657,7 +763,7 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
                     continue
                 risk = entry - stop
                 risk_pct = risk / entry * 100
-                rr = (entry * params.tp1_pct) / risk
+                rr = calc_rr_from_weighted_reward(entry, stop, params)
                 if risk_pct > params.max_risk_pct:
                     blockers[f"Risk too high"] += 1
                     continue
@@ -680,6 +786,7 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
         "Max RSI": round(max_rsi, 1),
         "Max 20D Run": round(max_20d_run, 1) if max_20d_run > -900 else None,
         "Leader Days": leader_days,
+        "Leader Recovery Days": leader_recovery_days,
         "Near Resistance Days": near_resistance_days,
         "Already Triggered Days": already_triggered_days,
         "Days > EMA8": days_above_ema8,
@@ -688,7 +795,7 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
 
 
 def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, params: StrategyParams, months: int,
-                            starting_capital: float = 10000.0, max_positions: int = 6):
+                            starting_capital: float = 10000.0, max_positions: int = 6, diagnostics_top_n: int = 20):
     prices = get_panel(data, "Close")
     highs = get_panel(data, "High")
     lows = get_panel(data, "Low")
@@ -869,23 +976,59 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
                 atr = float(pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
                 rsi = float(calc_rsi(c).iloc[-1])
                 chg20 = (last_p / c.iloc[-21] - 1) * 100
-                if last_p < sma200 or rsi > params.overbought_rsi or chg20 > params.max_20d_run:
-                    continue
-
                 common = c.index.intersection(spy_slice.index)
                 if len(common) < 21:
                     rs5, rs20 = 0.0, 0.0
                 else:
                     rs5, rs20 = relative_strength_vs_spy(c.loc[common], spy_slice.loc[common])
+
                 edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
+                leader_recovery = (
+                    params.allow_leader_recovery
+                    and last_p < sma200
+                    and rs20 > params.leader_recovery_rs20_min
+                    and chg20 > params.leader_recovery_20d_min
+                    and last_p > ema8
+                    and last_p > ema21
+                )
+                strong_leader = (
+                    rs20 > params.rs20_min + 2
+                    and chg20 > 10
+                    and last_p > ema8
+                    and last_p > ema21
+                    and last_p > sma200
+                )
+
+                if last_p < sma200 and not leader_recovery:
+                    continue
+                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not (strong_leader or leader_recovery):
+                    continue
+
+                atr_pct = atr / last_p * 100
+                if atr_pct < params.min_atr_pct and ticker not in MOMENTUM_TICKERS and not (strong_leader or leader_recovery):
+                    continue
+
                 dist_to_res = (res20 / last_p - 1)
 
                 order_type = None
                 entry_price = 0.0
                 stop = 0.0
 
+                # Leader Recovery: below SMA200 allowed only with exceptional RS and recovery momentum.
+                if leader_recovery:
+                    shallow_entry = round(min(ema8 * 1.003, last_p * 0.99), 2)
+                    momentum_entry = round(prev_hi * 1.002, 2)
+                    if last_p > shallow_entry and (last_p / ema8 - 1) < 0.055:
+                        order_type = "BUY LIMIT"
+                        entry_price = shallow_entry
+                        stop = round(entry_price - params.stop_atr_breakout * atr, 2)
+                    elif last_p < momentum_entry:
+                        order_type = "BUY STOP LIMIT"
+                        entry_price = momentum_entry
+                        stop = round(entry_price - params.stop_atr_breakout * atr, 2)
+
                 # Pre-breakout / near resistance
-                if edge_ok and 0 < dist_to_res < 0.045:
+                elif edge_ok and 0 < dist_to_res < 0.045:
                     entry_price = round(res20 * 1.002, 2)
                     if last_p < entry_price:
                         order_type = "BUY STOP LIMIT"
@@ -909,7 +1052,7 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
                 if order_type and entry_price > stop:
                     risk_per_share = entry_price - stop
                     risk_pct = risk_per_share / entry_price * 100
-                    rr = (entry_price * params.tp1_pct) / risk_per_share
+                    rr = calc_rr_from_weighted_reward(entry_price, stop, params)
                     shares = int(investment_per_trade / entry_price)
                     if shares > 0 and risk_pct <= params.max_risk_pct and rr >= params.min_rr and shares * entry_price <= cash:
                         pending_orders[ticker] = {"type": order_type, "price": entry_price, "stop": stop, "shares": shares}
@@ -952,7 +1095,7 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
                 if row["Traded?"] == "YES":
                     row["Likely Miss Reason"] = "Traded"
                 missed_rows.append(row)
-        df_missed = pd.DataFrame(missed_rows).sort_values(by="Return %", ascending=False).head(20)
+        df_missed = pd.DataFrame(missed_rows).sort_values(by="Return %", ascending=False).head(diagnostics_top_n)
     except Exception:
         df_missed = pd.DataFrame()
 
@@ -977,7 +1120,9 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.2 - Diagnostics 7/12</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.4 - Leader Recovery + Smarter Diagnostics</h1>", unsafe_allow_html=True)
+    st.info("גרסה זו משלבת Leader Recovery, R/R משוקלל לפי 7%/12%, קנס למניות איטיות, ודיאגנוסטיקה מורחבת למניות שפספסנו.")
+
     st.sidebar.header("ניהול כספי")
     investment_amount = st.sidebar.number_input("סכום קבוע להשקעה בכל עסקה ($)", value=1000, step=100)
     mode = st.sidebar.selectbox("מצב אסטרטגיה", ["Conservative", "Balanced", "Aggressive"], index=1)
