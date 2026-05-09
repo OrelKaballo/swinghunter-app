@@ -3,6 +3,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from collections import Counter
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -10,9 +11,9 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V7.6 - Backtest Integrity Fix", layout="wide")
+st.set_page_config(page_title="SwingHunter V7.8 - Portfolio Defaults", layout="wide")
 
-APP_VERSION = "V7.6"
+APP_VERSION = "V7.8"
 
 # ==========================================================
 # 1. Security + Settings
@@ -165,7 +166,7 @@ def get_params(mode: str) -> StrategyParams:
         leader_recovery_rs20_min=8.0,
         leader_recovery_20d_min=6.0,
         auto_trade_momentum_only=True,
-        risk_budget_default=150.0,
+        risk_budget_default=200.0,
         runner_trail_close_only=True,
         max_positions_default=5,
     )
@@ -828,7 +829,13 @@ def run_backtest_simulation(
     max_positions: int = 6,
     diagnostics_top_n: int = 20,
     slippage_pct: float = 0.001,
-    commission_per_fill: float = 0.0
+    commission_per_fill: float = 0.0,
+    sizing_mode: str = "Fixed Amount",
+    position_pct: float = 0.20,
+    max_exposure_pct: float = 0.80,
+    cooldown_after_exit_days: int = 10,
+    cooldown_after_loss_days: int = 15,
+    double_loss_freeze_days: int = 30
 ):
     """
     V7.6 Backtest Integrity Fix:
@@ -861,6 +868,10 @@ def run_backtest_simulation(
     orders_expired = 0
     orders_gap_rejected = 0
     next_trade_id = 1
+
+    # Anti-churn state: prevents repeated trading in the same noisy ticker.
+    cooldown_until = {}
+    recent_loss_dates = {}
 
     requested_test_days = int(months * 21.5)
     start_idx = max(220, len(prices) - requested_test_days)
@@ -897,6 +908,7 @@ def run_backtest_simulation(
         trade_log.append({
             "TradeID": pos["trade_id"],
             "Date": date_str,
+            "EntryDate": pos.get("entry_date", ""),
             "Ticker": ticker,
             "Exit": exit_label,
             "Setup": pos.get("setup", ""),
@@ -984,7 +996,8 @@ def run_backtest_simulation(
                     }
 
         # DAY orders that did not fill are cancelled.
-        orders_expired += max(0, len(pending_orders) - orders_executed)
+        # Count only today's unfilled pending orders, not cumulative executed orders.
+        orders_expired += len(pending_orders)
         pending_orders.clear()
 
         # --------------------------------------------------
@@ -1037,7 +1050,31 @@ def run_backtest_simulation(
                     closed.append(ticker)
 
         for ticker in closed:
-            positions.pop(ticker, None)
+            closed_pos = positions.pop(ticker, None)
+            if closed_pos is not None:
+                # Apply cooldown after every exit.
+                cd = cooldown_after_exit_days
+
+                # If total PnL for this trade is negative, extend cooldown.
+                try:
+                    trade_pnl = sum(
+                        row["PnL"] for row in trade_log
+                        if row.get("TradeID") == closed_pos.get("trade_id")
+                    )
+                except Exception:
+                    trade_pnl = 0
+
+                if trade_pnl < 0:
+                    cd = max(cd, cooldown_after_loss_days)
+                    recent_loss_dates.setdefault(ticker, []).append(i)
+                    recent_loss_dates[ticker] = [
+                        d for d in recent_loss_dates[ticker]
+                        if i - d <= 30
+                    ]
+                    if len(recent_loss_dates[ticker]) >= 2:
+                        cd = max(cd, double_loss_freeze_days)
+
+                cooldown_until[ticker] = max(cooldown_until.get(ticker, -1), i + cd)
 
         # --------------------------------------------------
         # 3. Equity curve
@@ -1066,10 +1103,13 @@ def run_backtest_simulation(
         # 4. Generate DAY orders for next day
         # --------------------------------------------------
         try:
-            spy_slice = prices["SPY"].iloc[i - 220:i + 1]
-            if len(spy_slice) < 220:
+            market_slice = prices["QQQ"].iloc[i - 220:i + 1] if "QQQ" in prices.columns else prices["SPY"].iloc[i - 220:i + 1]
+            if len(market_slice) < 220:
                 continue
-            market_bull = float(spy_slice.iloc[-1]) > float(spy_slice.rolling(20).mean().iloc[-1])
+            market_bull = float(market_slice.iloc[-1]) > float(market_slice.rolling(20).mean().iloc[-1])
+
+            # SPY is still used for relative-strength diagnostics to keep continuity.
+            spy_slice = prices["SPY"].iloc[i - 220:i + 1]
         except Exception:
             continue
 
@@ -1078,6 +1118,9 @@ def run_backtest_simulation(
 
         for ticker in WATCHLIST:
             if ticker in positions or ticker in pending_orders or len(positions) + len(pending_orders) >= max_positions:
+                continue
+
+            if i < cooldown_until.get(ticker, -1):
                 continue
 
             if params.auto_trade_momentum_only and ticker not in MOMENTUM_TICKERS:
@@ -1172,7 +1215,20 @@ def run_backtest_simulation(
                     risk_pct = risk_per_share / entry_price * 100
                     rr = calc_rr_from_weighted_reward(entry_price, stop, params)
 
-                    shares_by_cash = int(investment_per_trade / entry_price)
+                    # Position sizing:
+                    # Fixed Amount = original behavior.
+                    # Percent of Equity = portfolio mode, e.g. 20% of current equity per trade.
+                    current_equity = portfolio_value
+                    current_exposure = max(0.0, current_equity - cash)
+                    max_total_exposure = current_equity * max_exposure_pct
+                    available_exposure_budget = max(0.0, max_total_exposure - current_exposure)
+
+                    if sizing_mode == "Percent of Equity":
+                        cash_budget_for_trade = min(current_equity * position_pct, available_exposure_budget, cash)
+                    else:
+                        cash_budget_for_trade = min(investment_per_trade, available_exposure_budget if max_exposure_pct < 0.999 else investment_per_trade, cash)
+
+                    shares_by_cash = int(cash_budget_for_trade / entry_price)
                     shares_by_risk = int(risk_budget / risk_per_share)
                     shares = min(shares_by_cash, shares_by_risk)
 
@@ -1227,13 +1283,20 @@ def run_backtest_simulation(
             df_trades.groupby(["TradeID", "Ticker"], as_index=False)
             .agg(
                 TotalPnL=("PnL", "sum"),
-                FirstDate=("Date", "min"),
-                LastDate=("Date", "max"),
+                EntryDate=("EntryDate", "min"),
+                FirstExitDate=("Date", "min"),
+                LastExitDate=("Date", "max"),
                 Exits=("Exit", lambda x: ", ".join(map(str, x)))
             )
         )
+        try:
+            trade_summary["HoldingDays"] = (
+                pd.to_datetime(trade_summary["LastExitDate"]) - pd.to_datetime(trade_summary["EntryDate"])
+            ).dt.days
+        except Exception:
+            trade_summary["HoldingDays"] = None
     else:
-        trade_summary = pd.DataFrame(columns=["TradeID", "Ticker", "TotalPnL", "FirstDate", "LastDate", "Exits"])
+        trade_summary = pd.DataFrame(columns=["TradeID", "Ticker", "TotalPnL", "EntryDate", "FirstExitDate", "LastExitDate", "HoldingDays", "Exits"])
 
     gross_profit = float(trade_summary.loc[trade_summary["TotalPnL"] > 0, "TotalPnL"].sum()) if not trade_summary.empty else 0.0
     gross_loss = float(-trade_summary.loc[trade_summary["TotalPnL"] < 0, "TotalPnL"].sum()) if not trade_summary.empty else 0.0
@@ -1302,6 +1365,80 @@ def run_backtest_simulation(
         df_missed
     )
 
+
+def build_backtest_excel_report(
+    df_eq: pd.DataFrame,
+    df_trades: pd.DataFrame,
+    trade_summary: pd.DataFrame,
+    df_missed: pd.DataFrame,
+    metrics: dict,
+    benchmarks: dict
+) -> bytes:
+    """Build one Excel file with all backtest outputs in separate sheets."""
+    output = BytesIO()
+
+    metrics_df = pd.DataFrame([
+        {"Metric": k, "Value": v}
+        for k, v in metrics.items()
+    ])
+
+    benchmarks_df = pd.DataFrame([
+        {"Benchmark": k, "Return %": round(v, 2) if isinstance(v, (int, float, np.floating)) else v}
+        for k, v in benchmarks.items()
+    ])
+
+    try:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            metrics_df.to_excel(writer, index=False, sheet_name="Summary")
+            benchmarks_df.to_excel(writer, index=False, sheet_name="Benchmarks")
+            df_eq.reset_index().to_excel(writer, index=False, sheet_name="Equity Curve")
+            trade_summary.to_excel(writer, index=False, sheet_name="Trade Summary")
+            df_trades.to_excel(writer, index=False, sheet_name="Partial Exits")
+            df_missed.to_excel(writer, index=False, sheet_name="Missed Winners")
+    except Exception:
+        # Fallback to xlsxwriter if available.
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            metrics_df.to_excel(writer, index=False, sheet_name="Summary")
+            benchmarks_df.to_excel(writer, index=False, sheet_name="Benchmarks")
+            df_eq.reset_index().to_excel(writer, index=False, sheet_name="Equity Curve")
+            trade_summary.to_excel(writer, index=False, sheet_name="Trade Summary")
+            df_trades.to_excel(writer, index=False, sheet_name="Partial Exits")
+            df_missed.to_excel(writer, index=False, sheet_name="Missed Winners")
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def build_backtest_csv_report(
+    df_eq: pd.DataFrame,
+    df_trades: pd.DataFrame,
+    trade_summary: pd.DataFrame,
+    df_missed: pd.DataFrame,
+    metrics: dict,
+    benchmarks: dict
+) -> bytes:
+    """Plain CSV fallback: one file with sections."""
+    parts = []
+
+    def add_section(name, df):
+        parts.append(f"===== {name} =====\n")
+        parts.append(df.to_csv(index=False))
+        parts.append("\n\n")
+
+    metrics_df = pd.DataFrame([{"Metric": k, "Value": v} for k, v in metrics.items()])
+    benchmarks_df = pd.DataFrame([{"Benchmark": k, "Return %": v} for k, v in benchmarks.items()])
+
+    add_section("Summary", metrics_df)
+    add_section("Benchmarks", benchmarks_df)
+    add_section("Equity Curve", df_eq.reset_index())
+    add_section("Trade Summary", trade_summary)
+    add_section("Partial Exits", df_trades)
+    add_section("Missed Winners", df_missed)
+
+    return "".join(parts).encode("utf-8-sig")
+
+
 # ==========================================================
 # 7. UI Dashboard
 # ==========================================================
@@ -1318,16 +1455,43 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.6 - Backtest Integrity Fix</h1>", unsafe_allow_html=True)
-    st.info("V7.6: תיקון אמינות Backtest — אין יציאה ביום הכניסה, Stop-Limit אמיתי עם לימיט, סגירת פוזיציות פתוחות בסוף, TradeID למדידת עסקה מלאה, והחלקה/עמלות בסיסיות.")
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.8 - Portfolio Defaults</h1>", unsafe_allow_html=True)
+    st.info("V7.8: ברירות המחדל כבר מכוונות למה שאנחנו רוצים לבדוק — Portfolio Mode, 20% מהתיק לפוזיציה, 80% חשיפה מקסימלית, סיכון $200 לעסקה ב-Balanced, Anti-Churn, ו-Export אחד מלא.")
 
     st.sidebar.header("ניהול כספי")
-    investment_amount = st.sidebar.number_input("תקרת השקעה בכל עסקה ($)", value=1000, step=100)
-    risk_budget = st.sidebar.number_input("סיכון מקסימלי לעסקה ($)", value=150, step=25)
+
+    # Defaults are intentionally set to the portfolio-style configuration we actually want to test.
     mode = st.sidebar.selectbox("מצב אסטרטגיה", ["Conservative", "Balanced", "Aggressive"], index=1)
-    months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 12, 3)
     params = get_params(mode)
+
+    months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 12, 12)
+
+    sizing_mode = st.sidebar.selectbox(
+        "שיטת גודל פוזיציה",
+        ["Fixed Amount", "Percent of Equity"],
+        index=1
+    )
+
+    investment_amount = st.sidebar.number_input(
+        "תקרת השקעה בכל עסקה במצב Fixed ($)",
+        value=2500,
+        step=100
+    )
+
+    risk_budget = st.sidebar.number_input(
+        "סיכון מקסימלי לעסקה ($)",
+        value=int(params.risk_budget_default),
+        step=25
+    )
+
+    position_pct = st.sidebar.slider("אחוז מהתיק לפוזיציה", 5, 35, 20) / 100
+    max_exposure_pct = st.sidebar.slider("מקסימום חשיפה כוללת", 30, 100, 80) / 100
     max_positions = st.sidebar.slider("מקסימום פוזיציות פתוחות", 1, 8, params.max_positions_default)
+
+    st.sidebar.markdown("### Anti-Churn")
+    cooldown_after_exit_days = st.sidebar.slider("Cooldown אחרי כל יציאה (ימי מסחר)", 0, 30, 10)
+    cooldown_after_loss_days = st.sidebar.slider("Cooldown אחרי הפסד (ימי מסחר)", 0, 45, 15)
+    double_loss_freeze_days = st.sidebar.slider("Freeze אחרי 2 הפסדים ב-30 יום", 0, 60, 30)
     diagnostics_top_n = st.sidebar.slider("כמה מניות להציג ב-Missed Winners", 10, 50, 20)
     slippage_pct = st.sidebar.number_input("החלקה משוערת לכל פעולה (%)", value=0.10, min_value=0.0, max_value=2.0, step=0.05) / 100
     commission_per_fill = st.sidebar.number_input("עמלה לכל פעולה ($)", value=0.0, min_value=0.0, step=0.5)
@@ -1373,7 +1537,7 @@ else:
                     st.error("שגיאה במשיכת נתוני השוק.")
 
     with tab_backtest:
-        st.markdown(f"### 🧪 Backtest — {months} חודשים — {mode} — {investment_amount}$ לעסקה")
+        st.markdown(f"### 🧪 Backtest — {months} חודשים — {mode} — {sizing_mode} — Risk ${risk_budget}")
         if st.button("⚙️ הרץ בדיקה היסטורית", type="primary"):
             with st.spinner("מריץ סימולציה. זה עשוי לקחת קצת זמן..."):
                 data = fetch_backtest_data(months)
@@ -1387,7 +1551,13 @@ else:
                     max_positions,
                     diagnostics_top_n,
                     slippage_pct,
-                    commission_per_fill
+                    commission_per_fill,
+                    sizing_mode,
+                    position_pct,
+                    max_exposure_pct,
+                    cooldown_after_exit_days,
+                    cooldown_after_loss_days,
+                    double_loss_freeze_days
                 )
                 (df_eq, df_trades, trade_summary, wins, losses, total_invested, gross_profit, gross_loss,
                  max_drawdown, exposure_pct, orders_created, orders_executed, orders_expired,
@@ -1419,6 +1589,61 @@ else:
                 c10.caption(f"Expired: {orders_expired} | Gap rejected: {orders_gap_rejected}")
                 c11.metric("SPY", f"{benchmarks.get('SPY', 0):.1f}%")
                 c12.metric("QQQ", f"{benchmarks.get('QQQ', 0):.1f}%")
+
+                export_metrics = {
+                    "App Version": APP_VERSION,
+                    "Mode": mode,
+                    "Months": months,
+                    "Sizing Mode": sizing_mode,
+                    "Investment Cap Per Trade": investment_amount,
+                    "Risk Budget Per Trade": risk_budget,
+                    "Position %": position_pct,
+                    "Max Exposure %": max_exposure_pct,
+                    "Max Positions": max_positions,
+                    "Slippage %": slippage_pct * 100,
+                    "Commission Per Fill": commission_per_fill,
+                    "Final Portfolio Value": final_value,
+                    "ROI %": roi,
+                    "Net PnL": net_pnl,
+                    "Profit Factor": profit_factor if np.isfinite(profit_factor) else "∞",
+                    "Max Drawdown %": max_drawdown,
+                    "Win Rate %": win_rate,
+                    "Avg Win": avg_win,
+                    "Avg Loss": avg_loss,
+                    "Exposure %": exposure_pct,
+                    "Orders Created": orders_created,
+                    "Orders Executed": orders_executed,
+                    "Orders Expired": orders_expired,
+                    "Orders Gap Rejected": orders_gap_rejected,
+                    "Cooldown After Exit Days": cooldown_after_exit_days,
+                    "Cooldown After Loss Days": cooldown_after_loss_days,
+                    "Double Loss Freeze Days": double_loss_freeze_days,
+                }
+
+                st.markdown("#### 📦 יצוא קובץ אחד")
+                try:
+                    excel_bytes = build_backtest_excel_report(
+                        df_eq, df_trades, trade_summary, df_missed, export_metrics, benchmarks
+                    )
+                    st.download_button(
+                        "⬇️ הורד קובץ Excel אחד עם כל הנתונים",
+                        data=excel_bytes,
+                        file_name=f"swinghunter_{APP_VERSION}_{mode}_{months}m_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                except Exception as e:
+                    csv_bytes = build_backtest_csv_report(
+                        df_eq, df_trades, trade_summary, df_missed, export_metrics, benchmarks
+                    )
+                    st.download_button(
+                        "⬇️ הורד קובץ CSV אחד עם כל הנתונים",
+                        data=csv_bytes,
+                        file_name=f"swinghunter_{APP_VERSION}_{mode}_{months}m_report.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    st.caption(f"Excel export failed, CSV fallback used: {e}")
 
                 st.markdown("#### 📈 Equity Curve")
                 st.line_chart(df_eq)
