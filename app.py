@@ -8,13 +8,13 @@ import xml.etree.ElementTree as ET
 import warnings
 
 # ==========================================
-# SwingHunter V7 - ULTIMATE QUANT TERMINAL
+# SwingHunter V7 - THE QUANT TERMINAL (FINAL)
 # ==========================================
 
 st.set_page_config(page_title="SwingHunter V7 - The Quant Terminal", layout="wide")
 warnings.filterwarnings('ignore')
 
-# --- פרטי גישה מובנים ---
+# --- Hardcoded Credentials ---
 APP_PASSWORD = "Pk0105Ak2701" 
 MY_EMAIL = "orel@peleg-eng.com"
 
@@ -28,7 +28,7 @@ WATCHLIST = [
 HISTORY_FILE = "swinghunter_history.csv"
 
 # ==========================================
-# 1. ניהול היסטוריה וזיכרון
+# 1. Persistence & Memory
 # ==========================================
 def save_scan_history(df_scan):
     if df_scan.empty: return
@@ -52,7 +52,7 @@ def get_setup_persistence(ticker):
     except: return 0, 0
 
 # ==========================================
-# 2. פונקציות סביבה (שוק, סנטימנט, דוחות)
+# 2. Environment Helpers
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_spy_context():
@@ -91,13 +91,12 @@ def get_headlines_sentiment(ticker):
     except: return "⚪"
 
 # ==========================================
-# 3. מודולי Edge (Compression, RS, Breakdown)
+# 3. Core Edge Modules
 # ==========================================
-def calculate_compression_score(df):
+def calculate_compression(df):
     try:
         h, l, c, v = df["High"], df["Low"], df["Close"], df["Volume"]
-        last_price = c.iloc[-1]
-        range_5 = ((h.tail(5).max() - l.tail(5).min()) / last_price) * 100
+        range_5 = ((h.tail(5).max() - l.tail(5).min()) / c.iloc[-1]) * 100
         avg_range_20 = (((h - l) / c).rolling(20).mean().iloc[-1]) * 100
         v5, v20 = v.tail(5).mean(), v.rolling(20).mean().iloc[-1]
         score = 0
@@ -117,8 +116,21 @@ def check_failed_breakdown(df):
     except: pass
     return False, 0
 
+def check_post_drift(df):
+    try:
+        c, o, h, l, v = df["Close"], df["Open"], df["High"], df["Low"], df["Volume"]
+        if v.tail(10).max() > v.rolling(20).mean().iloc[-1] * 2.5:
+            idx = v.tail(10).idxmax()
+            pos = df.index.get_loc(idx)
+            if pos < len(df) - 1:
+                ret = (float(c.iloc[pos]) / float(o.iloc[pos]) - 1) * 100
+                if ret > -5.0 and float(c.iloc[-1]) > float(l.iloc[pos]):
+                    return True, float(h.iloc[pos]), float(l.iloc[pos])
+    except: pass
+    return False, 0, 0
+
 # ==========================================
-# 4. מנוע האנליזה המאוחד (Unified Engine)
+# 4. Unified Analysis Engine (Live & Backtest)
 # ==========================================
 def analyze_edge_unified(ticker, ticker_df, spy_close_series, market_trend, invest_amount, current_pos=[]):
     try:
@@ -129,24 +141,26 @@ def analyze_edge_unified(ticker, ticker_df, spy_close_series, market_trend, inve
         res20 = float(h.iloc[-21:-1].max())
         dist_res = (res20 / last_p - 1) * 100
 
-        # הפעלת מודולים
-        comp_s = calculate_compression_score(ticker_df)
+        # Modules
+        comp_s = calculate_compression(ticker_df)
         rs_20 = ((last_p / c.iloc[-21]) - (spy_close_series.iloc[-1] / spy_close_series.iloc[-21])) * 100
         fail_brk, reclaimed_lvl = check_failed_breakdown(ticker_df)
+        drift, ev_h, ev_l = check_post_drift(ticker_df)
         w_days, _ = get_setup_persistence(ticker)
 
-        # שקלול ציון
+        # Scoring
         score = (15 if last_p > sma200 else 0) + (10 if last_p > ema21 else 0) + (15 if dist_res < 4.0 else 0)
         notes = []
         if comp_s >= 25 and (dist_res < 4.0 or rs_20 > 0): score += comp_s; notes.append("Compression")
         if rs_20 > 5.0: score += 20; notes.append("RS Leader")
         if fail_brk: score += 35; notes.append("Failed Breakdown")
+        if drift: score += 25; notes.append("Post-Event Drift")
         if w_days >= 2: score += 15; notes.append("Building Pressure")
 
         rsi = 100 - (100 / (1 + ((c.diff().where(c.diff() > 0, 0)).rolling(14).mean() / (-c.diff().where(c.diff() < 0, 0)).rolling(14).mean()).iloc[-1]))
         earn_s, earn_d = get_earnings_status(ticker)
 
-        # שומרי סף
+        # Status
         icon, decision, reject = "🔴", "Dormant", ""
         if earn_s == "DANGER": icon, decision, reject, score = "⚠️", "DANGER", "דוח קרוב", 0
         elif rsi > 78: icon, decision, reject, score = "🔥", "חם מדי", "RSI גבוה", min(score, 30)
@@ -154,7 +168,6 @@ def analyze_edge_unified(ticker, ticker_df, spy_close_series, market_trend, inve
         elif score >= 75 and len(notes) > 0: icon, decision = "🟢", "ARMED"
         elif score >= 45: icon, decision = "🟡", "Building Pressure"
         
-        # יצירת פקודה (רק אם המניה לא בתיק)
         order = None
         if decision == "ARMED" and ticker not in current_pos:
             p_type, entry = None, 0
@@ -171,25 +184,23 @@ def analyze_edge_unified(ticker, ticker_df, spy_close_series, market_trend, inve
                         order = {'מניה': ticker, 'פעולה': p_type, 'Edge': " + ".join(notes), 'כניסה': entry, 'כמות': sh, 'סטופ': stop}
         
         return {
-            'scanner': {'מניה': ticker, 'החלטה': f"{icon} {decision}", 'ציון_כולל': int(score), 'Edge': " + ".join(notes), 'RS 20D': f"{round(rs_20,1)}%", 'סיבת פסילה': reject},
+            'scanner': {'מניה': ticker, 'החלטה': f"{icon} {decision}", 'ציון_כולל': int(score), 'Edge': " + ".join(notes), 'סיבת פסילה': reject},
             'order': order
         }
     except: return None
 
 # ==========================================
-# 5. מנוע הבקטסט (V7 Logic - Scale Out)
+# 5. Backtest Simulation (V7 Engine)
 # ==========================================
 def run_v7_backtest(data, invest_amount):
     closes, highs, lows, opens = data['Close'], data['High'], data['Low'], data['Open']
     spy_c = data['Close']['SPY']
-    
     cash, pos, pending, logs, equity = 10000.0, {}, {}, [], []
     tot_inv, tot_p, tot_l = 0.0, 0.0, 0.0
 
     for i in range(200, len(closes) - 1):
         today_str = closes.index[i].strftime('%Y-%m-%d')
-        
-        # 1. ביצוע פקודות מאתמול
+        # 1. Fill Pending
         for t, o in list(pending.items()):
             if t in pos or len(pos) >= 5: continue
             try:
@@ -203,23 +214,18 @@ def run_v7_backtest(data, invest_amount):
             except: continue
         pending.clear()
 
-        # 2. ניהול פוזיציות (מכירה חצי ב-10% + הזזת סטופ)
+        # 2. Position Mgmt (Scale Out)
         for t, p in list(pos.items()):
             try:
                 t_h, t_l = float(highs[t].iloc[i]), float(lows[t].iloc[i])
                 ema21 = float(closes[t].iloc[:i+1].ewm(span=21, adjust=False).mean().iloc[-1])
-                
-                # יעד 1: 10% (מוכר חצי, סטופ עובר למחיר כניסה)
                 if p['mode'] == 'FULL' and t_h >= (p['ent'] * 1.10):
                     q = p['qty'] // 2
                     if q > 0:
                         rev = (p['ent'] * 1.10 * q); cash += rev; tot_p += (rev - (q * p['ent']))
                         p['qty'] -= q; p['mode'], p['st'] = 'HALF', p['ent']
-                
-                # סטופ עוקב לחצי השני
                 if p['mode'] == 'HALF': p['ts'] = max(p['ts'], ema21 * 0.99, p['ent'])
                 
-                # יציאה סופית (סטופ או יעד 2 ב-15%)
                 active_stop = p['ts'] if p['mode'] == 'HALF' else p['st']
                 if t_l <= active_stop or (p['mode'] == 'HALF' and t_h >= p['ent'] * 1.15):
                     sell_p = p['ent'] * 1.15 if (p['mode'] == 'HALF' and t_h >= p['ent'] * 1.15) else active_stop
@@ -229,17 +235,15 @@ def run_v7_backtest(data, invest_amount):
                     else: tot_l += abs(pnl)
                     logs.append({'Date': today_str, 'Ticker': t, 'PnL': round(pnl, 2)}); del pos[t]
             except: continue
-        
         equity.append(cash + sum(p['qty'] * float(closes[t].iloc[i]) for t, p in pos.items()))
 
-        # 3. סריקה למחר
+        # 3. New Scan
         spy_slice = spy_c.iloc[:i+1]
         market_trend = "BULL" if float(spy_slice.iloc[-1]) > float(spy_slice.rolling(20).mean().iloc[-1]) else "BEAR"
-        
         if market_trend == "BULL" and len(pos) < 5:
             for t in WATCHLIST:
                 if t in pos: continue
-                res = analyze_edge_unified(t, data[t].iloc[:i+1], spy_slice, market_trend, invest_amount, list(pos.keys()))
+                res = analyze_edge_unified(t, data[t].iloc[:i+1], spy_slice, "BULL", invest_amount, list(pos.keys()))
                 if res and res['order']:
                     o = res['order']
                     pending[t] = {'type': o['פעולה'], 'price': o['כניסה'], 'stop': o['סטופ'], 'shares': o['כמות']}
@@ -256,44 +260,33 @@ if not st.session_state["auth"]:
         if st.button("Enter"): st.session_state["auth"] = True; st.rerun()
 else:
     st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7 - The Quant Terminal</h1>", unsafe_allow_html=True)
-    st.sidebar.header("ניהול כספי")
-    inv_amount = st.sidebar.number_input("סכום קבוע לעסקה ($)", value=1000, step=100)
-    
-    tab1, tab2 = st.tabs(["🚀 עבודה יומית", "🔬 מעבדת סימולציות"])
+    st.sidebar.header("Capital Mgmt")
+    inv_amount = st.sidebar.number_input("Investment per Trade ($)", value=1000, step=100)
+    tab1, tab2 = st.tabs(["🚀 Live Dashboard", "🔬 Backtest Lab"])
 
     with tab1:
-        if st.button("⚡ הפק תוכנית עבודה להיום", use_container_width=True):
+        if st.button("⚡ Execute Daily Scan", use_container_width=True):
             spy_c, trend = get_spy_context()
             results, orders = [], []
-            with st.spinner("סורק שוק..."):
+            with st.spinner("Running Unified Engine..."):
                 for t in WATCHLIST:
                     df = yf.download(t, period='250d', progress=False)
                     res = analyze_edge_unified(t, df, spy_c, trend, inv_amount)
                     if res:
                         results.append(res['scanner'])
                         if res['order']: orders.append(res['order'])
-            
-            st.markdown("### 📝 פקודות היום (מסנן In is In פעיל)")
-            if orders: st.dataframe(pd.DataFrame(orders))
-            else: st.info("אין פקודות היום.")
-            st.markdown("### 🔍 רדאר שוק")
-            df_res = pd.DataFrame(results).sort_values(by='ציון_כולל', ascending=False)
-            save_scan_history(df_res)
-            st.dataframe(df_res)
+            st.markdown("### 📝 Today's Orders"); st.dataframe(pd.DataFrame(orders)) if orders else st.info("No orders.")
+            st.markdown("### 🔍 Market Radar"); df_res = pd.DataFrame(results).sort_values(by='ציון_כולל', ascending=False)
+            save_scan_history(df_res); st.dataframe(df_res)
 
     with tab2:
-        st.markdown(f"### 🧪 בקטסט 3 חודשים (השקעה של {inv_amount}$)")
-        if st.button("⚙️ הרץ סימולציה", type="primary"):
-            with st.spinner("מנתח אלפי נרות..."):
+        st.markdown(f"### 🧪 3-Month Backtest Analysis (Fixed {inv_amount}$)")
+        if st.button("⚙️ Start Simulation"):
+            with st.spinner("Processing..."):
                 data = yf.download(WATCHLIST + ['SPY'], start=(datetime.now()-timedelta(days=340)), progress=False)
                 df_e, df_tr, tot_inv, tot_p, tot_l = run_v7_backtest(data, inv_amount)
                 net = tot_p - tot_l; roi = (net / 10000.0) * 100
-                
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("השקעה מצטברת", f"${tot_inv:,.0f}")
-                c2.metric("רווח נקי", f"${net:,.0f}", f"{roi:.1f}% ROI")
-                c3.metric("Profit Factor", f"{round(tot_p/tot_l, 2) if tot_l > 0 else 'N/A'}")
-                c4.metric("ציון מערכת", "9/10 🏆" if roi > 8 else "7/10 🟢")
-                
-                st.line_chart(df_e)
-                st.dataframe(df_tr)
+                c1.metric("Total Invested", f"${tot_inv:,.0f}"); c2.metric("Net Profit", f"${net:,.0f}", f"{roi:.1f}% ROI")
+                c3.metric("Profit Factor", f"{round(tot_p/tot_l, 2) if tot_l > 0 else 'N/A'}"); c4.metric("Grade", "9/10 🏆" if roi > 8 else "7/10 🟢")
+                st.line_chart(df_e); st.dataframe(df_tr)
