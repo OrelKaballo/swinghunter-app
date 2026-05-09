@@ -212,7 +212,7 @@ def analyze_ticker(ticker, market_trend):
         return None
 
 # ==========================================
-# 4. פונקציית שליחת המייל שחזרה הביתה
+# 4. פונקציית שליחת המייל
 # ==========================================
 def send_email_report(df, email_pw):
     df_passed = df[df['סטטוס'] == '✅ עובר']
@@ -258,3 +258,69 @@ def send_email_report(df, email_pw):
 # ==========================================
 def check_password():
     if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+    
+    if not st.session_state["authenticated"]:
+        st.markdown("<h1 style='text-align: right;'>🔒 כניסה לסורק</h1>", unsafe_allow_html=True)
+        pwd_input = st.text_input("הזן סיסמה כדי להמשיך:", type="password")
+        if st.button("כניסה"):
+            if pwd_input == APP_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("סיסמה שגויה")
+        return False
+    return True
+
+if check_password():
+    st.set_page_config(page_title="סורק מניות פרו", layout="wide")
+    st.markdown("<h1 style='text-align: right;'>🎯 סורק מניות פרו V2.5</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: right;'>מנוע מלא: ניתוח טכני (SMA200), גוגל חדשות, סנטימנט AI ושליחה אוטומטית למייל.</p>", unsafe_allow_html=True)
+
+    st.sidebar.header("הגדרות סריקה ומייל")
+    st.sidebar.write(f"**מייל מוגדר:** {MY_EMAIL}")
+    email_app_pw = st.sidebar.text_input("סיסמת אפליקציה של Gmail (לצורך שליחה):", type="password")
+    
+    if st.button("🚀 התחל סריקת שוק", use_container_width=True):
+        with st.spinner("בודק את המגמה הכללית של הבורסה (S&P 500)..."):
+            market_trend = get_market_context()
+        
+        if "שלילי" in market_trend:
+            st.error(f"🚨 מצב השוק: {market_trend}. המערכת קפדנית יותר וקונסת מניות.")
+        else:
+            st.success(f"✅ מצב השוק: {market_trend}. כיוון המסחר חיובי.")
+
+        results = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for i, ticker in enumerate(WATCHLIST):
+            status_text.text(f"מנתח את: {ticker} ({i+1}/{len(WATCHLIST)})...")
+            res = analyze_ticker(ticker, market_trend)
+            if res:
+                results.append(res)
+            progress_bar.progress((i + 1) / len(WATCHLIST))
+
+        status_text.text("הסריקה הושלמה!")
+        
+        if results:
+            df_res = pd.DataFrame(results).sort_values(by="ציון", ascending=False).reset_index(drop=True)
+            
+            def highlight_passed(row):
+                if row['ציון'] >= 65:
+                    return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
+                return [''] * len(row)
+
+            st.markdown("""
+            <style>
+            .dataframe { direction: rtl; text-align: right; }
+            </style>
+            """, unsafe_allow_html=True)
+            
+            st.dataframe(df_res.style.apply(highlight_passed, axis=1), use_container_width=True, height=600)
+
+            if email_app_pw:
+                with st.spinner("אורז את התוצאות ושולח דו\"ח למייל..."):
+                    if send_email_report(df_res, email_app_pw):
+                        st.balloons()
+                        st.success("📩 הדו\"ח נשלח בהצלחה לתיבת המייל שלך!")
