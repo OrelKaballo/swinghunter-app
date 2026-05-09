@@ -11,9 +11,15 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V8 - Action Dashboard + Candidate Ranking", layout="wide")
+st.set_page_config(page_title="SwingHunter V8.1 - Simple Risk Percent", layout="wide")
 
-APP_VERSION = "V8.0"
+APP_VERSION = "V8.1"
+
+NOMINAL_TRADE_SIZE = 1000.0
+INTERNAL_MAX_OPEN_POSITIONS = 5
+DEFAULT_SLIPPAGE_PCT = 0.001
+DEFAULT_COMMISSION_PER_FILL = 0.0
+
 
 # ==========================================================
 # 1. Security + Settings
@@ -146,9 +152,9 @@ def get_params(mode: str) -> StrategyParams:
         armed_threshold=68,
         actionable_threshold=60,
         building_threshold=38,
-        min_rr=1.35,
-        max_risk_pct=12.5,
-        allow_bear_market_orders=False,  # regular orders off in weak QQQ; exceptional leaders can still pass
+        min_rr=1.45,
+        max_risk_pct=11.0,
+        allow_bear_market_orders=False,  # V7.5: no automatic orders when SPY is weak
         bear_market_min_edge=60,
         rs5_min=1.5,
         rs20_min=4.0,
@@ -166,7 +172,7 @@ def get_params(mode: str) -> StrategyParams:
         leader_recovery_rs20_min=8.0,
         leader_recovery_20d_min=6.0,
         auto_trade_momentum_only=True,
-        risk_budget_default=250.0,
+        risk_budget_default=200.0,
         runner_trail_close_only=True,
         max_positions_default=5,
     )
@@ -565,40 +571,15 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
                 risk_pct = risk_per_share / entry * 100
                 rr = calc_rr_from_weighted_reward(entry, stop, params)
                 if risk_pct <= params.max_risk_pct and rr >= params.min_rr:
-                    shares_by_cash = int(investment_budget / entry)
-                    shares_by_risk = int(risk_budget / risk_per_share)
-                    shares = min(shares_by_cash, shares_by_risk)
-                    if shares > 0:
+                    shares = investment_budget / entry
+                    if shares > 0 and risk_pct <= params.max_risk_pct:
                         actual_risk = round(shares * risk_per_share, 2)
-                        distance_to_entry = (entry / last_price - 1) * 100 if last_price else np.nan
-
-                        if p_type == "BUY LIMIT":
-                            if distance_to_entry <= -2.5:
-                                action_now = "WAIT - רחוקה מדי מעל הלימיט"
-                            elif distance_to_entry <= 0:
-                                action_now = "PLACE LIMIT"
-                            else:
-                                action_now = "PRICE BELOW LIMIT - CHECK MANUALLY"
-                        elif p_type == "BUY STOP LIMIT":
-                            if distance_to_entry < 0:
-                                action_now = "MISSED / WAIT RESET"
-                            elif distance_to_entry <= 3.0:
-                                action_now = "PLACE STOP LIMIT"
-                            else:
-                                action_now = "WAIT - טריגר רחוק"
-                        else:
-                            action_now = "CHECK"
-
                         order_data = {
                             "מניה": ticker,
                             "פעולה": p_type,
-                            "מה לעשות עכשיו": action_now,
-                            "מחיר נוכחי": round(last_price, 2),
-                            "שער כניסה": round(entry, 2),
-                            "מרחק לכניסה %": round(distance_to_entry, 2),
                             "Edge": " + ".join(edge_notes),
                             "כניסה": e_disp,
-                            "כמות": shares,
+                            "כמות תיאורטית ל-$1000": round(shares, 3),
                             "השקעה $": f"${round(shares * entry, 2)}",
                             "סיכון $": f"${actual_risk}",
                             "יעד ראשון": round(entry * (1 + params.tp1_pct), 2),
@@ -627,9 +608,6 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
             "Setup Score": int(setup_score),
             "Edge Score": int(edge_score),
             "תבנית": setup_type,
-            "מחיר נוכחי": round(last_price, 2),
-            "כניסה מוצעת": round(entry, 2) if 'entry' in locals() and entry else "",
-            "מרחק לכניסה %": round((entry / last_price - 1) * 100, 2) if 'entry' in locals() and entry and last_price else "",
             "Market": market_trend,
             "Watch Days": watch_days,
             "Comp. Score": comp,
@@ -845,26 +823,63 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
 
 
 
+
+def get_market_regime_from_series(market_slice: pd.Series) -> str:
+    """Regime for momentum stocks, based on QQQ if available."""
+    try:
+        if len(market_slice) < 60:
+            return "UNKNOWN"
+
+        last = float(market_slice.iloc[-1])
+        sma20 = float(market_slice.rolling(20).mean().iloc[-1])
+        sma50 = float(market_slice.rolling(50).mean().iloc[-1])
+
+        if last > sma20 and last > sma50:
+            return "BULL_STRONG"
+        if last > sma20 and last <= sma50:
+            return "BULL_WEAK"
+        if last <= sma20 and last > sma50:
+            return "PULLBACK"
+        return "BEAR"
+    except Exception:
+        return "UNKNOWN"
+
+
+def is_exceptional_leader(
+    ticker: str,
+    last_p: float,
+    sma200: float,
+    ema8: float,
+    ema21: float,
+    rs5: float,
+    rs20: float,
+    atr_pct: float,
+    min_atr_pct: float
+) -> bool:
+    """Allows very strong leaders even when QQQ regime is not perfect."""
+    return (
+        ticker in MOMENTUM_TICKERS
+        and last_p > sma200
+        and last_p > ema8
+        and last_p > ema21
+        and rs20 > 25
+        and rs5 > 5
+        and atr_pct >= min_atr_pct
+    )
+
+
 def run_backtest_simulation(
     data: pd.DataFrame,
-    investment_per_trade: float,
-    risk_budget: float,
     params: StrategyParams,
     months: int,
+    max_risk_pct_user: float,
     starting_capital: float = 10000.0,
-    max_positions: int = 6,
     diagnostics_top_n: int = 20,
-    slippage_pct: float = 0.001,
-    commission_per_fill: float = 0.0,
-    sizing_mode: str = "Fixed Amount",
-    position_pct: float = 0.20,
-    max_exposure_pct: float = 0.80,
-    cooldown_after_exit_days: int = 10,
-    cooldown_after_loss_days: int = 15,
-    double_loss_freeze_days: int = 30
+    slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
+    commission_per_fill: float = DEFAULT_COMMISSION_PER_FILL
 ):
     """
-    V7.6 Backtest Integrity Fix:
+    V8.1 Simplified backtest:
     1) DAY orders are generated at close of day i and can execute only on day i+1.
     2) A position cannot be stopped/take-profit on the same day it was opened.
        This avoids false stop-outs caused by not knowing intraday sequence.
@@ -896,7 +911,13 @@ def run_backtest_simulation(
     orders_gap_rejected = 0
     next_trade_id = 1
 
-    # Anti-churn state: prevents repeated trading in the same noisy ticker.
+    # Internal anti-churn. Hidden from UI: fewer choices, same protection.
+    cooldown_after_exit_days = 10
+    cooldown_after_loss_days = 20
+    double_loss_freeze_days = 45
+    max_positions = INTERNAL_MAX_OPEN_POSITIONS
+    investment_per_trade = NOMINAL_TRADE_SIZE
+
     cooldown_until = {}
     recent_loss_dates = {}
 
@@ -1004,7 +1025,7 @@ def run_backtest_simulation(
 
             if executed:
                 exec_price = apply_buy_slippage(raw_exec_price)
-                shares = int(order["shares"])
+                shares = float(order["shares"])
                 total_cost = exec_price * shares + commission_per_fill
 
                 if shares > 0 and cash >= total_cost:
@@ -1147,16 +1168,12 @@ def run_backtest_simulation(
             market_slice = prices["QQQ"].iloc[i - 220:i + 1] if "QQQ" in prices.columns else prices["SPY"].iloc[i - 220:i + 1]
             if len(market_slice) < 220:
                 continue
-            market_bull = float(market_slice.iloc[-1]) > float(market_slice.rolling(20).mean().iloc[-1])
+            market_regime = get_market_regime_from_series(market_slice)
 
             # SPY is still used for relative-strength diagnostics to keep continuity.
             spy_slice = prices["SPY"].iloc[i - 220:i + 1]
         except Exception:
             continue
-
-        # V8: build all candidates first, score them, then place only the best.
-        # This avoids the old bug/weakness where WATCHLIST order could crowd out better trades.
-        candidates = []
 
         for ticker in WATCHLIST:
             if ticker in positions or ticker in pending_orders or len(positions) + len(pending_orders) >= max_positions:
@@ -1201,8 +1218,6 @@ def run_backtest_simulation(
 
                 edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
 
-                atr_pct = atr / last_p * 100
-
                 strong_leader = (
                     rs20 > params.rs20_min + 2
                     and chg20 > 10
@@ -1211,27 +1226,23 @@ def run_backtest_simulation(
                     and last_p > sma200
                 )
 
-                exceptional_bear_leader = (
-                    (not market_bull)
-                    and ticker in MOMENTUM_TICKERS
-                    and rs20 > 25
-                    and rs5 > 5
-                    and last_p > ema8
-                    and last_p > ema21
-                    and last_p > sma200
-                    and atr_pct >= params.min_atr_pct
-                )
-
-                # Regular orders require positive QQQ regime.
-                # In weak market, only exceptional leaders are allowed.
-                if (not market_bull) and (not exceptional_bear_leader):
-                    continue
-
-                # V8: automatic orders still require SMA200.
+                # V7.6: automatic orders require SMA200.
                 if last_p < sma200:
                     continue
 
-                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not (strong_leader or exceptional_bear_leader):
+                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not (strong_leader or exceptional_leader):
+                    continue
+
+                atr_pct = atr / last_p * 100
+
+                exceptional_leader = is_exceptional_leader(
+                    ticker, last_p, sma200, ema8, ema21, rs5, rs20, atr_pct, params.min_atr_pct
+                )
+
+                # Market regime gate:
+                # - Strong bull: regular signals allowed
+                # - Weak/pullback/bear: only exceptional leaders allowed
+                if market_regime != "BULL_STRONG" and not exceptional_leader:
                     continue
 
                 if atr_pct < params.min_atr_pct:
@@ -1274,83 +1285,28 @@ def run_backtest_simulation(
                     risk_pct = risk_per_share / entry_price * 100
                     rr = calc_rr_from_weighted_reward(entry_price, stop, params)
 
-                    if not (risk_pct <= params.max_risk_pct and rr >= params.min_rr):
-                        continue
+                    # V8.1: normalized signal sizing.
+                    # We test every signal as a theoretical $1,000 allocation.
+                    # The user decides later whether to actually buy $800, $2,000 or $8,000.
+                    shares = investment_per_trade / entry_price
 
-                    # Candidate quality score:
-                    # prioritize relative strength, high-quality momentum, decent RR, and not-too-crazy risk.
-                    candidate_score = (
-                        (rs20 * 1.25)
-                        + (rs5 * 0.75)
-                        + (min(max(chg20, -10), 60) * 0.35)
-                        + (rr * 12)
-                        - (risk_pct * 1.2)
-                        + (15 if strong_leader else 0)
-                        + (18 if exceptional_bear_leader else 0)
-                        + (8 if setup_name == "RS Pullback" else 0)
-                        + (6 if ticker in MOMENTUM_TICKERS else 0)
-                    )
-
-                    # Penalize chasing very stretched names unless exceptional.
-                    if chg20 > 35 and not exceptional_bear_leader:
-                        candidate_score -= 10
-
-                    limit_price = round(entry_price * 1.006, 2) if order_type == "BUY STOP LIMIT" else entry_price
-
-                    candidates.append({
-                        "ticker": ticker,
-                        "type": order_type,
-                        "price": entry_price,
-                        "limit": limit_price,
-                        "stop": stop,
-                        "setup": setup_name,
-                        "risk_per_share": risk_per_share,
-                        "risk_pct": risk_pct,
-                        "rr": rr,
-                        "score": candidate_score,
-                    })
+                    # User-facing risk is percent distance from entry to stop, not dollars.
+                    if shares > 0 and risk_pct <= max_risk_pct_user and rr >= params.min_rr:
+                        estimated_cost = shares * entry_price * (1 + slippage_pct) + commission_per_fill
+                        if estimated_cost <= cash:
+                            limit_price = round(entry_price * 1.006, 2) if order_type == "BUY STOP LIMIT" else entry_price
+                            pending_orders[ticker] = {
+                                "type": order_type,
+                                "price": entry_price,
+                                "limit": limit_price,
+                                "stop": stop,
+                                "shares": shares,
+                                "setup": setup_name
+                            }
+                            orders_created += 1
 
             except Exception:
                 continue
-
-        # Place only the best candidates according to available exposure/cash/risk.
-        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-
-        for cand in candidates:
-            if len(positions) + len(pending_orders) >= max_positions:
-                break
-
-            current_equity = portfolio_value
-            current_exposure = max(0.0, current_equity - cash)
-            max_total_exposure = current_equity * max_exposure_pct
-            available_exposure_budget = max(0.0, max_total_exposure - current_exposure)
-
-            if sizing_mode == "Percent of Equity":
-                cash_budget_for_trade = min(current_equity * position_pct, available_exposure_budget, cash)
-            else:
-                cash_budget_for_trade = min(investment_per_trade, available_exposure_budget if max_exposure_pct < 0.999 else investment_per_trade, cash)
-
-            shares_by_cash = int(cash_budget_for_trade / cand["price"])
-            shares_by_risk = int(risk_budget / cand["risk_per_share"])
-            shares = min(shares_by_cash, shares_by_risk)
-
-            if shares <= 0:
-                continue
-
-            estimated_cost = shares * cand["price"] * (1 + slippage_pct) + commission_per_fill
-            if estimated_cost > cash:
-                continue
-
-            pending_orders[cand["ticker"]] = {
-                "type": cand["type"],
-                "price": cand["price"],
-                "limit": cand["limit"],
-                "stop": cand["stop"],
-                "shares": shares,
-                "setup": cand["setup"],
-                "candidate_score": round(cand["score"], 2)
-            }
-            orders_created += 1
 
     # ------------------------------------------------------
     # 5. Final liquidation of open positions
@@ -1593,50 +1549,31 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V8 - Action Dashboard + Candidate Ranking</h1>", unsafe_allow_html=True)
-    st.info("V8: לא רק UI — שיפור מנוע. Candidate Ranking יומי בוחר את העסקאות החזקות ביותר במקום לפי סדר ה-WATCHLIST, יש Bear Exception מבוקר למובילות חריגות, וברירות המחדל מכוונות לנסות להכות QQQ: 25% לפוזיציה, 90% חשיפה, Risk גבוה יותר ו-Anti-Churn חזק יותר.")
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V8.1 - Simple Risk Percent</h1>", unsafe_allow_html=True)
+    st.info("V8.1: מנוע פשוט יותר לבדיקה — כל כניסה מחושבת כ-$1,000 תאורטי, הסיכון מוגדר באחוזים מהכניסה לסטופ, פחות אופציות בתפריט, Regime Filter לפי QQQ, וחריג מבוקר רק למובילות חריגות.")
 
-    st.sidebar.header("ניהול כספי")
+    st.sidebar.header("הגדרות קצרות")
 
-    # Defaults are intentionally set to the portfolio-style configuration we actually want to test.
     mode = st.sidebar.selectbox("מצב אסטרטגיה", ["Conservative", "Balanced", "Aggressive"], index=1)
     params = get_params(mode)
 
     months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 12, 12)
 
-    sizing_mode = st.sidebar.selectbox(
-        "שיטת גודל פוזיציה",
-        ["Fixed Amount", "Percent of Equity"],
-        index=1
+    max_risk_pct_user = st.sidebar.slider(
+        "סיכון מקסימלי לעסקה (% מהכניסה לסטופ)",
+        4.0,
+        15.0,
+        9.5,
+        0.5
     )
 
-    investment_amount = st.sidebar.number_input(
-        "תקרת השקעה בכל עסקה במצב Fixed ($)",
-        value=3000,
-        step=100
-    )
-
-    risk_budget = st.sidebar.number_input(
-        "סיכון מקסימלי לעסקה ($)",
-        value=int(params.risk_budget_default),
-        step=25
-    )
-
-    position_pct = st.sidebar.slider("אחוז מהתיק לפוזיציה", 5, 40, 25) / 100
-    max_exposure_pct = st.sidebar.slider("מקסימום חשיפה כוללת", 30, 100, 90) / 100
-    max_positions = st.sidebar.slider("מקסימום פוזיציות פתוחות", 1, 8, params.max_positions_default)
-
-    st.sidebar.markdown("### Anti-Churn")
-    cooldown_after_exit_days = st.sidebar.slider("Cooldown אחרי כל יציאה (ימי מסחר)", 0, 30, 10)
-    cooldown_after_loss_days = st.sidebar.slider("Cooldown אחרי הפסד (ימי מסחר)", 0, 45, 20)
-    double_loss_freeze_days = st.sidebar.slider("Freeze אחרי 2 הפסדים ב-30 יום", 0, 60, 45)
-    diagnostics_top_n = st.sidebar.slider("כמה מניות להציג ב-Missed Winners", 10, 50, 20)
-    slippage_pct = st.sidebar.number_input("החלקה משוערת לכל פעולה (%)", value=0.10, min_value=0.0, max_value=2.0, step=0.05) / 100
-    commission_per_fill = st.sidebar.number_input("עמלה לכל פעולה ($)", value=0.0, min_value=0.0, step=0.5)
+    diagnostics_top_n = 20
+    investment_amount = NOMINAL_TRADE_SIZE
+    slippage_pct = DEFAULT_SLIPPAGE_PCT
+    commission_per_fill = DEFAULT_COMMISSION_PER_FILL
 
     st.sidebar.caption(
-        f"Mode={mode} | ARMED≥{params.armed_threshold} | Actionable≥{params.actionable_threshold} | "
-        f"TP1={params.tp1_pct*100:.0f}% | Runner=EMA21 close trail | R/R≥{params.min_rr}"
+        f"בדיקה מנורמלת: כל איתות = $1,000 תאורטי | סיכון לפי אחוז | Max Risk={max_risk_pct_user:.1f}%"
     )
 
     tab_daily, tab_backtest = st.tabs(["🚀 מסך עבודה יומי", "🔬 מעבדת סימולציות"])
@@ -1646,28 +1583,15 @@ else:
             with st.spinner("מנתח את השוק ומייצר פקודות... לוקח רגע"):
                 spy_close, market_trend = get_spy_context()
                 if spy_close is not None:
-                    raw_results = [analyze_edge(t, spy_close, market_trend, investment_amount, risk_budget, params) for t in WATCHLIST]
+                    raw_results = [analyze_edge(t, spy_close, market_trend, investment_amount, 0, params) for t in WATCHLIST]
                     raw_results = [r for r in raw_results if r is not None]
                     order_list = [r["order"] for r in raw_results if r["order"] is not None]
-                    st.markdown(f"### 🧭 מה עושים היום — {mode}")
+                    st.markdown(f"### 📝 פקודות יומיות — {mode} — איתות תאורטי: {investment_amount}$")
                     if order_list:
-                        df_orders = pd.DataFrame(order_list)
-                        sort_col = "R/R משוקלל" if "R/R משוקלל" in df_orders.columns else df_orders.columns[0]
-                        df_orders = df_orders.sort_values(by=sort_col, ascending=False).head(5)
-
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("פקודות אפשריות", len(df_orders))
-                        c2.metric("סיכון מתוכנן $", df_orders["סיכון $"].astype(str).str.replace("$", "", regex=False).astype(float).sum() if "סיכון $" in df_orders else 0)
-                        c3.metric("תקרת השקעה", f"${investment_amount:,.0f}")
-
-                        preferred_cols = [
-                            "מניה", "מה לעשות עכשיו", "פעולה", "מחיר נוכחי", "שער כניסה", "מרחק לכניסה %",
-                            "סטופ", "יעד ראשון", "כמות", "השקעה $", "סיכון $", "R/R משוקלל", "תוקף"
-                        ]
-                        cols = [c for c in preferred_cols if c in df_orders.columns] + [c for c in df_orders.columns if c not in preferred_cols]
-                        st.dataframe(df_orders[cols].style.hide(axis="index"), use_container_width=True)
+                        df_orders = pd.DataFrame(order_list).sort_values(by="R/R משוקלל", ascending=False).head(3)
+                        st.dataframe(df_orders.style.hide(axis="index"), use_container_width=True)
                     else:
-                        st.info("אין היום פקודות ביצוע. לא בכוח. אפשר לעיין ברדאר למטה.")
+                        st.info("אין היום פקודות שעברו את כל שומרי הסף. אפשר לעיין ברדאר למטה.")
                     st.markdown("---")
                     st.markdown("### 🔍 רדאר שוק")
                     scanner_list = [r["scanner"] for r in raw_results]
@@ -1688,27 +1612,19 @@ else:
                     st.error("שגיאה במשיכת נתוני השוק.")
 
     with tab_backtest:
-        st.markdown(f"### 🧪 Backtest — {months} חודשים — {mode} — {sizing_mode} — Risk ${risk_budget}")
+        st.markdown(f"### 🧪 Backtest — {months} חודשים — {mode} — $1,000 לכל איתות — Max Risk {max_risk_pct_user:.1f}%")
         if st.button("⚙️ הרץ בדיקה היסטורית", type="primary"):
             with st.spinner("מריץ סימולציה. זה עשוי לקחת קצת זמן..."):
                 data = fetch_backtest_data(months)
                 result = run_backtest_simulation(
                     data,
-                    investment_amount,
-                    risk_budget,
                     params,
                     months,
+                    max_risk_pct_user,
                     10000.0,
-                    max_positions,
                     diagnostics_top_n,
                     slippage_pct,
-                    commission_per_fill,
-                    sizing_mode,
-                    position_pct,
-                    max_exposure_pct,
-                    cooldown_after_exit_days,
-                    cooldown_after_loss_days,
-                    double_loss_freeze_days
+                    commission_per_fill
                 )
                 (df_eq, df_trades, trade_summary, wins, losses, total_invested, gross_profit, gross_loss,
                  max_drawdown, days_in_market_pct, avg_capital_exposure_pct, orders_created, orders_executed, orders_expired,
@@ -1752,12 +1668,10 @@ else:
                     "App Version": APP_VERSION,
                     "Mode": mode,
                     "Months": months,
-                    "Sizing Mode": sizing_mode,
-                    "Investment Cap Per Trade": investment_amount,
-                    "Risk Budget Per Trade": risk_budget,
-                    "Position %": position_pct,
-                    "Max Exposure %": max_exposure_pct,
-                    "Max Positions": max_positions,
+                    "Sizing Mode": "Normalized $1000 per signal",
+                    "Nominal Trade Size": NOMINAL_TRADE_SIZE,
+                    "Max Risk %": max_risk_pct_user,
+                    "Max Positions": INTERNAL_MAX_OPEN_POSITIONS,
                     "Slippage %": slippage_pct * 100,
                     "Commission Per Fill": commission_per_fill,
                     "Final Portfolio Value": final_value,
@@ -1776,9 +1690,9 @@ else:
                     "Orders Executed": orders_executed,
                     "Orders Expired": orders_expired,
                     "Orders Gap Rejected": orders_gap_rejected,
-                    "Cooldown After Exit Days": cooldown_after_exit_days,
-                    "Cooldown After Loss Days": cooldown_after_loss_days,
-                    "Double Loss Freeze Days": double_loss_freeze_days,
+                    "Cooldown After Exit Days": 10,
+                    "Cooldown After Loss Days": 20,
+                    "Double Loss Freeze Days": 45,
                 }
 
                 st.markdown("#### 📦 יצוא קובץ אחד")
