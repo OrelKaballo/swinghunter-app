@@ -45,7 +45,7 @@ def get_setup_persistence(ticker):
         hist = pd.read_csv(HISTORY_FILE)
         recent = hist[hist["מניה"] == ticker].tail(5)
         if recent.empty: return 0, 0
-        watch_days = recent["החלטה"].astype(str).str.contains("למעקב|פעיל|ARMED").sum()
+        watch_days = recent["החלטה"].astype(str).str.contains("למעקב|פעיל|ARMED|Building Pressure").sum()
         score_trend = recent["ציון_כולל"].diff().sum()
         return watch_days, score_trend
     except: return 0, 0
@@ -322,7 +322,7 @@ def analyze_edge(ticker, spy_close, market_trend, risk_budget):
     except: return None
 
 # ==========================================
-# 5. UI
+# 5. UI וממשק משולב
 # ==========================================
 if "authenticated" not in st.session_state: st.session_state["authenticated"] = False
 
@@ -344,14 +344,43 @@ else:
                 raw_results = [analyze_edge(t, spy_close, market_trend, risk_sum) for t in WATCHLIST]
                 raw_results = [r for r in raw_results if r is not None]
             
+                # --- הגדרות Hoover (Tooltips) לטבלת הפקודות ---
+                order_column_config = {
+                    "מניה": st.column_config.TextColumn("מניה", help="סימול המניה בוול סטריט"),
+                    "פעולה": st.column_config.TextColumn("פעולה", help="BUY STOP LIMIT = פריצה (מעל המחיר הנוכחי) | BUY LIMIT = פולבק (מתחת למחיר הנוכחי)"),
+                    "Edge": st.column_config.TextColumn("Edge", help="היתרונות הייחודיים שהצדיקו את הפקודה הזו"),
+                    "כניסה": st.column_config.TextColumn("כניסה", help="מחיר ההפעלה לפקודה בברוקר"),
+                    "כמות": st.column_config.NumberColumn("כמות", help="כמות המניות שחושבה אוטומטית לפי תקציב הסיכון שלך"),
+                    "יעד 10%": st.column_config.NumberColumn("יעד 10%", help="תחנת לקיחת רווח ראשונה (יעד מינימלי)"),
+                    "יעד 15%": st.column_config.NumberColumn("יעד 15%", help="תחנת לקיחת רווח שנייה לניהול הפוזיציה"),
+                    "סטופ": st.column_config.NumberColumn("סטופ", help="המחיר שבו חותכים הפסד. נגזר מהתנודתיות (ATR) או מרמת התמיכה"),
+                    "סיכון $": st.column_config.TextColumn("סיכון $", help="ההפסד בדולרים אם הסטופ יופעל (מותאם לסיכון שהגדרת)"),
+                    "סיכון %": st.column_config.TextColumn("סיכון %", help="המרחק באחוזים ממחיר הכניסה לסטופ (המערכת פוסלת מעל 7%)"),
+                    "R/R": st.column_config.NumberColumn("R/R", help="יחס סיכוי-סיכון. על כל 1$ שאתה מסכן, כמה דולרים תרוויח ביעד הראשון? (מינימום 1.5)"),
+                    "תוקף": st.column_config.TextColumn("תוקף", help="זמן תוקף הפקודה. DAY ONLY אומר שהפקודה מתבטלת בסוף יום המסחר")
+                }
+
                 # 1. פקודות היום
                 order_list = [r['order'] for r in raw_results if r['order'] is not None]
                 st.markdown(f"### 📝 פקודות ביצוע מוגנות (Market: {market_trend})")
                 if order_list:
                     df_orders = pd.DataFrame(order_list).sort_values(by="R/R", ascending=False).head(3)
-                    st.dataframe(df_orders.style.hide(axis="index"), use_container_width=True)
+                    st.dataframe(df_orders.style.hide(axis="index"), column_config=order_column_config, use_container_width=True)
                 else:
                     st.info("אין היום פקודות שעברו את כל שומרי הסף (דוחות, R/R, ומצב שוק).")
+
+                # --- הגדרות Hoover (Tooltips) לטבלת הסורק ---
+                scan_column_config = {
+                    "החלטה": st.column_config.TextColumn("החלטה", help="ARMED = מוכנה לפקודה | Building Pressure = צוברת לחץ למעקב | Dormant = רדומה, אין יתרון | DANGER = מסוכנת (דוח וכו')"),
+                    "ציון_כולל": st.column_config.NumberColumn("ציון כולל", help="שקלול של המבנה הטכני והיתרון היחסי. מעל 80 = פקודת עבודה"),
+                    "תבנית": st.column_config.TextColumn("תבנית", help="סוג הסטאפ (למשל: דחיסה לפני פריצה, פולבק מניית עוצמה, שבירת שווא)"),
+                    "Watch Days": st.column_config.NumberColumn("Watch Days", help="כמה ימים ברצף המניה נמצאת תחת המעקב של המערכת (זיכרון שוק)"),
+                    "Comp. Score": st.column_config.NumberColumn("Comp. Score", help="מדד דחיסה: בודק אם הטווח מתכווץ והנפח מתייבש (מעל 25 מעיד על לחץ שעומד להשתחרר)"),
+                    "RS (5D)": st.column_config.TextColumn("RS (5D)", help="עוצמה יחסית מול SPY ב-5 ימים האחרונים. מספר חיובי = המניה חזקה מהשוק"),
+                    "RS (20D)": st.column_config.TextColumn("RS (20D)", help="עוצמה יחסית מול SPY בחודש האחרון. המסנן המרכזי למניות מובילות (Leaders)"),
+                    "Edge Notes": st.column_config.TextColumn("Edge Notes", help="פירוט של הגורמים שנותנים למניה 'אלפא' (היתרון על פני שאר השוק)"),
+                    "סיבת פסילה": st.column_config.TextColumn("סיבת פסילה", help="למה המניה לא הפכה לפקודה היום? שומר עליך מטעויות (למשל R/R נמוך, דוח קרוב, מרדף)")
+                }
 
                 # 2. סורק מעקב
                 st.markdown("---")
@@ -368,6 +397,6 @@ else:
                     if "DANGER" in val: return ['background-color: rgba(231, 76, 60, 0.1)'] * len(row)
                     return [''] * len(row)
 
-                st.dataframe(df_scan.style.apply(color_logic, axis=1), use_container_width=True)
+                st.dataframe(df_scan.style.apply(color_logic, axis=1), column_config=scan_column_config, use_container_width=True)
             else:
                 st.error("שגיאה במשיכת נתוני SPY (שוק כללי).")
