@@ -13,8 +13,8 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. הגדרות (שנה לנתונים שלך)
 # ==========================================
-APP_PASSWORD = "YOUR_WEBSITE_PASSWORD" # סיסמת כניסה לאתר
-MY_EMAIL = "your_email@gmail.com"      # המייל שלך להתראות
+APP_PASSWORD = "Pk0105Ak2701" # סיסמת כניסה לאתר
+MY_EMAIL = "orel@peleg-eng.com"      # המייל שלך להתראות
 
 # רשימה מורחבת - 80 מניות מובילות מכל הסקטורים
 WATCHLIST = [
