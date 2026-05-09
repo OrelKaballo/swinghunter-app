@@ -5,7 +5,9 @@ import numpy as np
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime
+import urllib.request
+import xml.etree.ElementTree as ET
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -16,7 +18,6 @@ warnings.filterwarnings('ignore')
 APP_PASSWORD = "Pk0105Ak2701" # סיסמת כניסה לאתר
 MY_EMAIL = "orel@peleg-eng.com"      # המייל שלך להתראות
 
-# רשימה מורחבת - 80 מניות מובילות מכל הסקטורים
 WATCHLIST = [
     'AAPL','MSFT','NVDA','TSLA','AMZN','META','GOOGL','NFLX',
     'AMD','AVGO','TSM','INTC','QCOM','MU','MRVL','ASML','ARM',
@@ -30,7 +31,56 @@ WATCHLIST = [
 ]
 
 # ==========================================
-# 2. מנוע ניתוח (בעברית + מניעת סיכונים)
+# 2. מנועי מידע וניתוח חדשות (Google News)
+# ==========================================
+def get_external_news_and_sentiment(ticker):
+    try:
+        url = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            xml_page = response.read()
+        
+        root = ET.fromstring(xml_page)
+        items = root.findall('.//item')
+        if not items:
+            return "אין חדשות לאחרונה", "⚪ ניטרלי"
+        
+        titles = [item.find('title').text for item in items[:2]]
+        news_text = " | ".join(titles)
+        
+        pos_words = ['up', 'surge', 'jump', 'beat', 'growth', 'buy', 'upgrade', 'high', 'profit', 'win', 'soar']
+        neg_words = ['down', 'plunge', 'drop', 'miss', 'cut', 'sell', 'downgrade', 'low', 'loss', 'lawsuit', 'crash']
+        
+        text_lower = news_text.lower()
+        pos_count = sum(1 for word in pos_words if f" {word} " in f" {text_lower} ")
+        neg_count = sum(1 for word in neg_words if f" {word} " in f" {text_lower} ")
+        
+        if pos_count > neg_count: sentiment = "🟢 חיובי"
+        elif neg_count > pos_count: sentiment = "🔴 שלילי"
+        else: sentiment = "⚪ ניטרלי"
+            
+        return news_text, sentiment
+    except Exception as e:
+        return "שגיאה בשליפת חדשות מ-Google", "⚪ לא ידוע"
+
+def check_upcoming_earnings(ticker):
+    try:
+        tkr = yf.Ticker(ticker)
+        cal = tkr.get_earnings_dates(limit=3)
+        if cal is not None and not cal.empty:
+            now = pd.Timestamp.now(tz='UTC')
+            future_dates = cal.index[cal.index > now]
+            if not future_dates.empty:
+                next_date = future_dates[0]
+                days = (next_date - now).days
+                if 0 <= days <= 7:
+                    return True, days
+    except:
+        pass
+    return False, -1
+
+# ==========================================
+# 3. מנוע ניתוח טכני
 # ==========================================
 def rsi(series, period=14):
     delta = series.diff()
@@ -57,39 +107,10 @@ def get_market_context():
     except:
         return "לא ידוע"
 
-def check_upcoming_earnings(ticker):
-    """בודק אם יש דוח רווחים בשבוע הקרוב"""
-    try:
-        tkr = yf.Ticker(ticker)
-        # שולף תאריכי דוחות
-        cal = tkr.get_earnings_dates(limit=3)
-        if cal is not None and not cal.empty:
-            now = pd.Timestamp.now(tz='UTC')
-            future_dates = cal.index[cal.index > now]
-            if not future_dates.empty:
-                next_date = future_dates[0]
-                days_to_earnings = (next_date - now).days
-                if 0 <= days_to_earnings <= 7:
-                    return True, days_to_earnings
-    except:
-        pass
-    return False, -1
-
-def get_latest_news(ticker):
-    try:
-        tkr = yf.Ticker(ticker)
-        news = tkr.news[:2]
-        if not news:
-            return "אין חדשות אחרונות"
-        titles = [n['title'] for n in news]
-        return " | ".join(titles)
-    except:
-        return "שגיאה בשליפת חדשות"
-
 def analyze_ticker(ticker, market_trend):
     try:
-        df = yf.download(ticker, period='180d', progress=False)
-        if df.empty or len(df) < 60: return None
+        df = yf.download(ticker, period='250d', progress=False)
+        if df.empty or len(df) < 200: return None
         
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -100,6 +121,7 @@ def analyze_ticker(ticker, market_trend):
         vol = df['Volume']
 
         df['SMA20'] = close.rolling(20).mean()
+        df['SMA200'] = close.rolling(200).mean()
         df['EMA8'] = close.ewm(span=8, adjust=False).mean()
         df['EMA21'] = close.ewm(span=21, adjust=False).mean()
         df['RSI14'] = rsi(close, 14)
@@ -123,7 +145,7 @@ def analyze_ticker(ticker, market_trend):
 
         setup = []
         if price > df['High'].iloc[-2] and last['RelVol'] > 1.2 and price > last['Open']:
-            setup.append('פריצת מומנטום (מחזור גבוה)')
+            setup.append('פריצת מומנטום')
         if price > last['EMA8'] and last['EMA8'] > last['EMA21']:
             setup.append('מגמה קצרת-טווח חזקה')
         if last['RSI14'] < 40 and price > last['SMA20']:
@@ -137,7 +159,7 @@ def analyze_ticker(ticker, market_trend):
 
         if not setup:
             score = 0
-            remarks.append("נפסל: אין תבנית טכנית")
+            remarks.append("נפסל: אין תבנית")
         else:
             if 'פריצה' in setup_txt: score += 15
             if last['RelVol'] > 1.5: score += 15
@@ -146,103 +168,93 @@ def analyze_ticker(ticker, market_trend):
 
             if "שלילי" in market_trend: 
                 score -= 20
-                remarks.append("אזהרה: שוק כללי חלש")
+                remarks.append("אזהרה: שוק חלש")
             if rr < 1.3: 
                 score -= 30
-                remarks.append("נפסל: יחס סיכוי-סיכון נמוך מדי")
+                remarks.append("נפסל: סיכוי-סיכון נמוך")
             if last['RSI14'] > 75: 
                 score -= 15
-                remarks.append("אזהרה: קניית יתר (RSI > 75)")
+                remarks.append("אזהרה: קניית יתר (RSI>75)")
             if price > last['SMA20'] + (atr_val * 2): 
                 score -= 20
                 remarks.append("אזהרה: מחיר מתוח מדי")
+                
+            if price < float(last['SMA200']):
+                score -= 20
+                remarks.append("נפסל: מגמה ארוכת-טווח שלילית (מתחת ל-200)")
 
-            # בדיקת דוחות רק למניות שכמעט עוברות כדי לחסוך זמן סריקה
             if score >= 50:
                 has_earnings, days = check_upcoming_earnings(ticker)
                 if has_earnings:
                     display_ticker = f"❗ {ticker}"
-                    score -= 10 # קנס על סיכון דוח
-                    remarks.append(f"סכנה: דוח רווחים בעוד {days} ימים!")
+                    score -= 10 
+                    remarks.append(f"סכנה: דוח בעוד {days} ימים")
 
         score = max(0, min(100, score)) 
         status = "✅ עובר" if score >= 65 else "❌ נפסל"
 
-        news_headlines = get_latest_news(ticker) if score >= 65 else "-"
+        news_text, sentiment = get_external_news_and_sentiment(ticker) if score >= 65 else ("-", "-")
 
         return {
             'סטטוס': status,
             'מניה': display_ticker,
             'ציון': int(score),
+            'סנטימנט בחדשות': sentiment,
             'סיבת פסילה / אזהרות': ", ".join(remarks) if remarks else "תקין",
             'תבנית טכנית': setup_txt,
             'מחיר נוכחי': round(price, 2),
             'יעד ראשון': round(target1, 2),
             'סטופ-לוס': round(stop, 2),
             'יחס R/R': round(rr, 2),
-            'חדשות': news_headlines
+            'כותרות מהרשת': news_text
         }
     except Exception as e:
         return None
 
 # ==========================================
-# 3. ממשק משתמש
+# 4. פונקציית שליחת המייל שחזרה הביתה
+# ==========================================
+def send_email_report(df, email_pw):
+    df_passed = df[df['סטטוס'] == '✅ עובר']
+    
+    msg = MIMEMultipart()
+    msg['From'] = MY_EMAIL
+    msg['To'] = MY_EMAIL
+    msg['Subject'] = f"📈 דו\"ח סריקת מניות פרו - {datetime.now().strftime('%d/%m/%Y')}"
+
+    html_table = df_passed.to_html(index=False, justify='center', classes='table table-striped')
+    body = f"""
+    <html dir="rtl">
+      <head>
+        <style>
+          body {{ font-family: Arial, sans-serif; }}
+          table {{ border-collapse: collapse; width: 100%; direction: rtl; }}
+          th, td {{ padding: 8px; text-align: center; border-bottom: 1px solid #ddd; }}
+          th {{ background-color: #2ecc71; color: white; }}
+        </style>
+      </head>
+      <body>
+        <h2>סיכום סריקה יומית - מניות נבחרות</h2>
+        <p>להלן המניות שעמדו בכל הקריטריונים המחמירים של המערכת (ציון 65 ומעלה):</p>
+        {html_table}
+      </body>
+    </html>
+    """
+    msg.attach(MIMEText(body, 'html'))
+
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(MY_EMAIL, email_pw)
+        server.sendmail(MY_EMAIL, MY_EMAIL, msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        st.error(f"שגיאה בשליחת המייל: {e}")
+        return False
+
+# ==========================================
+# 5. ממשק משתמש מלא (UI)
 # ==========================================
 def check_password():
     if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-    
-    if not st.session_state["authenticated"]:
-        st.markdown("<h1 style='text-align: right;'>🔒 כניסה לסורק</h1>", unsafe_allow_html=True)
-        pwd_input = st.text_input("הזן סיסמה:", type="password")
-        if st.button("היכנס"):
-            if pwd_input == APP_PASSWORD:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("סיסמה שגויה")
-        return False
-    return True
-
-if check_password():
-    st.set_page_config(page_title="סורק מניות חכם", layout="wide")
-    st.markdown("<h1 style='text-align: right;'>🎯 סורק מניות פרו (80 מניות)</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: right;'>סורק טכני בעברית. סימן ❗ ליד מניה מציין שפרסום דוח הרווחים מתקרב!</p>", unsafe_allow_html=True)
-
-    if st.button("🚀 התחל סריקת שוק", use_container_width=True):
-        with st.spinner("בודק את המגמה הכללית של הבורסה..."):
-            market_trend = get_market_context()
-        
-        if "שלילי" in market_trend:
-            st.error(f"🚨 מצב השוק: {market_trend}. המערכת קפדנית יותר.")
-        else:
-            st.success(f"✅ מצב השוק: {market_trend}.")
-
-        results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        for i, ticker in enumerate(WATCHLIST):
-            status_text.text(f"מנתח את: {ticker} ({i+1}/{len(WATCHLIST)})...")
-            res = analyze_ticker(ticker, market_trend)
-            if res:
-                results.append(res)
-            progress_bar.progress((i + 1) / len(WATCHLIST))
-
-        status_text.text("הסריקה הושלמה!")
-        
-        if results:
-            df_res = pd.DataFrame(results).sort_values(by="ציון", ascending=False).reset_index(drop=True)
-            
-            def highlight_passed(row):
-                if row['ציון'] >= 65:
-                    return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
-                return [''] * len(row)
-
-            st.markdown("""
-            <style>
-            .dataframe { direction: rtl; text-align: right; }
-            </style>
-            """, unsafe_allow_html=True)
-            
-            st.dataframe(df_res.style.apply(highlight_passed, axis=1), use_container_width=True, height=700)
