@@ -5,7 +5,7 @@ import numpy as np
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -13,18 +13,24 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. הגדרות (שנה לנתונים שלך)
 # ==========================================
-APP_PASSWORD = "Pk0105Ak2701" # סיסמת כניסה לאתר
-MY_EMAIL = "orel@peleg-eng.com"      # המייל שלך להתראות
+APP_PASSWORD = "YOUR_WEBSITE_PASSWORD" # סיסמת כניסה לאתר
+MY_EMAIL = "your_email@gmail.com"      # המייל שלך להתראות
 
+# רשימה מורחבת - 80 מניות מובילות מכל הסקטורים
 WATCHLIST = [
-    'AAPL','MSFT','NVDA','TSLA','AMZN','META','GOOGL','AMD','AVGO','PLTR',
-    'CRWD','PANW','SMCI','COIN','MSTR','HOOD','SOFI','RIVN','UBER','SHOP',
-    'SQ','NFLX','DDOG','SNOW','NET','ROKU','AFRM','PYPL','MRVL','INTC',
-    'QCOM','TSM','BABA','CRM','NOW','UBER','ABNB','SPOT','DKNG','MARA'
+    'AAPL','MSFT','NVDA','TSLA','AMZN','META','GOOGL','NFLX',
+    'AMD','AVGO','TSM','INTC','QCOM','MU','MRVL','ASML','ARM',
+    'CRWD','PANW','PLTR','SNOW','DDOG','NET','ZS','FTNT','MDB',
+    'SMCI','DELL','HPQ','IBM','COIN','MSTR','HOOD','SOFI','SQ',
+    'PYPL','AFRM','MARA','RIOT','SHOP','BABA','MELI','WMT','TGT',
+    'COST','HD','UBER','ABNB','BKNG','EXPE','DAL','UAL','SPOT',
+    'ROKU','DKNG','DIS','NKE','SBUX','MCD','JPM','BAC','GS','MS',
+    'V','MA','AXP','LLY','NVO','JNJ','UNH','PFE','MRNA','CAT',
+    'BA','XOM','CVX','GE'
 ]
 
 # ==========================================
-# 2. מנוע ניתוח (בעברית)
+# 2. מנוע ניתוח (בעברית + מניעת סיכונים)
 # ==========================================
 def rsi(series, period=14):
     delta = series.diff()
@@ -51,8 +57,25 @@ def get_market_context():
     except:
         return "לא ידוע"
 
+def check_upcoming_earnings(ticker):
+    """בודק אם יש דוח רווחים בשבוע הקרוב"""
+    try:
+        tkr = yf.Ticker(ticker)
+        # שולף תאריכי דוחות
+        cal = tkr.get_earnings_dates(limit=3)
+        if cal is not None and not cal.empty:
+            now = pd.Timestamp.now(tz='UTC')
+            future_dates = cal.index[cal.index > now]
+            if not future_dates.empty:
+                next_date = future_dates[0]
+                days_to_earnings = (next_date - now).days
+                if 0 <= days_to_earnings <= 7:
+                    return True, days_to_earnings
+    except:
+        pass
+    return False, -1
+
 def get_latest_news(ticker):
-    """שואב את שתי הכותרות האחרונות על המניה"""
     try:
         tkr = yf.Ticker(ticker)
         news = tkr.news[:2]
@@ -98,7 +121,6 @@ def analyze_ticker(ticker, market_trend):
         reward = target1 - price
         rr = reward / risk if risk > 0 else 0
 
-        # זיהוי תבניות בעברית
         setup = []
         if price > df['High'].iloc[-2] and last['RelVol'] > 1.2 and price > last['Open']:
             setup.append('פריצת מומנטום (מחזור גבוה)')
@@ -111,8 +133,8 @@ def analyze_ticker(ticker, market_trend):
 
         score = 50 
         remarks = []
+        display_ticker = ticker
 
-        # תיקון הבאג: אם אין תבנית, המניה נפסלת מיידית
         if not setup:
             score = 0
             remarks.append("נפסל: אין תבנית טכנית")
@@ -130,28 +152,35 @@ def analyze_ticker(ticker, market_trend):
                 remarks.append("נפסל: יחס סיכוי-סיכון נמוך מדי")
             if last['RSI14'] > 75: 
                 score -= 15
-                remarks.append("אזהרה: המניה קנויה מדי (RSI גבוה)")
+                remarks.append("אזהרה: קניית יתר (RSI > 75)")
             if price > last['SMA20'] + (atr_val * 2): 
                 score -= 20
-                remarks.append("אזהרה: המניה מתוחה מדי למעלה")
+                remarks.append("אזהרה: מחיר מתוח מדי")
+
+            # בדיקת דוחות רק למניות שכמעט עוברות כדי לחסוך זמן סריקה
+            if score >= 50:
+                has_earnings, days = check_upcoming_earnings(ticker)
+                if has_earnings:
+                    display_ticker = f"❗ {ticker}"
+                    score -= 10 # קנס על סיכון דוח
+                    remarks.append(f"סכנה: דוח רווחים בעוד {days} ימים!")
 
         score = max(0, min(100, score)) 
         status = "✅ עובר" if score >= 65 else "❌ נפסל"
 
-        # משיכת חדשות רק למניות שעברו (כדי לחסוך זמן)
-        news_headlines = get_latest_news(ticker) if score >= 65 else "לא נבדק (מניה נפסלה)"
+        news_headlines = get_latest_news(ticker) if score >= 65 else "-"
 
         return {
             'סטטוס': status,
-            'מניה': ticker,
+            'מניה': display_ticker,
             'ציון': int(score),
             'סיבת פסילה / אזהרות': ", ".join(remarks) if remarks else "תקין",
-            'תבנית טכנית שזוהתה': setup_txt,
+            'תבנית טכנית': setup_txt,
             'מחיר נוכחי': round(price, 2),
-            'יעד רווח (לפי ATR)': round(target1, 2),
-            'הגנת סטופ-לוס': round(stop, 2),
-            'יחס סיכוי-סיכון': round(rr, 2),
-            'חדשות אחרונות (רקע)': news_headlines
+            'יעד ראשון': round(target1, 2),
+            'סטופ-לוס': round(stop, 2),
+            'יחס R/R': round(rr, 2),
+            'חדשות': news_headlines
         }
     except Exception as e:
         return None
@@ -177,24 +206,24 @@ def check_password():
 
 if check_password():
     st.set_page_config(page_title="סורק מניות חכם", layout="wide")
-    st.markdown("<h1 style='text-align: right;'>🎯 סורק מניות פרו</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: right;'>מערכת חכמה המשלבת ניתוח טכני בעברית, ניהול סיכונים וקריאת חדשות רקע.</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: right;'>🎯 סורק מניות פרו (80 מניות)</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: right;'>סורק טכני בעברית. סימן ❗ ליד מניה מציין שפרסום דוח הרווחים מתקרב!</p>", unsafe_allow_html=True)
 
     if st.button("🚀 התחל סריקת שוק", use_container_width=True):
         with st.spinner("בודק את המגמה הכללית של הבורסה..."):
             market_trend = get_market_context()
         
         if "שלילי" in market_trend:
-            st.error(f"🚨 מצב השוק הכללי: {market_trend}. המערכת תחמיר בסינון.")
+            st.error(f"🚨 מצב השוק: {market_trend}. המערכת קפדנית יותר.")
         else:
-            st.success(f"✅ מצב השוק הכללי: {market_trend}.")
+            st.success(f"✅ מצב השוק: {market_trend}.")
 
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         for i, ticker in enumerate(WATCHLIST):
-            status_text.text(f"מנתח את מניית: {ticker} ({i+1}/{len(WATCHLIST)})...")
+            status_text.text(f"מנתח את: {ticker} ({i+1}/{len(WATCHLIST)})...")
             res = analyze_ticker(ticker, market_trend)
             if res:
                 results.append(res)
@@ -210,11 +239,10 @@ if check_password():
                     return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
                 return [''] * len(row)
 
-            # עיצוב הטבלה שתוצג מימין לשמאל
             st.markdown("""
             <style>
             .dataframe { direction: rtl; text-align: right; }
             </style>
             """, unsafe_allow_html=True)
             
-            st.dataframe(df_res.style.apply(highlight_passed, axis=1), use_container_width=True, height=600)
+            st.dataframe(df_res.style.apply(highlight_passed, axis=1), use_container_width=True, height=700)
