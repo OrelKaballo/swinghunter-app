@@ -3,6 +3,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import BytesIO
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -11,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V9 - Clean Signal Engine", layout="wide")
-APP_VERSION = "V9.0"
+st.set_page_config(page_title="SwingHunter V9.1 - Clean Signal Engine Fixed Export", layout="wide")
+APP_VERSION = "V9.1"
 
 # ==========================================================
 # 1. Security
@@ -657,10 +658,17 @@ def run_clean_signal_backtest(
     else:
         ticker_summary = pd.DataFrame()
 
+    total_notional = len(df_trades) * NOTIONAL_PER_TRADE
+    signal_return_on_allocated = (total_pnl / total_notional * 100) if total_notional else 0.0
+    qqq_same_windows_return_on_allocated = (qqq_same_window_pnl / total_notional * 100) if total_notional else 0.0
+    edge_vs_qqq_pnl = total_pnl - qqq_same_window_pnl
+    edge_vs_qqq_pct = signal_return_on_allocated - qqq_same_windows_return_on_allocated
+
     metrics = {
         "App Version": APP_VERSION,
         "Months": months,
         "Notional Per Signal": NOTIONAL_PER_TRADE,
+        "Total Notional Tested": round(total_notional, 2),
         "Max Risk %": params.max_risk_pct,
         "Target %": params.target_pct,
         "Trades": len(df_trades),
@@ -668,6 +676,7 @@ def run_clean_signal_backtest(
         "Losses": losses,
         "Win Rate %": round(win_rate, 2),
         "Total PnL $1000 Signals": round(total_pnl, 2),
+        "Signal Return on Allocated Capital %": round(signal_return_on_allocated, 2),
         "Average Trade Return %": round(avg_return, 2),
         "Average Win %": round(avg_win, 2),
         "Average Loss %": round(avg_loss, 2),
@@ -675,7 +684,10 @@ def run_clean_signal_backtest(
         "Max Drawdown $": round(max_dd_dollars, 2),
         "QQQ Buy & Hold %": round(qqq_buyhold, 2) if np.isfinite(qqq_buyhold) else "",
         "QQQ Same Windows PnL": round(qqq_same_window_pnl, 2),
+        "QQQ Same Windows Return on Allocated Capital %": round(qqq_same_windows_return_on_allocated, 2),
         "QQQ Same Windows Avg %": round(qqq_same_window_avg, 2),
+        "Edge vs QQQ Same Windows PnL": round(edge_vs_qqq_pnl, 2),
+        "Edge vs QQQ Same Windows %": round(edge_vs_qqq_pct, 2),
         "Pending Orders Created": pending_created,
         "Pending Orders Filled": pending_filled,
         "Pending Orders Expired": pending_expired,
@@ -744,15 +756,19 @@ def get_today_actions(params: StrategyParams):
 # ==========================================================
 # 8. Export
 # ==========================================================
-def build_excel_report(df_equity, df_trades, ticker_summary, metrics):
+def build_zip_report(df_equity, df_trades, ticker_summary, metrics):
+    """
+    Robust export that does NOT depend on openpyxl/xlsxwriter.
+    Creates one ZIP file containing all CSVs.
+    """
     output = BytesIO()
     metrics_df = pd.DataFrame([{"Metric": k, "Value": v} for k, v in metrics.items()])
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        metrics_df.to_excel(writer, index=False, sheet_name="Summary")
-        df_equity.reset_index().to_excel(writer, index=False, sheet_name="Signal Equity")
-        df_trades.to_excel(writer, index=False, sheet_name="Trades")
-        ticker_summary.to_excel(writer, index=False, sheet_name="Ticker Summary")
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("summary.csv", metrics_df.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("signal_equity.csv", df_equity.reset_index().to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("trades.csv", df_trades.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("ticker_summary.csv", ticker_summary.to_csv(index=False).encode("utf-8-sig"))
 
     output.seek(0)
     return output.getvalue()
@@ -775,7 +791,7 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V9 — Clean Signal Engine</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V9.1 — Clean Signal Engine Fixed Export</h1>", unsafe_allow_html=True)
     st.info(
         "V9 בודקת איתותים נקיים: כל כניסה היא $1,000 תאורטי, אין קופה ואין גודל פוזיציה. "
         "אי אפשר להיכנס שוב לאותו טיקר בזמן שהוא כבר פתוח. כל יציאה מוכרת 100%."
@@ -831,25 +847,31 @@ else:
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Total PnL", f"${metrics['Total PnL $1000 Signals']:,.0f}")
-                c2.metric("Profit Factor", metrics["Profit Factor"])
-                c3.metric("Win Rate", f"{metrics['Win Rate %']:.1f}%")
-                c4.metric("Avg Trade", f"{metrics['Average Trade Return %']:.2f}%")
+                c2.metric("Signal Return", f"{metrics['Signal Return on Allocated Capital %']:.2f}%")
+                c3.metric("Profit Factor", metrics["Profit Factor"])
+                c4.metric("Win Rate", f"{metrics['Win Rate %']:.1f}%")
 
                 c5, c6, c7, c8 = st.columns(4)
                 c5.metric("Trades", metrics["Trades"])
                 c6.metric("Avg Win / Loss", f"{metrics['Average Win %']:.2f}% / {metrics['Average Loss %']:.2f}%")
-                c7.metric("QQQ Same Windows PnL", f"${metrics['QQQ Same Windows PnL']:,.0f}")
+                c7.metric("Edge vs QQQ same windows", f"${metrics['Edge vs QQQ Same Windows PnL']:,.0f}", f"{metrics['Edge vs QQQ Same Windows %']:.2f}%")
                 c8.metric("QQQ Buy&Hold", f"{metrics['QQQ Buy & Hold %']}%")
+
+                st.caption(
+                    f"בדיקה מנורמלת: {metrics['Trades']} עסקאות × $1,000 = "
+                    f"${metrics['Total Notional Tested']:,.0f} חשיפה תאורטית מצטברת. "
+                    f"QQQ באותם חלונות עשה {metrics['QQQ Same Windows Return on Allocated Capital %']:.2f}%."
+                )
 
                 st.markdown("#### 📈 Signal Equity Curve")
                 st.line_chart(df_equity)
 
-                excel_bytes = build_excel_report(df_equity, df_trades, ticker_summary, metrics)
+                zip_bytes = build_zip_report(df_equity, df_trades, ticker_summary, metrics)
                 st.download_button(
-                    "⬇️ הורד קובץ Excel אחד עם כל הבדיקה",
-                    excel_bytes,
-                    file_name=f"swinghunter_{APP_VERSION}_clean_signal_report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "⬇️ הורד קובץ ZIP אחד עם כל הבדיקה",
+                    zip_bytes,
+                    file_name=f"swinghunter_{APP_VERSION}_clean_signal_report.zip",
+                    mime="application/zip",
                     use_container_width=True
                 )
 
