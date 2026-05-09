@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V10.1 - Banked Action Runner Engine", layout="wide")
-APP_VERSION = "V10.1"
+st.set_page_config(page_title="SwingHunter V10.2 - Trend Bank Engine", layout="wide")
+APP_VERSION = "V10.2"
 
 # ==========================================================
 # 1. Security
@@ -50,6 +50,7 @@ MOMENTUM_TICKERS = {
 
 NOTIONAL_PER_TRADE = 1000.0
 DEFAULT_STARTING_BANK = 50000.0
+DEFAULT_POSITION_PCT = 0.10
 
 
 # ==========================================================
@@ -58,10 +59,11 @@ DEFAULT_STARTING_BANK = 50000.0
 @dataclass
 class StrategyParams:
     max_risk_pct: float = 9.5
-    target_pct: float = 8.0  # TP1 in runner mode
-    tp1_fraction: float = 0.50
-    use_runner: bool = True
-    min_rr: float = 1.00
+    target_pct: float = 0.0  # V10.2: no fixed profit target
+    position_pct: float = DEFAULT_POSITION_PCT
+    initial_stop_buffer: float = 0.995
+    min_score_for_trade: float = 35.0
+    min_rr: float = 0.00
     min_atr_pct: float = 1.4
     overbought_rsi: float = 86.0
     max_20d_run: float = 60.0
@@ -219,12 +221,11 @@ def evaluate_ticker(
         "Entry": np.nan,
         "Distance to Entry %": np.nan,
         "Stop": np.nan,
-        "Target": np.nan,
-        "Runner Exit": "EMA21 close",
-        "TP1 Fraction": params.tp1_fraction,
+        "Target": "No fixed target",
+        "Exit Rule": "Daily close below EMA21 trail",
         "Risk %": np.nan,
-        "Target %": params.target_pct,
-        "R/R": np.nan,
+        "Target %": "Trend",
+        "R/R": "Trend",
         "Order": "",
         "Action Now": "",
         "Regime": "",
@@ -360,10 +361,10 @@ def evaluate_ticker(
         stop = round(stop, 2)
 
         risk_pct = (entry - stop) / entry * 100
-        target = round(entry * (1 + params.target_pct / 100), 2)
-        rr = params.target_pct / risk_pct if risk_pct > 0 else np.nan
 
-        score = score_candidate(rs5, rs20, run20, rr, risk_pct, setup, exceptional, momentum_name)
+        # V10.2: no fixed profit target. Score is based on trend quality.
+        rr_proxy = max(1.0, (rs20 + max(run20, 0)) / max(risk_pct, 1.0) / 5)
+        score = score_candidate(rs5, rs20, run20, rr_proxy, risk_pct, setup, exceptional, momentum_name)
 
         if risk_pct > params.max_risk_pct + 0.01:
             base.update(
@@ -372,24 +373,24 @@ def evaluate_ticker(
                 Setup=setup,
                 Entry=round(entry, 2),
                 Stop=stop,
-                Target=target,
-                Risk_pct=round(risk_pct, 2),
+                Target="No fixed target",
+                **{"Risk %": round(risk_pct, 2)},
                 Score=round(score, 2),
                 Reason=f"סיכון גבוה מדי ({risk_pct:.1f}%)"
             )
             return base
 
-        if rr < params.min_rr:
+        if score < params.min_score_for_trade:
             base.update(
                 Status="WATCH",
                 Decision="WAIT",
                 Setup=setup,
                 Entry=round(entry, 2),
                 Stop=stop,
-                Target=target,
-                Risk_pct=round(risk_pct, 2),
+                Target="No fixed target",
+                **{"Risk %": round(risk_pct, 2)},
                 Score=round(score, 2),
-                Reason=f"R/R נמוך ({rr:.2f})"
+                Reason=f"Score נמוך מדי לביצוע ({score:.1f})"
             )
             return base
 
@@ -413,9 +414,10 @@ def evaluate_ticker(
             "Entry": round(entry, 2),
             "Distance to Entry %": round(distance, 2),
             "Stop": stop,
-            "Target": target,
+            "Target": "No fixed target",
+            "Exit Rule": "Close below EMA21 trail",
             "Risk %": round(risk_pct, 2),
-            "R/R": round(rr, 2),
+            "R/R": "Trend",
             "Order": order_type,
             "Action Now": action,
             "Reason": ""
@@ -448,6 +450,13 @@ def execute_pending_order(order, open_p, high_p, low_p):
 # 6. Backtest - Banked, full exit, re-entry allowed after close
 # ==========================================================
 def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BANK):
+    """
+    V10.2 Trend Bank Engine:
+    - Each trade allocates position_pct of current equity, not a fixed $1,000.
+    - No fixed profit target.
+    - Full exit only, when daily close/trailing stop breaks the EMA21 trend.
+    - No second entry in a ticker while it is open.
+    """
     prices = get_panel(data, "Close")
     highs = get_panel(data, "High")
     lows = get_panel(data, "Low")
@@ -461,7 +470,6 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
     open_positions = {}
     pending_orders = {}
 
-    partial_exits = []
     trades = []
     equity_rows = []
     pending_created = 0
@@ -472,91 +480,15 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
     next_trade_id = 1
     max_open_positions = 0
 
-    def position_value(ticker, pos, i):
-        value = 0.0
-        try:
-            close_p = float(prices[ticker].iloc[i])
-        except Exception:
-            close_p = pos["Entry"]
-
-        for lot in pos["Lots"]:
-            value += lot["notional"] * (close_p / pos["Entry"])
-        return value
-
     def open_value(i):
-        return sum(position_value(ticker, pos, i) for ticker, pos in open_positions.items())
-
-    def total_open_notional(pos):
-        return sum(lot["notional"] for lot in pos["Lots"])
-
-    def close_lot(ticker, pos, lot_index, exit_price, exit_reason, date_str, i):
-        """
-        Closes one lot inside a position, returns cash to bank, logs partial exit.
-        """
-        nonlocal cash_bank
-
-        lot = pos["Lots"][lot_index]
-        notional = lot["notional"]
-
-        if notional <= 0:
-            return 0.0
-
-        ret_pct = (exit_price / pos["Entry"] - 1) * 100
-        pnl = notional * ret_pct / 100
-        cash_bank += notional + pnl
-
-        try:
-            q_entry = float(prices["QQQ"].loc[pd.to_datetime(pos["EntryDate"])])
-            q_exit = float(prices["QQQ"].iloc[i])
-            q_ret = (q_exit / q_entry - 1) * 100
-            q_pnl = notional * q_ret / 100
-        except Exception:
-            q_ret = np.nan
-            q_pnl = np.nan
-
-        partial_exits.append({
-            "TradeID": pos["TradeID"],
-            "Ticker": ticker,
-            "EntryDate": pos["EntryDate"],
-            "ExitDate": date_str,
-            "HoldingDays": i - pos["EntryIndex"],
-            "Setup": pos["Setup"],
-            "Lot": lot["name"],
-            "Notional": round(notional, 2),
-            "Entry": round(pos["Entry"], 2),
-            "Exit": round(exit_price, 2),
-            "ExitReason": exit_reason,
-            "Return %": round(ret_pct, 2),
-            "PnL": round(pnl, 2),
-            "Risk %": round(pos["Risk %"], 2),
-            "Score": round(pos["Score"], 2),
-            "QQQ Same Window %": round(q_ret, 2) if np.isfinite(q_ret) else np.nan,
-            "QQQ Same Window PnL": round(q_pnl, 2) if np.isfinite(q_pnl) else np.nan,
-        })
-
-        pos["RealizedPnL"] += pnl
-        pos["Lots"][lot_index]["notional"] = 0.0
-        return pnl
-
-    def finalize_if_closed(ticker, pos, final_exit_date):
-        if total_open_notional(pos) <= 0.01:
-            trades.append({
-                "TradeID": pos["TradeID"],
-                "Ticker": ticker,
-                "EntryDate": pos["EntryDate"],
-                "ExitDate": final_exit_date,
-                "HoldingDays": pos.get("LastExitIndex", pos["EntryIndex"]) - pos["EntryIndex"],
-                "Setup": pos["Setup"],
-                "Entry": round(pos["Entry"], 2),
-                "TotalPnL": round(pos["RealizedPnL"], 2),
-                "ReturnOn1000 %": round(pos["RealizedPnL"] / NOTIONAL_PER_TRADE * 100, 2),
-                "Risk %": round(pos["Risk %"], 2),
-                "Score": round(pos["Score"], 2),
-                "TP1Done": pos.get("TP1Done", False),
-                "FinalExitReason": pos.get("LastExitReason", "")
-            })
-            return True
-        return False
+        value = 0.0
+        for ticker, pos in open_positions.items():
+            try:
+                close_p = float(prices[ticker].iloc[i])
+                value += pos["Capital"] * (close_p / pos["Entry"])
+            except Exception:
+                value += pos["Capital"]
+        return value
 
     for i in range(start_idx, end_idx):
         date_str = prices.index[i].strftime("%Y-%m-%d")
@@ -568,7 +500,11 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
                 processed.add(ticker)
                 continue
 
-            if cash_bank < NOTIONAL_PER_TRADE:
+            current_equity_before_fill = cash_bank + open_value(i)
+            desired_capital = current_equity_before_fill * params.position_pct
+            capital = min(desired_capital, cash_bank)
+
+            if capital < 100:
                 pending_no_cash += 1
                 processed.add(ticker)
                 continue
@@ -584,18 +520,8 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
             fill = execute_pending_order(order, open_p, high_p, low_p)
 
             if fill is not None:
-                cash_bank -= NOTIONAL_PER_TRADE
-                turnover += NOTIONAL_PER_TRADE
-
-                if params.use_runner:
-                    first_notional = NOTIONAL_PER_TRADE * params.tp1_fraction
-                    runner_notional = NOTIONAL_PER_TRADE - first_notional
-                    lots = [
-                        {"name": "TP1", "notional": first_notional},
-                        {"name": "RUNNER", "notional": runner_notional},
-                    ]
-                else:
-                    lots = [{"name": "FULL", "notional": NOTIONAL_PER_TRADE}]
+                cash_bank -= capital
+                turnover += capital
 
                 open_positions[ticker] = {
                     "TradeID": next_trade_id,
@@ -603,17 +529,12 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
                     "EntryDate": date_str,
                     "EntryIndex": i,
                     "Entry": fill,
+                    "Capital": capital,
                     "Stop": order["Stop"],
-                    "InitialStop": order["Stop"],
-                    "Target": order["Target"],
+                    "TrailStop": order["Stop"],
                     "Setup": order["Setup"],
                     "Score": order["Score"],
                     "Risk %": (fill - order["Stop"]) / fill * 100,
-                    "Lots": lots,
-                    "TP1Done": False,
-                    "RealizedPnL": 0.0,
-                    "LastExitReason": "",
-                    "LastExitIndex": i,
                 }
                 next_trade_id += 1
                 pending_filled += 1
@@ -622,14 +543,13 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
         pending_expired += len([t for t in pending_orders if t not in processed])
         pending_orders.clear()
 
-        # 2) Manage positions.
+        # 2) Manage positions: full exit only, trend-following.
         closed = []
         for ticker, pos in list(open_positions.items()):
             if pos["EntryIndex"] == i:
                 continue
 
             try:
-                high_p = safe_float(highs[ticker].iloc[i])
                 low_p = safe_float(lows[ticker].iloc[i])
                 close_p = safe_float(prices[ticker].iloc[i])
                 hist = prices[ticker].iloc[max(0, i - 25):i + 1].dropna()
@@ -637,61 +557,56 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
             except Exception:
                 continue
 
-            # Conservative: if stop and target both touched, stop first.
-            if low_p <= pos["Stop"]:
-                for idx, lot in enumerate(pos["Lots"]):
-                    if lot["notional"] > 0:
-                        close_lot(ticker, pos, idx, pos["Stop"], "STOP", date_str, i)
-                pos["LastExitReason"] = "STOP"
-                pos["LastExitIndex"] = i
-                if finalize_if_closed(ticker, pos, date_str):
-                    closed.append(ticker)
-                continue
+            # Trail stop only moves upward.
+            ema_trail = ema21 * params.initial_stop_buffer
+            pos["TrailStop"] = max(pos["TrailStop"], ema_trail)
 
-            # TP1 partial.
-            if params.use_runner and (not pos["TP1Done"]) and high_p >= pos["Target"]:
-                # Close TP1 lot only.
-                for idx, lot in enumerate(pos["Lots"]):
-                    if lot["name"] == "TP1" and lot["notional"] > 0:
-                        close_lot(ticker, pos, idx, pos["Target"], "TP1_PARTIAL", date_str, i)
-                        break
+            exit_reason = None
+            exit_price = None
 
-                pos["TP1Done"] = True
-                pos["Stop"] = max(pos["Stop"], pos["Entry"])  # runner break-even
-                continue
+            if low_p <= pos["TrailStop"]:
+                exit_reason = "TRAIL_STOP"
+                exit_price = pos["TrailStop"]
+            elif np.isfinite(close_p) and close_p < ema21 * params.initial_stop_buffer:
+                exit_reason = "EMA21_CLOSE"
+                exit_price = close_p
+            elif i - pos["EntryIndex"] >= params.max_holding_days:
+                exit_reason = "TIME_EXIT"
+                exit_price = close_p
 
-            # Full-target mode.
-            if (not params.use_runner) and high_p >= pos["Target"]:
-                for idx, lot in enumerate(pos["Lots"]):
-                    if lot["notional"] > 0:
-                        close_lot(ticker, pos, idx, pos["Target"], "TARGET", date_str, i)
-                pos["LastExitReason"] = "TARGET"
-                pos["LastExitIndex"] = i
-                if finalize_if_closed(ticker, pos, date_str):
-                    closed.append(ticker)
-                continue
+            if exit_reason:
+                ret_pct = (exit_price / pos["Entry"] - 1) * 100
+                pnl = pos["Capital"] * ret_pct / 100
+                cash_bank += pos["Capital"] + pnl
 
-            # Runner exits by close under EMA21.
-            if np.isfinite(close_p) and close_p < ema21 * 0.995:
-                for idx, lot in enumerate(pos["Lots"]):
-                    if lot["notional"] > 0:
-                        reason = "RUNNER_EMA21_CLOSE" if pos.get("TP1Done", False) else "EMA21_CLOSE"
-                        close_lot(ticker, pos, idx, close_p, reason, date_str, i)
-                pos["LastExitReason"] = reason
-                pos["LastExitIndex"] = i
-                if finalize_if_closed(ticker, pos, date_str):
-                    closed.append(ticker)
-                continue
+                try:
+                    q_entry = float(prices["QQQ"].loc[pd.to_datetime(pos["EntryDate"])])
+                    q_exit = float(prices["QQQ"].iloc[i])
+                    q_ret = (q_exit / q_entry - 1) * 100
+                    q_pnl = pos["Capital"] * q_ret / 100
+                except Exception:
+                    q_ret = np.nan
+                    q_pnl = np.nan
 
-            if i - pos["EntryIndex"] >= params.max_holding_days:
-                for idx, lot in enumerate(pos["Lots"]):
-                    if lot["notional"] > 0:
-                        reason = "RUNNER_TIME_EXIT" if pos.get("TP1Done", False) else "TIME_EXIT"
-                        close_lot(ticker, pos, idx, close_p, reason, date_str, i)
-                pos["LastExitReason"] = reason
-                pos["LastExitIndex"] = i
-                if finalize_if_closed(ticker, pos, date_str):
-                    closed.append(ticker)
+                trades.append({
+                    "TradeID": pos["TradeID"],
+                    "Ticker": ticker,
+                    "EntryDate": pos["EntryDate"],
+                    "ExitDate": date_str,
+                    "HoldingDays": i - pos["EntryIndex"],
+                    "Setup": pos["Setup"],
+                    "Capital": round(pos["Capital"], 2),
+                    "Entry": round(pos["Entry"], 2),
+                    "Exit": round(exit_price, 2),
+                    "ExitReason": exit_reason,
+                    "Return %": round(ret_pct, 2),
+                    "PnL": round(pnl, 2),
+                    "Risk %": round(pos["Risk %"], 2),
+                    "Score": round(pos["Score"], 2),
+                    "QQQ Same Window %": round(q_ret, 2) if np.isfinite(q_ret) else np.nan,
+                    "QQQ Same Window PnL": round(q_pnl, 2) if np.isfinite(q_pnl) else np.nan,
+                })
+                closed.append(ticker)
 
         for ticker in closed:
             open_positions.pop(ticker, None)
@@ -731,9 +646,12 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
                 continue
 
         candidates = sorted(candidates, key=lambda x: x["Score"], reverse=True)
-        slots = int(cash_bank // NOTIONAL_PER_TRADE)
-        if slots > 0:
-            for cand in candidates[:slots]:
+
+        # Avoid creating more pending orders than cash can support.
+        slot_size = max(100, (cash_bank + ov) * params.position_pct)
+        available_slots = int(cash_bank // slot_size)
+        if available_slots > 0:
+            for cand in candidates[:available_slots]:
                 pending_orders[cand["Ticker"]] = cand
                 pending_created += 1
 
@@ -742,17 +660,29 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
     for ticker, pos in list(open_positions.items()):
         try:
             final_close = float(prices[ticker].iloc[end_idx])
-            for idx, lot in enumerate(pos["Lots"]):
-                if lot["notional"] > 0:
-                    reason = "RUNNER_FINAL_CLOSE" if pos.get("TP1Done", False) else "FINAL_CLOSE"
-                    close_lot(ticker, pos, idx, final_close, reason, final_date, end_idx)
-            pos["LastExitReason"] = reason
-            pos["LastExitIndex"] = end_idx
-            finalize_if_closed(ticker, pos, final_date)
+            ret_pct = (final_close / pos["Entry"] - 1) * 100
+            pnl = pos["Capital"] * ret_pct / 100
+            cash_bank += pos["Capital"] + pnl
+
+            trades.append({
+                "TradeID": pos["TradeID"],
+                "Ticker": ticker,
+                "EntryDate": pos["EntryDate"],
+                "ExitDate": final_date,
+                "HoldingDays": end_idx - pos["EntryIndex"],
+                "Setup": pos["Setup"],
+                "Capital": round(pos["Capital"], 2),
+                "Entry": round(pos["Entry"], 2),
+                "Exit": round(final_close, 2),
+                "ExitReason": "FINAL_CLOSE",
+                "Return %": round(ret_pct, 2),
+                "PnL": round(pnl, 2),
+                "Risk %": round(pos["Risk %"], 2),
+                "Score": round(pos["Score"], 2),
+            })
         except Exception:
             pass
 
-    df_exits = pd.DataFrame(partial_exits)
     df_trades = pd.DataFrame(trades)
     df_equity = pd.DataFrame(equity_rows).set_index("Date") if equity_rows else pd.DataFrame()
 
@@ -764,15 +694,15 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
         df_equity.loc[final_date, "Exposure %"] = 0.0
 
     if not df_trades.empty:
-        wins = int((df_trades["TotalPnL"] > 0).sum())
-        losses = int((df_trades["TotalPnL"] < 0).sum())
-        gross_profit = float(df_trades.loc[df_trades["TotalPnL"] > 0, "TotalPnL"].sum())
-        gross_loss = float(-df_trades.loc[df_trades["TotalPnL"] < 0, "TotalPnL"].sum())
-        total_pnl = float(df_trades["TotalPnL"].sum())
-        avg_ret = float(df_trades["ReturnOn1000 %"].mean())
-        avg_win = float(df_trades.loc[df_trades["TotalPnL"] > 0, "ReturnOn1000 %"].mean()) if wins else 0.0
-        avg_loss = float(df_trades.loc[df_trades["TotalPnL"] < 0, "ReturnOn1000 %"].mean()) if losses else 0.0
-        qqq_same_pnl = float(df_exits["QQQ Same Window PnL"].sum(skipna=True)) if not df_exits.empty and "QQQ Same Window PnL" in df_exits else 0.0
+        wins = int((df_trades["PnL"] > 0).sum())
+        losses = int((df_trades["PnL"] < 0).sum())
+        gross_profit = float(df_trades.loc[df_trades["PnL"] > 0, "PnL"].sum())
+        gross_loss = float(-df_trades.loc[df_trades["PnL"] < 0, "PnL"].sum())
+        total_pnl = float(df_trades["PnL"].sum())
+        avg_ret = float(df_trades["Return %"].mean())
+        avg_win = float(df_trades.loc[df_trades["PnL"] > 0, "Return %"].mean()) if wins else 0.0
+        avg_loss = float(df_trades.loc[df_trades["PnL"] < 0, "Return %"].mean()) if losses else 0.0
+        qqq_same_pnl = float(df_trades["QQQ Same Window PnL"].sum(skipna=True)) if "QQQ Same Window PnL" in df_trades else 0.0
     else:
         wins = losses = 0
         gross_profit = gross_loss = total_pnl = avg_ret = avg_win = avg_loss = qqq_same_pnl = 0.0
@@ -802,10 +732,10 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
             df_trades.groupby("Ticker", as_index=False)
             .agg(
                 Trades=("TradeID", "count"),
-                PnL=("TotalPnL", "sum"),
-                AvgReturn=("ReturnOn1000 %", "mean"),
-                Wins=("TotalPnL", lambda x: int((x > 0).sum())),
-                Losses=("TotalPnL", lambda x: int((x < 0).sum())),
+                PnL=("PnL", "sum"),
+                AvgReturn=("Return %", "mean"),
+                Wins=("PnL", lambda x: int((x > 0).sum())),
+                Losses=("PnL", lambda x: int((x < 0).sum())),
             )
             .sort_values("PnL", ascending=False)
         )
@@ -820,13 +750,10 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
         "Starting Bank": round(starting_bank, 2),
         "Ending Bank": round(cash_bank, 2),
         "Bank ROI %": round(roi, 2),
-        "Trade Size": NOTIONAL_PER_TRADE,
-        "Runner Mode": params.use_runner,
-        "TP1 %": params.target_pct,
-        "TP1 Fraction": params.tp1_fraction,
+        "Position % of Bank": round(params.position_pct * 100, 2),
         "Max Risk %": params.max_risk_pct,
+        "Exit Rule": "No fixed target; full exit on EMA21/trailing stop",
         "Trades": len(df_trades),
-        "Partial Exits": len(df_exits),
         "Wins": wins,
         "Losses": losses,
         "Win Rate %": round(win_rate, 2),
@@ -848,7 +775,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
         "Pending No Cash": pending_no_cash,
     }
 
-    return df_equity, df_trades, ticker_summary, metrics, df_exits
+    return df_equity, df_trades, ticker_summary, metrics
 # ==========================================================
 # 7. Live Daily Dashboard
 # ==========================================================
@@ -889,7 +816,7 @@ def get_today_actions(params: StrategyParams):
 # ==========================================================
 # 8. Export
 # ==========================================================
-def build_zip_report(df_equity, df_trades, ticker_summary, metrics, daily_orders=None, daily_radar=None, df_exits=None):
+def build_zip_report(df_equity, df_trades, ticker_summary, metrics, daily_orders=None, daily_radar=None):
     output = BytesIO()
     metrics_df = pd.DataFrame([{"Metric": k, "Value": v} for k, v in metrics.items()])
 
@@ -898,8 +825,6 @@ def build_zip_report(df_equity, df_trades, ticker_summary, metrics, daily_orders
         zf.writestr("bank_equity.csv", df_equity.reset_index().to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("trades.csv", df_trades.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("ticker_summary.csv", ticker_summary.to_csv(index=False).encode("utf-8-sig"))
-        if df_exits is not None:
-            zf.writestr("partial_exits.csv", df_exits.to_csv(index=False).encode("utf-8-sig"))
         if daily_orders is not None:
             zf.writestr("daily_orders.csv", daily_orders.to_csv(index=False).encode("utf-8-sig"))
         if daily_radar is not None:
@@ -926,19 +851,19 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.1 — Banked Action Runner Engine</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.2 — Trend Bank Engine</h1>", unsafe_allow_html=True)
     st.info(
-        "V10.1 שומרת על המסך הברור של V10 ומוסיפה Runner: ב-TP1 נמכרים 50%, "
-        "הסטופ על היתרה עולה ל-Break Even, והראנר יוצא רק ב-EMA21/סטופ/זמן/סוף בדיקה."
+        "V10.2 משנה את חוקי המשחק: 10% מהבנק לכל עסקה, בלי יעד רווח קשיח, "
+        "ויציאה מלאה רק כשהמגמה נשברת לפי EMA21/Trailing Stop. זה בודק אם יש Trend Following אמיתי מול QQQ."
     )
 
     st.sidebar.header("הגדרות קצרות")
     months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 24, 12)
     starting_bank = st.sidebar.number_input("בנק התחלתי ($)", value=50000, step=5000)
     max_risk_pct = st.sidebar.slider("סיכון מקסימלי לעסקה (%)", 4.0, 15.0, 9.5, 0.5)
-    target_pct = st.sidebar.slider("TP1 - יעד ראשון (%)", 6.0, 18.0, 8.0, 0.5)
+    position_pct = st.sidebar.slider("אחוז מהבנק לכל עסקה", 5.0, 25.0, 10.0, 1.0) / 100
 
-    params = StrategyParams(max_risk_pct=max_risk_pct, target_pct=target_pct, use_runner=True, tp1_fraction=0.50)
+    params = StrategyParams(max_risk_pct=max_risk_pct, position_pct=position_pct)
 
     tab_daily, tab_backtest = st.tabs(["🚀 מה עושים היום", "🔬 בדיקת בנק"])
 
@@ -952,7 +877,7 @@ else:
                 if not df_orders.empty:
                     cols = [
                         "Ticker","Action Now","Order","Current","Entry","Distance to Entry %",
-                        "Stop","Target","Runner Exit","Risk %","Target %","R/R","Setup","Score",
+                        "Stop","Exit Rule","Risk %","Setup","Score",
                         "Regime","RS5","RS20","RSI","ATR%","20D Run"
                     ]
                     cols = [c for c in cols if c in df_orders.columns]
@@ -986,12 +911,12 @@ else:
                 )
 
     with tab_backtest:
-        st.markdown(f"### 🧪 Banked Backtest — {months} חודשים — בנק ${starting_bank:,.0f} — $1,000 לכל כניסה")
+        st.markdown(f"### 🧪 Banked Backtest — {months} חודשים — בנק ${starting_bank:,.0f} — 10% מהבנק לכל כניסה")
 
         if st.button("⚙️ הרץ בדיקת בנק", type="primary"):
-            with st.spinner("מריץ Backtest עם בנק, כניסה חוזרת אחרי מכירה מלאה, TP1 + Runner + סטופ/EMA21..."):
+            with st.spinner("מריץ Backtest עם בנק, כניסה חוזרת אחרי מכירה מלאה, ויציאה מלאה בכל יעד/סטופ..."):
                 data = fetch_backtest_data(months)
-                df_equity, df_trades, ticker_summary, metrics, df_exits = run_banked_backtest(
+                df_equity, df_trades, ticker_summary, metrics = run_banked_backtest(
                     data,
                     months,
                     params,
@@ -1012,7 +937,7 @@ else:
 
                 st.caption(
                     f"מודל בנק: מתחילים עם ${metrics['Starting Bank']:,.0f}. "
-                    f"כל עסקה משתמשת ב-$1,000. כשהיא נמכרת, $1,000 + רווח/הפסד חוזר לבנק. "
+                    f"כל עסקה משתמשת ב-{metrics['Position % of Bank']:.0f}% מהבנק בזמן הכניסה. היציאה היא מלאה בשבירת EMA21/Trailing Stop. "
                     f"Turnover: ${metrics['Turnover']:,.0f}. חשיפה ממוצעת: {metrics['Average Exposure %']:.1f}%."
                 )
 
@@ -1020,7 +945,7 @@ else:
                 if not df_equity.empty:
                     st.line_chart(df_equity[["Total Equity"]])
 
-                zip_bytes = build_zip_report(df_equity, df_trades, ticker_summary, metrics, df_exits=df_exits)
+                zip_bytes = build_zip_report(df_equity, df_trades, ticker_summary, metrics)
                 st.download_button(
                     "⬇️ הורד ZIP אחד עם כל הבדיקה",
                     zip_bytes,
@@ -1030,12 +955,8 @@ else:
                 )
 
                 if not df_trades.empty:
-                    with st.expander("📌 עסקאות מלאות"):
+                    with st.expander("📌 כל העסקאות"):
                         st.dataframe(df_trades, use_container_width=True, hide_index=True)
-
-                if not df_exits.empty:
-                    with st.expander("🧾 יציאות חלקיות / Runner"):
-                        st.dataframe(df_exits, use_container_width=True, hide_index=True)
 
                 if not ticker_summary.empty:
                     with st.expander("🏷️ PnL לפי טיקר"):
