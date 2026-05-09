@@ -11,9 +11,9 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V7.8 - Portfolio Defaults", layout="wide")
+st.set_page_config(page_title="SwingHunter V7.9 - Portfolio Metrics Fix", layout="wide")
 
-APP_VERSION = "V7.8"
+APP_VERSION = "V7.9"
 
 # ==========================================================
 # 1. Security + Settings
@@ -859,6 +859,7 @@ def run_backtest_simulation(
     pending_orders = {}
 
     equity_curve, dates, trade_log = [], [], []
+    exposure_pct_curve = []
     total_invested = 0.0
     exposure_days = 0
     max_equity = starting_capital
@@ -928,8 +929,12 @@ def run_backtest_simulation(
         # --------------------------------------------------
         # 1. Execute pending DAY orders generated yesterday
         # --------------------------------------------------
+        processed_pending = set()
+
         for ticker, order in list(pending_orders.items()):
             if ticker in positions or len(positions) >= max_positions:
+                # Order cannot be used today; treat it as expired DAY order.
+                processed_pending.add(ticker)
                 continue
 
             try:
@@ -940,6 +945,7 @@ def run_backtest_simulation(
                 continue
 
             if not np.isfinite(today_open):
+                processed_pending.add(ticker)
                 continue
 
             executed = False
@@ -958,6 +964,7 @@ def run_backtest_simulation(
                 # If opens above limit, a real stop-limit would probably not fill.
                 if today_open > limit_price:
                     orders_gap_rejected += 1
+                    processed_pending.add(ticker)
                     continue
 
                 if today_high >= stop_price:
@@ -966,6 +973,7 @@ def run_backtest_simulation(
                         executed = True
                     else:
                         orders_gap_rejected += 1
+                        processed_pending.add(ticker)
                         continue
 
             if executed:
@@ -980,6 +988,8 @@ def run_backtest_simulation(
                     cash -= total_cost
                     total_invested += exec_price * shares
                     orders_executed += 1
+
+                    processed_pending.add(ticker)
 
                     positions[ticker] = {
                         "trade_id": trade_id,
@@ -996,8 +1006,9 @@ def run_backtest_simulation(
                     }
 
         # DAY orders that did not fill are cancelled.
-        # Count only today's unfilled pending orders, not cumulative executed orders.
-        orders_expired += len(pending_orders)
+        # Filled and gap-rejected orders were marked as processed, so they are not counted as expired.
+        unprocessed_pending = [t for t in pending_orders.keys() if t not in processed_pending]
+        orders_expired += len(unprocessed_pending)
         pending_orders.clear()
 
         # --------------------------------------------------
@@ -1089,6 +1100,10 @@ def run_backtest_simulation(
 
             if not pd.isna(ticker_close):
                 portfolio_value += pos["remaining"] * float(ticker_close)
+
+        capital_exposure = max(0.0, portfolio_value - cash)
+        capital_exposure_pct = (capital_exposure / portfolio_value * 100) if portfolio_value > 0 else 0.0
+        exposure_pct_curve.append(capital_exposure_pct)
 
         max_equity = max(max_equity, portfolio_value)
 
@@ -1270,12 +1285,18 @@ def run_backtest_simulation(
     # Add final equity point after liquidation.
     equity_curve.append(final_value)
     dates.append(final_date)
+    exposure_pct_curve.append(0.0)
 
-    df_equity = pd.DataFrame({"Date": dates, "Portfolio Value": equity_curve}).set_index("Date")
+    df_equity = pd.DataFrame({
+        "Date": dates,
+        "Portfolio Value": equity_curve,
+        "Capital Exposure %": exposure_pct_curve[:len(dates)]
+    }).set_index("Date")
     df_trades = pd.DataFrame(trade_log)
 
     total_days = max(1, len(dates))
-    exposure_pct = exposure_days / total_days * 100
+    days_in_market_pct = exposure_days / total_days * 100
+    avg_capital_exposure_pct = float(np.nanmean(exposure_pct_curve)) if exposure_pct_curve else 0.0
 
     # Full-trade metrics by TradeID.
     if not df_trades.empty and "TradeID" in df_trades.columns:
@@ -1302,6 +1323,28 @@ def run_backtest_simulation(
     gross_loss = float(-trade_summary.loc[trade_summary["TotalPnL"] < 0, "TotalPnL"].sum()) if not trade_summary.empty else 0.0
     wins = int((trade_summary["TotalPnL"] > 0).sum()) if not trade_summary.empty else 0
     losses = int((trade_summary["TotalPnL"] < 0).sum()) if not trade_summary.empty else 0
+
+    if not trade_summary.empty:
+        ticker_summary = (
+            trade_summary.groupby("Ticker", as_index=False)
+            .agg(
+                Trades=("TradeID", "count"),
+                PnL=("TotalPnL", "sum"),
+                AvgTradePnL=("TotalPnL", "mean"),
+                Wins=("TotalPnL", lambda x: int((x > 0).sum())),
+                Losses=("TotalPnL", lambda x: int((x < 0).sum())),
+            )
+            .sort_values(by="PnL", ascending=False)
+        )
+        ticker_summary["WinRate %"] = np.where(
+            ticker_summary["Trades"] > 0,
+            ticker_summary["Wins"] / ticker_summary["Trades"] * 100,
+            0
+        ).round(1)
+        ticker_summary["PnL"] = ticker_summary["PnL"].round(2)
+        ticker_summary["AvgTradePnL"] = ticker_summary["AvgTradePnL"].round(2)
+    else:
+        ticker_summary = pd.DataFrame(columns=["Ticker", "Trades", "PnL", "AvgTradePnL", "Wins", "Losses", "WinRate %"])
 
     # Benchmarks for exact tested window.
     benchmarks = {}
@@ -1356,13 +1399,15 @@ def run_backtest_simulation(
         gross_profit,
         gross_loss,
         max_drawdown,
-        exposure_pct,
+        days_in_market_pct,
+        avg_capital_exposure_pct,
         orders_created,
         orders_executed,
         orders_expired,
         orders_gap_rejected,
         benchmarks,
-        df_missed
+        df_missed,
+        ticker_summary
     )
 
 
@@ -1371,6 +1416,7 @@ def build_backtest_excel_report(
     df_trades: pd.DataFrame,
     trade_summary: pd.DataFrame,
     df_missed: pd.DataFrame,
+    ticker_summary: pd.DataFrame,
     metrics: dict,
     benchmarks: dict
 ) -> bytes:
@@ -1393,6 +1439,7 @@ def build_backtest_excel_report(
             benchmarks_df.to_excel(writer, index=False, sheet_name="Benchmarks")
             df_eq.reset_index().to_excel(writer, index=False, sheet_name="Equity Curve")
             trade_summary.to_excel(writer, index=False, sheet_name="Trade Summary")
+            ticker_summary.to_excel(writer, index=False, sheet_name="Ticker Summary")
             df_trades.to_excel(writer, index=False, sheet_name="Partial Exits")
             df_missed.to_excel(writer, index=False, sheet_name="Missed Winners")
     except Exception:
@@ -1403,6 +1450,7 @@ def build_backtest_excel_report(
             benchmarks_df.to_excel(writer, index=False, sheet_name="Benchmarks")
             df_eq.reset_index().to_excel(writer, index=False, sheet_name="Equity Curve")
             trade_summary.to_excel(writer, index=False, sheet_name="Trade Summary")
+            ticker_summary.to_excel(writer, index=False, sheet_name="Ticker Summary")
             df_trades.to_excel(writer, index=False, sheet_name="Partial Exits")
             df_missed.to_excel(writer, index=False, sheet_name="Missed Winners")
 
@@ -1415,6 +1463,7 @@ def build_backtest_csv_report(
     df_trades: pd.DataFrame,
     trade_summary: pd.DataFrame,
     df_missed: pd.DataFrame,
+    ticker_summary: pd.DataFrame,
     metrics: dict,
     benchmarks: dict
 ) -> bytes:
@@ -1433,6 +1482,7 @@ def build_backtest_csv_report(
     add_section("Benchmarks", benchmarks_df)
     add_section("Equity Curve", df_eq.reset_index())
     add_section("Trade Summary", trade_summary)
+    add_section("Ticker Summary", ticker_summary)
     add_section("Partial Exits", df_trades)
     add_section("Missed Winners", df_missed)
 
@@ -1455,8 +1505,8 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.8 - Portfolio Defaults</h1>", unsafe_allow_html=True)
-    st.info("V7.8: ברירות המחדל כבר מכוונות למה שאנחנו רוצים לבדוק — Portfolio Mode, 20% מהתיק לפוזיציה, 80% חשיפה מקסימלית, סיכון $200 לעסקה ב-Balanced, Anti-Churn, ו-Export אחד מלא.")
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.9 - Portfolio Metrics Fix</h1>", unsafe_allow_html=True)
+    st.info("V7.9: ברירות מחדל לתיק אמיתי + תיקון מדדים: Expired Orders, חשיפה ממוצעת של הון, Return/Drawdown, QQQ מתואם חשיפה, PnL לפי טיקר ו-Export אחד מלא.")
 
     st.sidebar.header("ניהול כספי")
 
@@ -1560,8 +1610,8 @@ else:
                     double_loss_freeze_days
                 )
                 (df_eq, df_trades, trade_summary, wins, losses, total_invested, gross_profit, gross_loss,
-                 max_drawdown, exposure_pct, orders_created, orders_executed, orders_expired,
-                 orders_gap_rejected, benchmarks, df_missed) = result
+                 max_drawdown, days_in_market_pct, avg_capital_exposure_pct, orders_created, orders_executed, orders_expired,
+                 orders_gap_rejected, benchmarks, df_missed, ticker_summary) = result
 
                 net_pnl = gross_profit - gross_loss
                 final_value = df_eq["Portfolio Value"].iloc[-1] if not df_eq.empty else 10000.0
@@ -1581,14 +1631,21 @@ else:
                 c5, c6, c7, c8 = st.columns(4)
                 c5.metric("Win Rate לפי עסקה", f"{win_rate:.1f}%")
                 c6.metric("Avg Win / Avg Loss", f"${avg_win:.0f} / ${avg_loss:.0f}")
-                c7.metric("חשיפה לשוק", f"{exposure_pct:.1f}%")
+                c7.metric("חשיפה ממוצעת של הון", f"{avg_capital_exposure_pct:.1f}%")
+                c7.caption(f"ימים בפוזיציה: {days_in_market_pct:.1f}%")
                 c8.metric("השקעה מצטברת", f"${total_invested:,.0f}")
                 c9, c10, c11, c12 = st.columns(4)
                 c9.metric("פקודות נוצרו", f"{orders_created}")
                 c10.metric("פקודות נתפסו", f"{orders_executed}")
                 c10.caption(f"Expired: {orders_expired} | Gap rejected: {orders_gap_rejected}")
                 c11.metric("SPY", f"{benchmarks.get('SPY', 0):.1f}%")
-                c12.metric("QQQ", f"{benchmarks.get('QQQ', 0):.1f}%")
+                qqq_return = benchmarks.get('QQQ', 0)
+                qqq_adjusted = qqq_return * (avg_capital_exposure_pct / 100) if avg_capital_exposure_pct else 0
+                c12.metric("QQQ", f"{qqq_return:.1f}%")
+                c12.caption(f"QQQ מתואם חשיפה: {qqq_adjusted:.1f}%")
+
+                return_to_dd = (roi / abs(max_drawdown)) if max_drawdown < 0 else np.inf
+                st.caption(f"Return / Max Drawdown: {return_to_dd:.2f} | QQQ מתואם חשיפה: {qqq_adjusted:.1f}%")
 
                 export_metrics = {
                     "App Version": APP_VERSION,
@@ -1607,10 +1664,13 @@ else:
                     "Net PnL": net_pnl,
                     "Profit Factor": profit_factor if np.isfinite(profit_factor) else "∞",
                     "Max Drawdown %": max_drawdown,
+                    "Return / Max Drawdown": return_to_dd if np.isfinite(return_to_dd) else "∞",
                     "Win Rate %": win_rate,
                     "Avg Win": avg_win,
                     "Avg Loss": avg_loss,
-                    "Exposure %": exposure_pct,
+                    "Days in Market %": days_in_market_pct,
+                    "Average Capital Exposure %": avg_capital_exposure_pct,
+                    "QQQ Exposure Adjusted %": qqq_adjusted,
                     "Orders Created": orders_created,
                     "Orders Executed": orders_executed,
                     "Orders Expired": orders_expired,
@@ -1623,7 +1683,7 @@ else:
                 st.markdown("#### 📦 יצוא קובץ אחד")
                 try:
                     excel_bytes = build_backtest_excel_report(
-                        df_eq, df_trades, trade_summary, df_missed, export_metrics, benchmarks
+                        df_eq, df_trades, trade_summary, df_missed, ticker_summary, export_metrics, benchmarks
                     )
                     st.download_button(
                         "⬇️ הורד קובץ Excel אחד עם כל הנתונים",
@@ -1634,7 +1694,7 @@ else:
                     )
                 except Exception as e:
                     csv_bytes = build_backtest_csv_report(
-                        df_eq, df_trades, trade_summary, df_missed, export_metrics, benchmarks
+                        df_eq, df_trades, trade_summary, df_missed, ticker_summary, export_metrics, benchmarks
                     )
                     st.download_button(
                         "⬇️ הורד קובץ CSV אחד עם כל הנתונים",
@@ -1651,6 +1711,10 @@ else:
                 if not df_missed.empty:
                     with st.expander("🏃 Missed Winner Diagnostics — מי עלו הכי הרבה ולמה פספסנו"):
                         st.dataframe(df_missed, use_container_width=True)
+
+                if not ticker_summary.empty:
+                    with st.expander("🏷️ PnL לפי טיקר"):
+                        st.dataframe(ticker_summary, use_container_width=True)
 
                 if not trade_summary.empty:
                     with st.expander("📌 סיכום לפי TradeID — מדידת עסקה מלאה"):
