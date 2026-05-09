@@ -13,8 +13,8 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. הגדרות משתמש (User Settings) - ערוך כאן!
 # ==========================================
-APP_PASSWORD = "YOUR_WEBSITE_PASSWORD" # שנה לסיסמה שתשמש אותך לכניסה לאתר
-MY_EMAIL = "your_email@gmail.com"      # המייל שלך (שולח ומקבל)
+APP_PASSWORD = "Pk0105Ak2701" # שנה לסיסמה שתשמש אותך לכניסה לאתר
+MY_EMAIL = "orel@peleg-eng.com"      # המייל שלך (שולח ומקבל)
 
 # רשימת מניות חזקות וסחירות (אפשר להוסיף/להוריד)
 WATCHLIST = [
