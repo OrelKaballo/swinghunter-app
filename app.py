@@ -10,9 +10,9 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V7.4 - Leader Recovery + Smarter Diagnostics", layout="wide")
+st.set_page_config(page_title="SwingHunter V7.6 - Backtest Integrity Fix", layout="wide")
 
-APP_VERSION = "V7.4"
+APP_VERSION = "V7.6"
 
 # ==========================================================
 # 1. Security + Settings
@@ -70,6 +70,9 @@ class StrategyParams:
     allow_leader_recovery: bool
     leader_recovery_rs20_min: float
     leader_recovery_20d_min: float
+    auto_trade_momentum_only: bool
+    risk_budget_default: float
+    runner_trail_close_only: bool
     max_positions_default: int
 
 
@@ -92,13 +95,16 @@ def get_params(mode: str) -> StrategyParams:
             stop_atr_pullback=1.6,
             tp1_pct=0.07,
             tp1_fraction=0.50,
-            runner_target_pct=0.12,
+            runner_target_pct=0.20,  # display only; runner is mainly trailing-based
             use_trailing_runner=True,
             min_atr_pct=1.8,
             momentum_bonus=5,
             allow_leader_recovery=False,
             leader_recovery_rs20_min=12.0,
             leader_recovery_20d_min=10.0,
+            auto_trade_momentum_only=True,
+            risk_budget_default=120.0,
+            runner_trail_close_only=True,
             max_positions_default=4,
         )
 
@@ -118,44 +124,50 @@ def get_params(mode: str) -> StrategyParams:
             max_20d_run=55,
             stop_atr_breakout=2.6,
             stop_atr_pullback=2.1,
-            tp1_pct=0.07,
+            tp1_pct=0.08,
             tp1_fraction=0.50,
-            runner_target_pct=0.12,
+            runner_target_pct=0.30,  # display only; runner is mainly trailing-based
             use_trailing_runner=True,
-            min_atr_pct=1.2,
+            min_atr_pct=1.5,
             momentum_bonus=12,
             allow_leader_recovery=True,
             leader_recovery_rs20_min=6.0,
             leader_recovery_20d_min=5.0,
+            auto_trade_momentum_only=True,
+            risk_budget_default=150.0,
+            runner_trail_close_only=True,
             max_positions_default=7,
         )
 
-    # V7.4: Balanced keeps 7/12 exits, adds Leader Recovery, weighted R/R, ATR filter, and richer diagnostics.
+    # V7.5 Power Swing: auto-orders only for Momentum/Growth, SMA200 hard gate for orders, TP1 8%, runner trails by EMA21 close, fixed-risk sizing.
     return StrategyParams(
         mode="Balanced",
         armed_threshold=68,
         actionable_threshold=60,
         building_threshold=38,
-        min_rr=1.20,
-        max_risk_pct=9.0,
-        allow_bear_market_orders=True,  # Controlled: orders in BEAR only if Edge Score is strong enough
+        min_rr=1.45,
+        max_risk_pct=11.0,
+        allow_bear_market_orders=False,  # V7.5: no automatic orders when SPY is weak
         bear_market_min_edge=60,
-        rs5_min=1.2,
-        rs20_min=3.5,
+        rs5_min=1.5,
+        rs20_min=4.0,
         overbought_rsi=82,
-        max_20d_run=45,
-        stop_atr_breakout=2.3,
-        stop_atr_pullback=1.9,
-        tp1_pct=0.07,
+        max_20d_run=50,
+        stop_atr_breakout=2.7,
+        stop_atr_pullback=2.3,
+        tp1_pct=0.08,
         tp1_fraction=0.50,
-        runner_target_pct=0.12,
+        runner_target_pct=0.25,  # display only; runner is mainly trailing-based
         use_trailing_runner=True,
-        min_atr_pct=1.4,
+        min_atr_pct=1.8,
         momentum_bonus=10,
         allow_leader_recovery=True,
         leader_recovery_rs20_min=8.0,
         leader_recovery_20d_min=6.0,
-        max_positions_default=6,
+        auto_trade_momentum_only=True,
+        risk_budget_default=150.0,
+        runner_trail_close_only=True,
+        max_positions_default=5,
     )
 
 
@@ -363,7 +375,7 @@ def post_event_drift(df: pd.DataFrame):
 # ==========================================================
 # 5. Live Edge Engine
 # ==========================================================
-def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investment_budget: float, params: StrategyParams):
+def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investment_budget: float, risk_budget: float, params: StrategyParams):
     df = download_single(ticker, "300d")
     if df.empty or len(df) < 220:
         return None
@@ -471,6 +483,24 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
     order_data = None
     can_create_order = decision in ["ARMED", "Actionable"]
 
+    # V7.5 safety rails:
+    # 1) automatic orders only in the momentum/growth universe
+    # 2) hard SMA200 gate for actual orders
+    # 3) Leader Recovery is radar-only, not auto-trade
+    if ticker not in MOMENTUM_TICKERS and params.auto_trade_momentum_only:
+        can_create_order = False
+        if not reject_reason:
+            reject_reason = "לא Momentum/Growth — רדאר בלבד"
+    if last_price < sma200:
+        can_create_order = False
+        if leader_recovery:
+            reject_reason = "Leader Recovery מתחת SMA200 — רדאר בלבד"
+        elif not reject_reason:
+            reject_reason = "מתחת SMA200 — אין פקודה אוטומטית"
+    if setup_type == "Leader Recovery":
+        can_create_order = False
+        reject_reason = "Leader Recovery — Watchlist only"
+
     if can_create_order:
         p_type = None
         entry = 0.0
@@ -534,8 +564,11 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
                 risk_pct = risk_per_share / entry * 100
                 rr = calc_rr_from_weighted_reward(entry, stop, params)
                 if risk_pct <= params.max_risk_pct and rr >= params.min_rr:
-                    shares = int(investment_budget / entry)
+                    shares_by_cash = int(investment_budget / entry)
+                    shares_by_risk = int(risk_budget / risk_per_share)
+                    shares = min(shares_by_cash, shares_by_risk)
                     if shares > 0:
+                        actual_risk = round(shares * risk_per_share, 2)
                         order_data = {
                             "מניה": ticker,
                             "פעולה": p_type,
@@ -543,12 +576,13 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
                             "כניסה": e_disp,
                             "כמות": shares,
                             "השקעה $": f"${round(shares * entry, 2)}",
+                            "סיכון $": f"${actual_risk}",
                             "יעד ראשון": round(entry * (1 + params.tp1_pct), 2),
-                            "יעד ראנר": round(entry * (1 + params.runner_target_pct), 2),
+                            "יעד ראנר": "אין יעד קבוע — trailing EMA21",
                             "סטופ": stop,
                             "סיכון %": f"{round(risk_pct, 1)}%",
-                            "R/R": round(rr, 2),
-                            "ניהול יציאה": f"Sell {int(params.tp1_fraction * 100)}% at TP1, trail rest by EMA21/ATR",
+                            "R/R משוקלל": round(rr, 2),
+                            "ניהול יציאה": f"Sell {int(params.tp1_fraction * 100)}% at TP1, trail rest by EMA21 close",
                             "תוקף": "DAY ONLY"
                         }
                 else:
@@ -717,19 +751,8 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
                     blockers["Already above breakout trigger"] += 1
 
             elif leader_recovery:
-                # Leader Recovery: do not auto-reject below SMA200 when RS is exceptional.
-                shallow_entry = round(min(ema8 * 1.003, last_p * 0.99), 2)
-                momentum_entry = round(prev_hi * 1.002, 2)
-                if last_p > shallow_entry and (last_p / ema8 - 1) < 0.055:
-                    entry = shallow_entry
-                    stop = round(entry - params.stop_atr_breakout * atr, 2)
-                    possible = True
-                elif last_p < momentum_entry:
-                    entry = momentum_entry
-                    stop = round(entry - params.stop_atr_breakout * atr, 2)
-                    possible = True
-                else:
-                    blockers["Leader Recovery too extended / no clean entry"] += 1
+                # Watchlist only in V7.5.
+                blockers["Leader Recovery watchlist only"] += 1
 
             elif strong_leader:
                 # Leader Mode: shallow EMA8 pullback or stop above yesterday high.
@@ -794,8 +817,31 @@ def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Seri
     }
 
 
-def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, params: StrategyParams, months: int,
-                            starting_capital: float = 10000.0, max_positions: int = 6, diagnostics_top_n: int = 20):
+
+def run_backtest_simulation(
+    data: pd.DataFrame,
+    investment_per_trade: float,
+    risk_budget: float,
+    params: StrategyParams,
+    months: int,
+    starting_capital: float = 10000.0,
+    max_positions: int = 6,
+    diagnostics_top_n: int = 20,
+    slippage_pct: float = 0.001,
+    commission_per_fill: float = 0.0
+):
+    """
+    V7.6 Backtest Integrity Fix:
+    1) DAY orders are generated at close of day i and can execute only on day i+1.
+    2) A position cannot be stopped/take-profit on the same day it was opened.
+       This avoids false stop-outs caused by not knowing intraday sequence.
+    3) BUY STOP LIMIT is simulated with both stop and limit:
+       if the stock gaps above the limit, the order is not filled.
+    4) Open positions are liquidated at the final close and counted in PnL.
+    5) TradeID is used so Win Rate / Avg Win / Avg Loss are calculated per full trade,
+       not per partial exit.
+    6) Basic slippage and commission are included.
+    """
     prices = get_panel(data, "Close")
     highs = get_panel(data, "High")
     lows = get_panel(data, "Low")
@@ -804,150 +850,221 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
     cash = starting_capital
     positions = {}
     pending_orders = {}
+
     equity_curve, dates, trade_log = [], [], []
-    wins = losses = 0
-    total_invested = gross_profit = gross_loss = 0.0
+    total_invested = 0.0
     exposure_days = 0
     max_equity = starting_capital
     max_drawdown = 0.0
-    orders_created = orders_executed = 0
+    orders_created = 0
+    orders_executed = 0
+    orders_expired = 0
+    orders_gap_rejected = 0
+    next_trade_id = 1
 
-    # Fix: test exactly the last N approximate trading days, after sufficient warmup.
     requested_test_days = int(months * 21.5)
     start_idx = max(220, len(prices) - requested_test_days)
     test_start_idx = start_idx
+
+    def apply_buy_slippage(price: float) -> float:
+        return price * (1 + slippage_pct)
+
+    def apply_sell_slippage(price: float) -> float:
+        return price * (1 - slippage_pct)
+
+    def close_shares(ticker, pos, sell_shares, sell_price_raw, exit_label, date_str):
+        nonlocal cash
+        sell_shares = int(min(sell_shares, pos["remaining"]))
+        if sell_shares <= 0:
+            return 0.0
+
+        sell_price = apply_sell_slippage(float(sell_price_raw))
+        gross_revenue = sell_shares * sell_price
+        exit_commission = commission_per_fill
+
+        entry_commission_alloc = pos["entry_commission_remaining"] * (sell_shares / pos["remaining"])
+        pos["entry_commission_remaining"] -= entry_commission_alloc
+
+        cash += gross_revenue - exit_commission
+
+        pnl = (
+            gross_revenue
+            - (pos["entry"] * sell_shares)
+            - entry_commission_alloc
+            - exit_commission
+        )
+
+        trade_log.append({
+            "TradeID": pos["trade_id"],
+            "Date": date_str,
+            "Ticker": ticker,
+            "Exit": exit_label,
+            "Setup": pos.get("setup", ""),
+            "Shares": sell_shares,
+            "Entry": round(pos["entry"], 2),
+            "ExitPrice": round(sell_price, 2),
+            "PnL": round(pnl, 2)
+        })
+
+        pos["remaining"] -= sell_shares
+        return pnl
 
     for i in range(start_idx, len(prices) - 1):
         today = prices.index[i]
         today_str = today.strftime("%Y-%m-%d")
 
-        # 1. Execute pending DAY orders from previous scan
+        # --------------------------------------------------
+        # 1. Execute pending DAY orders generated yesterday
+        # --------------------------------------------------
         for ticker, order in list(pending_orders.items()):
             if ticker in positions or len(positions) >= max_positions:
                 continue
+
             try:
                 today_open = safe_float(opens[ticker].iloc[i])
                 today_high = safe_float(highs[ticker].iloc[i])
                 today_low = safe_float(lows[ticker].iloc[i])
             except Exception:
                 continue
+
             if not np.isfinite(today_open):
                 continue
 
             executed = False
-            exec_price = 0.0
-            if order["type"] == "BUY LIMIT" and today_low <= order["price"]:
-                exec_price = min(order["price"], today_open)
-                executed = True
-            elif order["type"] == "BUY STOP LIMIT" and today_high >= order["price"]:
-                exec_price = max(today_open, order["price"])
-                executed = True
+            raw_exec_price = 0.0
+
+            if order["type"] == "BUY LIMIT":
+                if today_low <= order["price"]:
+                    # Conservative: assume fill at limit, not better.
+                    raw_exec_price = order["price"]
+                    executed = True
+
+            elif order["type"] == "BUY STOP LIMIT":
+                stop_price = order["price"]
+                limit_price = order.get("limit", stop_price * 1.006)
+
+                # If opens above limit, a real stop-limit would probably not fill.
+                if today_open > limit_price:
+                    orders_gap_rejected += 1
+                    continue
+
+                if today_high >= stop_price:
+                    raw_exec_price = max(today_open, stop_price)
+                    if raw_exec_price <= limit_price:
+                        executed = True
+                    else:
+                        orders_gap_rejected += 1
+                        continue
 
             if executed:
-                cost = exec_price * order["shares"]
-                if cash >= cost:
-                    cash -= cost
-                    total_invested += cost
+                exec_price = apply_buy_slippage(raw_exec_price)
+                shares = int(order["shares"])
+                total_cost = exec_price * shares + commission_per_fill
+
+                if shares > 0 and cash >= total_cost:
+                    trade_id = next_trade_id
+                    next_trade_id += 1
+
+                    cash -= total_cost
+                    total_invested += exec_price * shares
                     orders_executed += 1
+
                     positions[ticker] = {
-                        "shares": order["shares"],
-                        "remaining": order["shares"],
+                        "trade_id": trade_id,
+                        "shares": shares,
+                        "remaining": shares,
                         "entry": exec_price,
+                        "entry_commission_remaining": commission_per_fill,
                         "stop": order["stop"],
                         "tp1": exec_price * (1 + params.tp1_pct),
-                        "runner_target": exec_price * (1 + params.runner_target_pct),
                         "tp1_done": False,
                         "entry_date": today_str,
+                        "entry_index": i,
+                        "setup": order.get("setup", "")
                     }
+
+        # DAY orders that did not fill are cancelled.
+        orders_expired += max(0, len(pending_orders) - orders_executed)
         pending_orders.clear()
 
+        # --------------------------------------------------
         # 2. Manage open positions
+        # --------------------------------------------------
         closed = []
-        for ticker, pos in positions.items():
+
+        for ticker, pos in list(positions.items()):
+            # Do not allow exits on the same day the trade was opened.
+            # With daily OHLC, we do not know whether the stop/target happened before or after entry.
+            if pos.get("entry_index") == i:
+                continue
+
             try:
                 today_high = safe_float(highs[ticker].iloc[i])
                 today_low = safe_float(lows[ticker].iloc[i])
+                today_close = safe_float(prices[ticker].iloc[i])
                 close_history = prices[ticker].iloc[max(0, i - 25):i + 1]
                 ema21_now = close_history.ewm(span=21, adjust=False).mean().iloc[-1]
             except Exception:
                 continue
 
-            # Conservative assumption: if stop and target touched same day, stop first.
-            if today_low <= pos["stop"]:
-                sell_shares = pos["remaining"]
-                revenue = sell_shares * pos["stop"]
-                cash += revenue
-                pnl = (pos["stop"] - pos["entry"]) * sell_shares
-                if pnl >= 0:
-                    gross_profit += pnl
-                else:
-                    gross_loss += abs(pnl)
-                if not pos["tp1_done"]:
-                    losses += 1
-                trade_log.append({"Date": today_str, "Ticker": ticker, "Exit": "STOP" if pnl < 0 else "STOP_PROFIT",
-                                  "Shares": sell_shares, "Entry": round(pos["entry"], 2),
-                                  "ExitPrice": round(pos["stop"], 2), "PnL": round(pnl, 2)})
+            # Initial stop before TP1 is allowed intraday.
+            if not pos["tp1_done"] and today_low <= pos["stop"]:
+                close_shares(ticker, pos, pos["remaining"], pos["stop"], "STOP_LOSS", today_str)
                 closed.append(ticker)
                 continue
 
-            # Partial take profit
+            # Partial TP1.
             if (not pos["tp1_done"]) and today_high >= pos["tp1"]:
                 sell_shares = max(1, int(pos["shares"] * params.tp1_fraction))
-                sell_shares = min(sell_shares, pos["remaining"])
-                revenue = sell_shares * pos["tp1"]
-                cash += revenue
-                pnl = (pos["tp1"] - pos["entry"]) * sell_shares
-                gross_profit += pnl
-                wins += 1
-                pos["remaining"] -= sell_shares
+                close_shares(ticker, pos, sell_shares, pos["tp1"], "TP1_PARTIAL", today_str)
                 pos["tp1_done"] = True
+
+                # Do not immediately trail intraday. Move emergency stop only to breakeven.
                 pos["stop"] = max(pos["stop"], pos["entry"])
-                trade_log.append({"Date": today_str, "Ticker": ticker, "Exit": "TP1_PARTIAL",
-                                  "Shares": sell_shares, "Entry": round(pos["entry"], 2),
-                                  "ExitPrice": round(pos["tp1"], 2), "PnL": round(pnl, 2)})
 
             if pos["remaining"] <= 0:
                 closed.append(ticker)
                 continue
 
-            # Runner
-            if pos["tp1_done"]:
-                if today_high >= pos["runner_target"]:
-                    sell_price = pos["runner_target"]
-                    sell_shares = pos["remaining"]
-                    pnl = (sell_price - pos["entry"]) * sell_shares
-                    cash += sell_shares * sell_price
-                    if pnl >= 0:
-                        gross_profit += pnl
-                    else:
-                        gross_loss += abs(pnl)
-                    trade_log.append({"Date": today_str, "Ticker": ticker, "Exit": "RUNNER_TARGET",
-                                      "Shares": sell_shares, "Entry": round(pos["entry"], 2),
-                                      "ExitPrice": round(sell_price, 2), "PnL": round(pnl, 2)})
+            # Runner management:
+            # after TP1, exit only if DAILY CLOSE is below EMA21 trail level.
+            # This avoids intraday wick shakeouts.
+            if pos["tp1_done"] and params.use_trailing_runner:
+                trail_level = float(ema21_now) * 0.995
+
+                if np.isfinite(today_close) and today_close < trail_level:
+                    close_shares(ticker, pos, pos["remaining"], today_close, "TRAIL_EMA21_CLOSE", today_str)
                     closed.append(ticker)
-                elif params.use_trailing_runner:
-                    trail_stop = max(pos["stop"], float(ema21_now) * 0.995)
-                    pos["stop"] = trail_stop
 
         for ticker in closed:
             positions.pop(ticker, None)
 
+        # --------------------------------------------------
         # 3. Equity curve
+        # --------------------------------------------------
         portfolio_value = cash
+
         if positions:
             exposure_days += 1
+
         for ticker, pos in positions.items():
             ticker_close = prices[ticker].iloc[i]
+
             if not pd.isna(ticker_close):
                 portfolio_value += pos["remaining"] * float(ticker_close)
+
         max_equity = max(max_equity, portfolio_value)
+
         if max_equity > 0:
             drawdown = (portfolio_value / max_equity - 1) * 100
             max_drawdown = min(max_drawdown, drawdown)
+
         equity_curve.append(portfolio_value)
         dates.append(today_str)
 
-        # 4. Generate orders for next day - Active Balanced simplified historical edge logic
+        # --------------------------------------------------
+        # 4. Generate DAY orders for next day
+        # --------------------------------------------------
         try:
             spy_slice = prices["SPY"].iloc[i - 220:i + 1]
             if len(spy_slice) < 220:
@@ -955,42 +1072,50 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
             market_bull = float(spy_slice.iloc[-1]) > float(spy_slice.rolling(20).mean().iloc[-1])
         except Exception:
             continue
+
         if not market_bull and not params.allow_bear_market_orders:
             continue
 
         for ticker in WATCHLIST:
             if ticker in positions or ticker in pending_orders or len(positions) + len(pending_orders) >= max_positions:
                 continue
+
+            if params.auto_trade_momentum_only and ticker not in MOMENTUM_TICKERS:
+                continue
+
             try:
                 c = prices[ticker].iloc[i - 220:i + 1].dropna()
                 h = highs[ticker].iloc[i - 220:i + 1].dropna()
                 l = lows[ticker].iloc[i - 220:i + 1].dropna()
+
                 if len(c) < 220 or len(h) < 220 or len(l) < 220:
                     continue
+
                 last_p = float(c.iloc[-1])
                 sma200 = float(c.rolling(200).mean().iloc[-1])
                 ema8 = float(c.ewm(span=8, adjust=False).mean().iloc[-1])
                 ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
                 res20 = float(h.iloc[-21:-1].max())
                 prev_hi = float(h.iloc[-2])
-                atr = float(pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
+
+                atr = float(pd.concat([
+                    h - l,
+                    (h - c.shift()).abs(),
+                    (l - c.shift()).abs()
+                ], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
+
                 rsi = float(calc_rsi(c).iloc[-1])
                 chg20 = (last_p / c.iloc[-21] - 1) * 100
+
                 common = c.index.intersection(spy_slice.index)
+
                 if len(common) < 21:
                     rs5, rs20 = 0.0, 0.0
                 else:
                     rs5, rs20 = relative_strength_vs_spy(c.loc[common], spy_slice.loc[common])
 
                 edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
-                leader_recovery = (
-                    params.allow_leader_recovery
-                    and last_p < sma200
-                    and rs20 > params.leader_recovery_rs20_min
-                    and chg20 > params.leader_recovery_20d_min
-                    and last_p > ema8
-                    and last_p > ema21
-                )
+
                 strong_leader = (
                     rs20 > params.rs20_min + 2
                     and chg20 > 10
@@ -999,13 +1124,15 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
                     and last_p > sma200
                 )
 
-                if last_p < sma200 and not leader_recovery:
+                # V7.6: automatic orders require SMA200.
+                if last_p < sma200:
                     continue
-                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not (strong_leader or leader_recovery):
+
+                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not strong_leader:
                     continue
 
                 atr_pct = atr / last_p * 100
-                if atr_pct < params.min_atr_pct and ticker not in MOMENTUM_TICKERS and not (strong_leader or leader_recovery):
+                if atr_pct < params.min_atr_pct and ticker not in MOMENTUM_TICKERS and not strong_leader:
                     continue
 
                 dist_to_res = (res20 / last_p - 1)
@@ -1013,59 +1140,107 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
                 order_type = None
                 entry_price = 0.0
                 stop = 0.0
+                setup_name = ""
 
-                # Leader Recovery: below SMA200 allowed only with exceptional RS and recovery momentum.
-                if leader_recovery:
-                    shallow_entry = round(min(ema8 * 1.003, last_p * 0.99), 2)
-                    momentum_entry = round(prev_hi * 1.002, 2)
-                    if last_p > shallow_entry and (last_p / ema8 - 1) < 0.055:
-                        order_type = "BUY LIMIT"
-                        entry_price = shallow_entry
-                        stop = round(entry_price - params.stop_atr_breakout * atr, 2)
-                    elif last_p < momentum_entry:
-                        order_type = "BUY STOP LIMIT"
-                        entry_price = momentum_entry
-                        stop = round(entry_price - params.stop_atr_breakout * atr, 2)
-
-                # Pre-breakout / near resistance
-                elif edge_ok and 0 < dist_to_res < 0.045:
+                # Pre-breakout / near resistance.
+                if edge_ok and 0 < dist_to_res < 0.045:
                     entry_price = round(res20 * 1.002, 2)
                     if last_p < entry_price:
                         order_type = "BUY STOP LIMIT"
                         stop = round(entry_price - params.stop_atr_breakout * atr, 2)
+                        setup_name = "Near Resistance Breakout"
 
-                # Dynamic RS pullback shallow entry
+                # Dynamic RS pullback shallow entry.
                 elif edge_ok and last_p > ema21 and (last_p / ema8 - 1) < 0.035:
                     base = ema8 if rs5 > params.rs5_min else ema21
                     entry_price = min(round(base * 1.003, 2), round(last_p * 0.995, 2))
                     if last_p > entry_price:
                         order_type = "BUY LIMIT"
                         stop = round(entry_price - params.stop_atr_pullback * atr, 2)
+                        setup_name = "RS Pullback"
 
-                # Momentum continuation with controlled buy stop above yesterday high
+                # Momentum continuation with controlled buy stop above yesterday high.
                 elif edge_ok and last_p > ema21 and (prev_hi / last_p - 1) < 0.025:
                     entry_price = round(prev_hi * 1.002, 2)
                     if last_p < entry_price:
                         order_type = "BUY STOP LIMIT"
                         stop = round(entry_price - params.stop_atr_breakout * atr, 2)
+                        setup_name = "Momentum Continuation"
 
                 if order_type and entry_price > stop:
                     risk_per_share = entry_price - stop
                     risk_pct = risk_per_share / entry_price * 100
                     rr = calc_rr_from_weighted_reward(entry_price, stop, params)
-                    shares = int(investment_per_trade / entry_price)
-                    if shares > 0 and risk_pct <= params.max_risk_pct and rr >= params.min_rr and shares * entry_price <= cash:
-                        pending_orders[ticker] = {"type": order_type, "price": entry_price, "stop": stop, "shares": shares}
-                        orders_created += 1
+
+                    shares_by_cash = int(investment_per_trade / entry_price)
+                    shares_by_risk = int(risk_budget / risk_per_share)
+                    shares = min(shares_by_cash, shares_by_risk)
+
+                    if shares > 0 and risk_pct <= params.max_risk_pct and rr >= params.min_rr:
+                        estimated_cost = shares * entry_price * (1 + slippage_pct) + commission_per_fill
+                        if estimated_cost <= cash:
+                            limit_price = round(entry_price * 1.006, 2) if order_type == "BUY STOP LIMIT" else entry_price
+                            pending_orders[ticker] = {
+                                "type": order_type,
+                                "price": entry_price,
+                                "limit": limit_price,
+                                "stop": stop,
+                                "shares": shares,
+                                "setup": setup_name
+                            }
+                            orders_created += 1
+
             except Exception:
                 continue
 
+    # ------------------------------------------------------
+    # 5. Final liquidation of open positions
+    # ------------------------------------------------------
+    final_idx = len(prices) - 1
+    final_date = prices.index[final_idx].strftime("%Y-%m-%d")
+
+    for ticker, pos in list(positions.items()):
+        try:
+            final_close = safe_float(prices[ticker].iloc[final_idx])
+            if np.isfinite(final_close):
+                close_shares(ticker, pos, pos["remaining"], final_close, "FINAL_CLOSE", final_date)
+        except Exception:
+            pass
+
+    positions.clear()
+
+    final_value = cash
+
+    # Add final equity point after liquidation.
+    equity_curve.append(final_value)
+    dates.append(final_date)
+
     df_equity = pd.DataFrame({"Date": dates, "Portfolio Value": equity_curve}).set_index("Date")
     df_trades = pd.DataFrame(trade_log)
+
     total_days = max(1, len(dates))
     exposure_pct = exposure_days / total_days * 100
 
-    # Benchmarks for the exact tested window
+    # Full-trade metrics by TradeID.
+    if not df_trades.empty and "TradeID" in df_trades.columns:
+        trade_summary = (
+            df_trades.groupby(["TradeID", "Ticker"], as_index=False)
+            .agg(
+                TotalPnL=("PnL", "sum"),
+                FirstDate=("Date", "min"),
+                LastDate=("Date", "max"),
+                Exits=("Exit", lambda x: ", ".join(map(str, x)))
+            )
+        )
+    else:
+        trade_summary = pd.DataFrame(columns=["TradeID", "Ticker", "TotalPnL", "FirstDate", "LastDate", "Exits"])
+
+    gross_profit = float(trade_summary.loc[trade_summary["TotalPnL"] > 0, "TotalPnL"].sum()) if not trade_summary.empty else 0.0
+    gross_loss = float(-trade_summary.loc[trade_summary["TotalPnL"] < 0, "TotalPnL"].sum()) if not trade_summary.empty else 0.0
+    wins = int((trade_summary["TotalPnL"] > 0).sum()) if not trade_summary.empty else 0
+    losses = int((trade_summary["TotalPnL"] < 0).sum()) if not trade_summary.empty else 0
+
+    # Benchmarks for exact tested window.
     benchmarks = {}
     try:
         for bench in ["SPY", "QQQ"]:
@@ -1075,33 +1250,56 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
     except Exception:
         benchmarks = {}
 
-    # Missed Winner Diagnostics: which top movers were not traded, and why.
+    # Missed Winner Diagnostics.
     missed_rows = []
     traded_tickers = set(df_trades["Ticker"].unique()) if not df_trades.empty and "Ticker" in df_trades else set()
+
     try:
         spy_series = prices["SPY"]
         end_idx = len(prices) - 1
+
         for ticker in WATCHLIST:
             s = prices[ticker].iloc[test_start_idx:end_idx].dropna()
+
             if len(s) > 1:
                 ret = (float(s.iloc[-1]) / float(s.iloc[0]) - 1) * 100
                 diag = diagnose_missed_ticker(prices, highs, lows, ticker, spy_series, test_start_idx, end_idx, params)
+
                 row = {
                     "Ticker": ticker,
                     "Return %": round(ret, 1),
                     "Traded?": "YES" if ticker in traded_tickers else "NO",
                 }
+
                 row.update(diag)
+
                 if row["Traded?"] == "YES":
                     row["Likely Miss Reason"] = "Traded"
+
                 missed_rows.append(row)
+
         df_missed = pd.DataFrame(missed_rows).sort_values(by="Return %", ascending=False).head(diagnostics_top_n)
+
     except Exception:
         df_missed = pd.DataFrame()
 
     return (
-        df_equity, df_trades, wins, losses, total_invested, gross_profit, gross_loss,
-        max_drawdown, exposure_pct, orders_created, orders_executed, benchmarks, df_missed
+        df_equity,
+        df_trades,
+        trade_summary,
+        wins,
+        losses,
+        total_invested,
+        gross_profit,
+        gross_loss,
+        max_drawdown,
+        exposure_pct,
+        orders_created,
+        orders_executed,
+        orders_expired,
+        orders_gap_rejected,
+        benchmarks,
+        df_missed
     )
 
 # ==========================================================
@@ -1120,18 +1318,23 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.4 - Leader Recovery + Smarter Diagnostics</h1>", unsafe_allow_html=True)
-    st.info("גרסה זו משלבת Leader Recovery, R/R משוקלל לפי 7%/12%, קנס למניות איטיות, ודיאגנוסטיקה מורחבת למניות שפספסנו.")
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.6 - Backtest Integrity Fix</h1>", unsafe_allow_html=True)
+    st.info("V7.6: תיקון אמינות Backtest — אין יציאה ביום הכניסה, Stop-Limit אמיתי עם לימיט, סגירת פוזיציות פתוחות בסוף, TradeID למדידת עסקה מלאה, והחלקה/עמלות בסיסיות.")
 
     st.sidebar.header("ניהול כספי")
-    investment_amount = st.sidebar.number_input("סכום קבוע להשקעה בכל עסקה ($)", value=1000, step=100)
+    investment_amount = st.sidebar.number_input("תקרת השקעה בכל עסקה ($)", value=1000, step=100)
+    risk_budget = st.sidebar.number_input("סיכון מקסימלי לעסקה ($)", value=150, step=25)
     mode = st.sidebar.selectbox("מצב אסטרטגיה", ["Conservative", "Balanced", "Aggressive"], index=1)
     months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 12, 3)
     params = get_params(mode)
     max_positions = st.sidebar.slider("מקסימום פוזיציות פתוחות", 1, 8, params.max_positions_default)
+    diagnostics_top_n = st.sidebar.slider("כמה מניות להציג ב-Missed Winners", 10, 50, 20)
+    slippage_pct = st.sidebar.number_input("החלקה משוערת לכל פעולה (%)", value=0.10, min_value=0.0, max_value=2.0, step=0.05) / 100
+    commission_per_fill = st.sidebar.number_input("עמלה לכל פעולה ($)", value=0.0, min_value=0.0, step=0.5)
+
     st.sidebar.caption(
         f"Mode={mode} | ARMED≥{params.armed_threshold} | Actionable≥{params.actionable_threshold} | "
-        f"TP1={params.tp1_pct*100:.0f}% | Runner={params.runner_target_pct*100:.0f}% | R/R≥{params.min_rr}"
+        f"TP1={params.tp1_pct*100:.0f}% | Runner=EMA21 close trail | R/R≥{params.min_rr}"
     )
 
     tab_daily, tab_backtest = st.tabs(["🚀 מסך עבודה יומי", "🔬 מעבדת סימולציות"])
@@ -1141,12 +1344,12 @@ else:
             with st.spinner("מנתח את השוק ומייצר פקודות... לוקח רגע"):
                 spy_close, market_trend = get_spy_context()
                 if spy_close is not None:
-                    raw_results = [analyze_edge(t, spy_close, market_trend, investment_amount, params) for t in WATCHLIST]
+                    raw_results = [analyze_edge(t, spy_close, market_trend, investment_amount, risk_budget, params) for t in WATCHLIST]
                     raw_results = [r for r in raw_results if r is not None]
                     order_list = [r["order"] for r in raw_results if r["order"] is not None]
-                    st.markdown(f"### 📝 פקודות יומיות — {mode} — השקעה מבוקשת: {investment_amount}$")
+                    st.markdown(f"### 📝 פקודות יומיות — {mode} — תקרת השקעה: {investment_amount}$")
                     if order_list:
-                        df_orders = pd.DataFrame(order_list).sort_values(by="R/R", ascending=False).head(3)
+                        df_orders = pd.DataFrame(order_list).sort_values(by="R/R משוקלל", ascending=False).head(3)
                         st.dataframe(df_orders.style.hide(axis="index"), use_container_width=True)
                     else:
                         st.info("אין היום פקודות שעברו את כל שומרי הסף. אפשר לעיין ברדאר למטה.")
@@ -1174,14 +1377,27 @@ else:
         if st.button("⚙️ הרץ בדיקה היסטורית", type="primary"):
             with st.spinner("מריץ סימולציה. זה עשוי לקחת קצת זמן..."):
                 data = fetch_backtest_data(months)
-                result = run_backtest_simulation(data, investment_amount, params, months, 10000.0, max_positions)
-                (df_eq, df_trades, wins, losses, total_invested, gross_profit, gross_loss,
-                 max_drawdown, exposure_pct, orders_created, orders_executed, benchmarks, df_missed) = result
+                result = run_backtest_simulation(
+                    data,
+                    investment_amount,
+                    risk_budget,
+                    params,
+                    months,
+                    10000.0,
+                    max_positions,
+                    diagnostics_top_n,
+                    slippage_pct,
+                    commission_per_fill
+                )
+                (df_eq, df_trades, trade_summary, wins, losses, total_invested, gross_profit, gross_loss,
+                 max_drawdown, exposure_pct, orders_created, orders_executed, orders_expired,
+                 orders_gap_rejected, benchmarks, df_missed) = result
+
                 net_pnl = gross_profit - gross_loss
                 final_value = df_eq["Portfolio Value"].iloc[-1] if not df_eq.empty else 10000.0
                 roi = ((final_value / 10000.0) - 1) * 100
-                total_exits = wins + losses
-                win_rate = (wins / total_exits * 100) if total_exits else 0
+                total_trades = wins + losses
+                win_rate = (wins / total_trades * 100) if total_trades else 0
                 profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.inf
                 avg_win = gross_profit / wins if wins else 0
                 avg_loss = gross_loss / losses if losses else 0
@@ -1193,13 +1409,14 @@ else:
                 c3.metric("Profit Factor", f"{profit_factor:.2f}" if np.isfinite(profit_factor) else "∞")
                 c4.metric("Max Drawdown", f"{max_drawdown:.1f}%")
                 c5, c6, c7, c8 = st.columns(4)
-                c5.metric("Win Rate", f"{win_rate:.1f}%")
+                c5.metric("Win Rate לפי עסקה", f"{win_rate:.1f}%")
                 c6.metric("Avg Win / Avg Loss", f"${avg_win:.0f} / ${avg_loss:.0f}")
                 c7.metric("חשיפה לשוק", f"{exposure_pct:.1f}%")
                 c8.metric("השקעה מצטברת", f"${total_invested:,.0f}")
                 c9, c10, c11, c12 = st.columns(4)
                 c9.metric("פקודות נוצרו", f"{orders_created}")
                 c10.metric("פקודות נתפסו", f"{orders_executed}")
+                c10.caption(f"Expired: {orders_expired} | Gap rejected: {orders_gap_rejected}")
                 c11.metric("SPY", f"{benchmarks.get('SPY', 0):.1f}%")
                 c12.metric("QQQ", f"{benchmarks.get('QQQ', 0):.1f}%")
 
@@ -1210,6 +1427,10 @@ else:
                     with st.expander("🏃 Missed Winner Diagnostics — מי עלו הכי הרבה ולמה פספסנו"):
                         st.dataframe(df_missed, use_container_width=True)
 
+                if not trade_summary.empty:
+                    with st.expander("📌 סיכום לפי TradeID — מדידת עסקה מלאה"):
+                        st.dataframe(trade_summary, use_container_width=True)
+
                 if not df_trades.empty:
-                    with st.expander("📝 יומן עסקאות"):
+                    with st.expander("📝 יומן יציאות חלקיות"):
                         st.dataframe(df_trades, use_container_width=True)
