@@ -2,16 +2,13 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from datetime import datetime
 import urllib.request
 import xml.etree.ElementTree as ET
 import warnings
 
-# 1. הגדרת עמוד (חייב להיות ראשון)
-st.set_page_config(page_title="SwingHunter Pro V3.5", layout="wide")
+# 1. הגדרת עמוד
+st.set_page_config(page_title="SwingHunter V4.3 - Command Center", layout="wide")
 warnings.filterwarnings('ignore')
 
 # ==========================================
@@ -21,18 +18,18 @@ try:
     APP_PASSWORD = st.secrets["APP_PASSWORD"]
     MY_EMAIL = st.secrets["MY_EMAIL"]
 except:
-    APP_PASSWORD = "YOUR_WEBSITE_PASSWORD" 
-    MY_EMAIL = "your_email@gmail.com"
+    APP_PASSWORD = "Pk0105Ak2701" 
+    MY_EMAIL = "orel@peleg-eng.com"
 
 WATCHLIST = [
     'AAPL','MSFT','NVDA','TSLA','AMZN','META','GOOGL','NFLX','AMD','AVGO','TSM','QCOM',
     'CRWD','PANW','PLTR','SNOW','DDOG','NET','SMCI','COIN','MSTR','HOOD','SOFI','SQ',
     'PYPL','AFRM','SHOP','BABA','MELI','WMT','TGT','COST','HD','UBER','ABNB','SPOT',
-    'DKNG','DIS','NKE','SBUX','MCD','JPM','BAC','GS','MS','V','MA','LLY','NVO','UNH','CAT','BA'
+    'DKNG','DIS','NKE','SBUX','MCD','JPM','BAC','GS','MS','V','MA','LLY','NVO','UNH','CAT','BA','MRNA'
 ]
 
 # ==========================================
-# 3. פונקציות עזר (שוק, חדשות, דוחות)
+# 3. פונקציות עזר
 # ==========================================
 def get_market_context():
     try:
@@ -68,14 +65,14 @@ def get_earnings_warning(ticker):
             future_dates = cal.index[cal.index > now]
             if not future_dates.empty:
                 days = (future_dates[0] - now).days
-                if 0 <= days <= 7: return True, days
+                if 0 <= days <= 3: return True
     except: pass
-    return False, -1
+    return False
 
 # ==========================================
-# 4. מנוע הניתוח המרכזי
+# 4. המנוע המרכזי (The Command Engine V4.3)
 # ==========================================
-def analyze_ticker(ticker, market_trend):
+def run_full_analysis(ticker, market_trend, risk_budget):
     try:
         df = yf.download(ticker, period='250d', progress=False)
         if df.empty or len(df) < 200: return None
@@ -83,82 +80,113 @@ def analyze_ticker(ticker, market_trend):
 
         close, highs, lows = df['Close'], df['High'], df['Low']
         last_price = float(close.iloc[-1])
-        
-        # אינדיקטורים
         sma200 = close.rolling(200).mean().iloc[-1]
         ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
         res_20d = float(highs.iloc[-21:-1].max()) 
         
-        # ATR תקין
         tr = pd.concat([highs-lows, (highs-close.shift()).abs(), (lows-close.shift()).abs()], axis=1).max(axis=1)
         atr_val = tr.rolling(14).mean().iloc[-1]
-        
         rel_vol = float(df['Volume'].iloc[-1] / df['Volume'].rolling(20).mean().iloc[-1])
         change_20d = float((last_price / close.iloc[-20] - 1) * 100)
         
-        # RSI
         delta = close.diff()
         rsi_val = 100 - (100 / (1 + ((delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()).iloc[-1]))
 
-        # ניקוד (מתחיל מ-0)
+        # לוגיקת סיווג בסיסית לסורק
         score = 0
-        reasons = []
         decision, icon, setup = "לא לגעת", "🔴", "No Setup"
         instruction = "אין טריגר ברור."
+        is_hot = rsi_val > 78 or change_20d > 30
+        has_earn = get_earnings_warning(ticker)
 
         if market_trend == "BULL": score += 10
         if last_price > sma200: score += 15
-        else: score -= 20; reasons.append("מתחת ל-SMA200")
+        else: score -= 20
 
-        # איתור סטאפ
-        is_hot = rsi_val > 78 or change_20d > 30
         if is_hot:
             setup, icon, decision = "Overextended", "🔥", "חם מדי"
-            instruction = "מתוחה מדי. סכנת רדיפה."
+            instruction = "סכנת רדיפה."
             score -= 40
-        else:
-            if last_price > res_20d:
-                setup = "Breakout"
-                if rel_vol > 1.5:
-                    score += 30; icon, decision = "🟢", "סטאפ פעיל"
-                    instruction = "פריצה עם נפח חזק."
+        elif last_price > res_20d:
+            setup = "Breakout"
+            if rel_vol > 1.5:
+                score += 30; icon, decision = "🟢", "סטאפ פעיל"
+                instruction = "פריצה עם נפח."
+            else:
+                icon, decision = "🟡", "למעקב"; score += 5
+                instruction = "מעל התנגדות ללא נפח."
+        elif (res_20d / last_price - 1) < 0.03:
+            setup, icon, decision = "Near Resistance", "🟡", "למעקב"
+            score += 5; instruction = f"להמתין לפריצה מעל {round(res_20d, 2)}."
+        elif last_price > ema21 * 0.99 and last_price < ema21 * 1.03:
+            setup, icon, decision = "Pullback", "🟡", "למעקב"
+            score += 15; instruction = "תיקון לממוצע 21."
+
+        if rel_vol > 2.0: score += 15
+        if has_earn: score -= 15
+
+        # לוגיקת פקודות ביצוע חסינה (Order Generation)
+        order_data = None
+        p_type = None
+        
+        if score >= 40 and not is_hot and not has_earn and market_trend == "BULL" and last_price > sma200:
+            if setup in ["Breakout", "Near Resistance"]:
+                entry = round(res_20d * 1.002, 2)
+                # תיקון קריטי: Buy Stop חייב להיות מעל המחיר הנוכחי
+                if last_price < entry:
+                    l_max = round(res_20d * 1.008, 2)
+                    e_disp = f"Stop {entry} / Lmt {l_max}"
+                    p_type = "BUY STOP LIMIT"
                 else:
-                    icon, decision = "🟡", "למעקב"
-                    instruction = f"מעל התנגדות ללא נפח ({round(rel_vol,1)})."
-            elif (res_20d / last_price - 1) < 0.03:
-                setup, icon, decision = "Near Resistance", "🟡", "למעקב"
-                instruction = f"להמתין לפריצה מעל {round(res_20d, 2)}."
-            elif last_price > ema21 * 0.99 and last_price < ema21 * 1.03:
-                setup, icon, decision = "Pullback", "🟡", "למעקב"
-                score += 15; instruction = "תיקון לממוצע 21. מחפש היפוך."
+                    instruction = "כבר פרצה — לא לרדוף. המתן לפולבק." # מבטל את הפקודה ומעדכן את הסורק
+            
+            elif setup == "Pullback":
+                # תיקון קריטי: Buy Limit חייב להיות מתחת או שווה למחיר הנוכחי
+                entry = min(round(ema21 * 1.005, 2), round(last_price * 0.995, 2))
+                e_disp = f"{entry}"
+                p_type = "BUY LIMIT"
 
-        if rel_vol > 2.0: score += 20
-        has_earn, earn_days = get_earnings_warning(ticker)
-        if has_earn: score -= 15; instruction += f" | דוח עוד {earn_days} ימים!"
+            # אם נוצרה פקודה חוקית, מחשבים סיכון
+            if p_type:
+                stop = round(min(ema21, entry - (1.5 * atr_val)), 2)
+                risk_ps = entry - stop
+                
+                if risk_ps > 0:
+                    risk_p = (risk_ps / entry) * 100
+                    rr = (entry * 0.10) / risk_ps # R/R לפי יעד של 10%
+                    
+                    # סינון קפדני: R/R מעל 1.5, וסיכון לא גדול מ-7%
+                    if risk_p <= 7.0 and rr >= 1.5:
+                        shares = int(risk_budget / risk_ps)
+                        if shares > 0:
+                            actual_risk_dollars = round(shares * risk_ps, 2)
+                            
+                            order_data = {
+                                'מניה': ticker,
+                                'פעולה': p_type,
+                                'תוקף': 'DAY ONLY',
+                                'כניסה': e_disp,
+                                'כמות': shares,
+                                'סיכון $': f"${actual_risk_dollars}",
+                                'יעד 10%': round(entry * 1.10, 2),
+                                'יעד 15%': round(entry * 1.15, 2),
+                                'סטופ': stop,
+                                'סיכון %': f"{round(risk_p,1)}%",
+                                'R/R': round(rr, 2)
+                            }
 
-        # יעדים ו-R/R
-        target_10 = last_price * 1.10
-        stop_tight = ema21
-        stop_wide = last_price - (atr_val * 1.5)
-        
-        rr_tight = (target_10 - last_price) / (last_price - stop_tight) if last_price > stop_tight else 0
-        
         return {
-            'החלטה': f"{icon} {decision}",
-            'מניה': ticker,
-            'ציון': int(max(0, score)),
-            'סוג סטאפ': setup,
-            'הוראה': instruction,
-            'מחיר': round(last_price, 2),
-            'יעד 10%': round(target_10, 2),
-            'סטופ': round(stop_tight, 2),
-            'R/R (יעד 10%)': round(rr_tight, 2),
-            'סנטימנט': get_headlines_sentiment(ticker) if score > 35 else "-"
+            'scanner': {
+                'החלטה': f"{icon} {decision}", 'מניה': ticker, 'ציון': int(max(0, score)),
+                'סוג סטאפ': setup, 'הוראה': instruction, 'מחיר': round(last_price, 2),
+                'RSI': int(rsi_val), 'סנטימנט': get_headlines_sentiment(ticker) if score > 20 else "-"
+            },
+            'order': order_data
         }
     except: return None
 
 # ==========================================
-# 5. ממשק משתמש ותיקון באג העיצוב
+# 5. UI וממשק משולב
 # ==========================================
 if "authenticated" not in st.session_state: st.session_state["authenticated"] = False
 
@@ -167,25 +195,39 @@ if not st.session_state["authenticated"]:
     pwd = st.text_input("סיסמה:", type="password")
     if st.button("כניסה"):
         if pwd == APP_PASSWORD: st.session_state["authenticated"] = True; st.rerun()
-        else: st.error("שגויה")
 else:
-    st.title("🎯 SwingHunter Pro V3.5")
-    if st.button("🚀 הרץ סריקה", use_container_width=True):
-        with st.spinner("סורק מניות ומחשב R/R..."):
+    st.markdown("<h1 style='text-align: right;'>🎮 מרכז בקרה - SwingHunter V4.3</h1>", unsafe_allow_html=True)
+    
+    st.sidebar.header("ניהול סיכונים")
+    risk_sum = st.sidebar.number_input("סיכון לעסקה ($)", value=150, step=50)
+    
+    if st.button("🚀 הרץ ניתוח משולב", use_container_width=True):
+        with st.spinner("מנתח שוק ומייצר פקודות עבודה מוגנות..."):
             market_trend = get_market_context()
-            results = [analyze_ticker(t, market_trend) for t in WATCHLIST]
-            results = [r for r in results if r is not None]
+            raw_results = [run_full_analysis(t, market_trend, risk_sum) for t in WATCHLIST]
+            raw_results = [r for r in raw_results if r is not None]
         
-        if results:
-            df_res = pd.DataFrame(results).sort_values(by="ציון", ascending=False)
-            st.write(f"📈 **מצב שוק:** {market_trend}")
-            
-            # פונקציית צביעה חסינה (מטפלת ב-NaN ובמספרים)
-            def highlight_active(row):
-                # הופך למחרוזת כדי למנוע את ה-TypeError
-                val = str(row['החלטה'])
-                if "פעיל" in val:
-                    return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
-                return [''] * len(row)
+        # 1. טבלת פקודות
+        order_list = [r['order'] for r in raw_results if r['order'] is not None]
+        st.markdown("### 📝 פקודות לביצוע היום (Bracket Orders)")
+        if order_list:
+            df_orders = pd.DataFrame(order_list).sort_values(by="R/R", ascending=False).head(3)
+            # הסתרת אינדקס הטבלה למראה נקי יותר
+            st.dataframe(df_orders.style.hide(axis="index"), use_container_width=True)
+        else:
+            st.info("אין פקודות ביצוע שתואמות את כל תנאי הסף להיום. עדיף להמתין.")
 
-            st.dataframe(df_res.style.apply(highlight_active, axis=1), use_container_width=True)
+        # 2. טבלת סורק 
+        st.markdown("---")
+        st.markdown("### 🔍 סורק שוק מלא (Watchlist & Analysis)")
+        scanner_list = [r['scanner'] for r in raw_results]
+        df_scan = pd.DataFrame(scanner_list).sort_values(by="ציון", ascending=False)
+        
+        def highlight_rows(row):
+            val = str(row['החלטה'])
+            if "פעיל" in val: return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
+            if "למעקב" in val: return ['background-color: rgba(241, 196, 15, 0.1)'] * len(row)
+            return [''] * len(row)
+
+        st.dataframe(df_scan.style.apply(highlight_rows, axis=1), use_container_width=True)
+        st.write(f"📈 **מצב שוק:** {market_trend}")
