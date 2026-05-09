@@ -11,16 +11,16 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V7.9 - Portfolio Metrics Fix", layout="wide")
+st.set_page_config(page_title="SwingHunter V8 - Action Dashboard + Candidate Ranking", layout="wide")
 
-APP_VERSION = "V7.9"
+APP_VERSION = "V8.0"
 
 # ==========================================================
 # 1. Security + Settings
 # ==========================================================
 # For quick local testing the fallback password is 1234.
 # For Streamlit Cloud, define APP_PASSWORD in Secrets and it will override this.
-LOCAL_TEST_PASSWORD = "Pk0105Ak2701"
+LOCAL_TEST_PASSWORD = "1234"
 
 try:
     APP_PASSWORD = st.secrets.get("APP_PASSWORD", LOCAL_TEST_PASSWORD)
@@ -146,9 +146,9 @@ def get_params(mode: str) -> StrategyParams:
         armed_threshold=68,
         actionable_threshold=60,
         building_threshold=38,
-        min_rr=1.45,
-        max_risk_pct=11.0,
-        allow_bear_market_orders=False,  # V7.5: no automatic orders when SPY is weak
+        min_rr=1.35,
+        max_risk_pct=12.5,
+        allow_bear_market_orders=False,  # regular orders off in weak QQQ; exceptional leaders can still pass
         bear_market_min_edge=60,
         rs5_min=1.5,
         rs20_min=4.0,
@@ -166,7 +166,7 @@ def get_params(mode: str) -> StrategyParams:
         leader_recovery_rs20_min=8.0,
         leader_recovery_20d_min=6.0,
         auto_trade_momentum_only=True,
-        risk_budget_default=200.0,
+        risk_budget_default=250.0,
         runner_trail_close_only=True,
         max_positions_default=5,
     )
@@ -570,9 +570,32 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
                     shares = min(shares_by_cash, shares_by_risk)
                     if shares > 0:
                         actual_risk = round(shares * risk_per_share, 2)
+                        distance_to_entry = (entry / last_price - 1) * 100 if last_price else np.nan
+
+                        if p_type == "BUY LIMIT":
+                            if distance_to_entry <= -2.5:
+                                action_now = "WAIT - רחוקה מדי מעל הלימיט"
+                            elif distance_to_entry <= 0:
+                                action_now = "PLACE LIMIT"
+                            else:
+                                action_now = "PRICE BELOW LIMIT - CHECK MANUALLY"
+                        elif p_type == "BUY STOP LIMIT":
+                            if distance_to_entry < 0:
+                                action_now = "MISSED / WAIT RESET"
+                            elif distance_to_entry <= 3.0:
+                                action_now = "PLACE STOP LIMIT"
+                            else:
+                                action_now = "WAIT - טריגר רחוק"
+                        else:
+                            action_now = "CHECK"
+
                         order_data = {
                             "מניה": ticker,
                             "פעולה": p_type,
+                            "מה לעשות עכשיו": action_now,
+                            "מחיר נוכחי": round(last_price, 2),
+                            "שער כניסה": round(entry, 2),
+                            "מרחק לכניסה %": round(distance_to_entry, 2),
                             "Edge": " + ".join(edge_notes),
                             "כניסה": e_disp,
                             "כמות": shares,
@@ -604,6 +627,9 @@ def analyze_edge(ticker: str, spy_close: pd.Series, market_trend: str, investmen
             "Setup Score": int(setup_score),
             "Edge Score": int(edge_score),
             "תבנית": setup_type,
+            "מחיר נוכחי": round(last_price, 2),
+            "כניסה מוצעת": round(entry, 2) if 'entry' in locals() and entry else "",
+            "מרחק לכניסה %": round((entry / last_price - 1) * 100, 2) if 'entry' in locals() and entry and last_price else "",
             "Market": market_trend,
             "Watch Days": watch_days,
             "Comp. Score": comp,
@@ -1128,8 +1154,9 @@ def run_backtest_simulation(
         except Exception:
             continue
 
-        if not market_bull and not params.allow_bear_market_orders:
-            continue
+        # V8: build all candidates first, score them, then place only the best.
+        # This avoids the old bug/weakness where WATCHLIST order could crowd out better trades.
+        candidates = []
 
         for ticker in WATCHLIST:
             if ticker in positions or ticker in pending_orders or len(positions) + len(pending_orders) >= max_positions:
@@ -1174,6 +1201,8 @@ def run_backtest_simulation(
 
                 edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
 
+                atr_pct = atr / last_p * 100
+
                 strong_leader = (
                     rs20 > params.rs20_min + 2
                     and chg20 > 10
@@ -1182,15 +1211,30 @@ def run_backtest_simulation(
                     and last_p > sma200
                 )
 
-                # V7.6: automatic orders require SMA200.
+                exceptional_bear_leader = (
+                    (not market_bull)
+                    and ticker in MOMENTUM_TICKERS
+                    and rs20 > 25
+                    and rs5 > 5
+                    and last_p > ema8
+                    and last_p > ema21
+                    and last_p > sma200
+                    and atr_pct >= params.min_atr_pct
+                )
+
+                # Regular orders require positive QQQ regime.
+                # In weak market, only exceptional leaders are allowed.
+                if (not market_bull) and (not exceptional_bear_leader):
+                    continue
+
+                # V8: automatic orders still require SMA200.
                 if last_p < sma200:
                     continue
 
-                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not strong_leader:
+                if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not (strong_leader or exceptional_bear_leader):
                     continue
 
-                atr_pct = atr / last_p * 100
-                if atr_pct < params.min_atr_pct and ticker not in MOMENTUM_TICKERS and not strong_leader:
+                if atr_pct < params.min_atr_pct:
                     continue
 
                 dist_to_res = (res20 / last_p - 1)
@@ -1230,39 +1274,83 @@ def run_backtest_simulation(
                     risk_pct = risk_per_share / entry_price * 100
                     rr = calc_rr_from_weighted_reward(entry_price, stop, params)
 
-                    # Position sizing:
-                    # Fixed Amount = original behavior.
-                    # Percent of Equity = portfolio mode, e.g. 20% of current equity per trade.
-                    current_equity = portfolio_value
-                    current_exposure = max(0.0, current_equity - cash)
-                    max_total_exposure = current_equity * max_exposure_pct
-                    available_exposure_budget = max(0.0, max_total_exposure - current_exposure)
+                    if not (risk_pct <= params.max_risk_pct and rr >= params.min_rr):
+                        continue
 
-                    if sizing_mode == "Percent of Equity":
-                        cash_budget_for_trade = min(current_equity * position_pct, available_exposure_budget, cash)
-                    else:
-                        cash_budget_for_trade = min(investment_per_trade, available_exposure_budget if max_exposure_pct < 0.999 else investment_per_trade, cash)
+                    # Candidate quality score:
+                    # prioritize relative strength, high-quality momentum, decent RR, and not-too-crazy risk.
+                    candidate_score = (
+                        (rs20 * 1.25)
+                        + (rs5 * 0.75)
+                        + (min(max(chg20, -10), 60) * 0.35)
+                        + (rr * 12)
+                        - (risk_pct * 1.2)
+                        + (15 if strong_leader else 0)
+                        + (18 if exceptional_bear_leader else 0)
+                        + (8 if setup_name == "RS Pullback" else 0)
+                        + (6 if ticker in MOMENTUM_TICKERS else 0)
+                    )
 
-                    shares_by_cash = int(cash_budget_for_trade / entry_price)
-                    shares_by_risk = int(risk_budget / risk_per_share)
-                    shares = min(shares_by_cash, shares_by_risk)
+                    # Penalize chasing very stretched names unless exceptional.
+                    if chg20 > 35 and not exceptional_bear_leader:
+                        candidate_score -= 10
 
-                    if shares > 0 and risk_pct <= params.max_risk_pct and rr >= params.min_rr:
-                        estimated_cost = shares * entry_price * (1 + slippage_pct) + commission_per_fill
-                        if estimated_cost <= cash:
-                            limit_price = round(entry_price * 1.006, 2) if order_type == "BUY STOP LIMIT" else entry_price
-                            pending_orders[ticker] = {
-                                "type": order_type,
-                                "price": entry_price,
-                                "limit": limit_price,
-                                "stop": stop,
-                                "shares": shares,
-                                "setup": setup_name
-                            }
-                            orders_created += 1
+                    limit_price = round(entry_price * 1.006, 2) if order_type == "BUY STOP LIMIT" else entry_price
+
+                    candidates.append({
+                        "ticker": ticker,
+                        "type": order_type,
+                        "price": entry_price,
+                        "limit": limit_price,
+                        "stop": stop,
+                        "setup": setup_name,
+                        "risk_per_share": risk_per_share,
+                        "risk_pct": risk_pct,
+                        "rr": rr,
+                        "score": candidate_score,
+                    })
 
             except Exception:
                 continue
+
+        # Place only the best candidates according to available exposure/cash/risk.
+        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+
+        for cand in candidates:
+            if len(positions) + len(pending_orders) >= max_positions:
+                break
+
+            current_equity = portfolio_value
+            current_exposure = max(0.0, current_equity - cash)
+            max_total_exposure = current_equity * max_exposure_pct
+            available_exposure_budget = max(0.0, max_total_exposure - current_exposure)
+
+            if sizing_mode == "Percent of Equity":
+                cash_budget_for_trade = min(current_equity * position_pct, available_exposure_budget, cash)
+            else:
+                cash_budget_for_trade = min(investment_per_trade, available_exposure_budget if max_exposure_pct < 0.999 else investment_per_trade, cash)
+
+            shares_by_cash = int(cash_budget_for_trade / cand["price"])
+            shares_by_risk = int(risk_budget / cand["risk_per_share"])
+            shares = min(shares_by_cash, shares_by_risk)
+
+            if shares <= 0:
+                continue
+
+            estimated_cost = shares * cand["price"] * (1 + slippage_pct) + commission_per_fill
+            if estimated_cost > cash:
+                continue
+
+            pending_orders[cand["ticker"]] = {
+                "type": cand["type"],
+                "price": cand["price"],
+                "limit": cand["limit"],
+                "stop": cand["stop"],
+                "shares": shares,
+                "setup": cand["setup"],
+                "candidate_score": round(cand["score"], 2)
+            }
+            orders_created += 1
 
     # ------------------------------------------------------
     # 5. Final liquidation of open positions
@@ -1505,8 +1593,8 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.9 - Portfolio Metrics Fix</h1>", unsafe_allow_html=True)
-    st.info("V7.9: ברירות מחדל לתיק אמיתי + תיקון מדדים: Expired Orders, חשיפה ממוצעת של הון, Return/Drawdown, QQQ מתואם חשיפה, PnL לפי טיקר ו-Export אחד מלא.")
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V8 - Action Dashboard + Candidate Ranking</h1>", unsafe_allow_html=True)
+    st.info("V8: לא רק UI — שיפור מנוע. Candidate Ranking יומי בוחר את העסקאות החזקות ביותר במקום לפי סדר ה-WATCHLIST, יש Bear Exception מבוקר למובילות חריגות, וברירות המחדל מכוונות לנסות להכות QQQ: 25% לפוזיציה, 90% חשיפה, Risk גבוה יותר ו-Anti-Churn חזק יותר.")
 
     st.sidebar.header("ניהול כספי")
 
@@ -1524,7 +1612,7 @@ else:
 
     investment_amount = st.sidebar.number_input(
         "תקרת השקעה בכל עסקה במצב Fixed ($)",
-        value=2500,
+        value=3000,
         step=100
     )
 
@@ -1534,14 +1622,14 @@ else:
         step=25
     )
 
-    position_pct = st.sidebar.slider("אחוז מהתיק לפוזיציה", 5, 35, 20) / 100
-    max_exposure_pct = st.sidebar.slider("מקסימום חשיפה כוללת", 30, 100, 80) / 100
+    position_pct = st.sidebar.slider("אחוז מהתיק לפוזיציה", 5, 40, 25) / 100
+    max_exposure_pct = st.sidebar.slider("מקסימום חשיפה כוללת", 30, 100, 90) / 100
     max_positions = st.sidebar.slider("מקסימום פוזיציות פתוחות", 1, 8, params.max_positions_default)
 
     st.sidebar.markdown("### Anti-Churn")
     cooldown_after_exit_days = st.sidebar.slider("Cooldown אחרי כל יציאה (ימי מסחר)", 0, 30, 10)
-    cooldown_after_loss_days = st.sidebar.slider("Cooldown אחרי הפסד (ימי מסחר)", 0, 45, 15)
-    double_loss_freeze_days = st.sidebar.slider("Freeze אחרי 2 הפסדים ב-30 יום", 0, 60, 30)
+    cooldown_after_loss_days = st.sidebar.slider("Cooldown אחרי הפסד (ימי מסחר)", 0, 45, 20)
+    double_loss_freeze_days = st.sidebar.slider("Freeze אחרי 2 הפסדים ב-30 יום", 0, 60, 45)
     diagnostics_top_n = st.sidebar.slider("כמה מניות להציג ב-Missed Winners", 10, 50, 20)
     slippage_pct = st.sidebar.number_input("החלקה משוערת לכל פעולה (%)", value=0.10, min_value=0.0, max_value=2.0, step=0.05) / 100
     commission_per_fill = st.sidebar.number_input("עמלה לכל פעולה ($)", value=0.0, min_value=0.0, step=0.5)
@@ -1561,12 +1649,25 @@ else:
                     raw_results = [analyze_edge(t, spy_close, market_trend, investment_amount, risk_budget, params) for t in WATCHLIST]
                     raw_results = [r for r in raw_results if r is not None]
                     order_list = [r["order"] for r in raw_results if r["order"] is not None]
-                    st.markdown(f"### 📝 פקודות יומיות — {mode} — תקרת השקעה: {investment_amount}$")
+                    st.markdown(f"### 🧭 מה עושים היום — {mode}")
                     if order_list:
-                        df_orders = pd.DataFrame(order_list).sort_values(by="R/R משוקלל", ascending=False).head(3)
-                        st.dataframe(df_orders.style.hide(axis="index"), use_container_width=True)
+                        df_orders = pd.DataFrame(order_list)
+                        sort_col = "R/R משוקלל" if "R/R משוקלל" in df_orders.columns else df_orders.columns[0]
+                        df_orders = df_orders.sort_values(by=sort_col, ascending=False).head(5)
+
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("פקודות אפשריות", len(df_orders))
+                        c2.metric("סיכון מתוכנן $", df_orders["סיכון $"].astype(str).str.replace("$", "", regex=False).astype(float).sum() if "סיכון $" in df_orders else 0)
+                        c3.metric("תקרת השקעה", f"${investment_amount:,.0f}")
+
+                        preferred_cols = [
+                            "מניה", "מה לעשות עכשיו", "פעולה", "מחיר נוכחי", "שער כניסה", "מרחק לכניסה %",
+                            "סטופ", "יעד ראשון", "כמות", "השקעה $", "סיכון $", "R/R משוקלל", "תוקף"
+                        ]
+                        cols = [c for c in preferred_cols if c in df_orders.columns] + [c for c in df_orders.columns if c not in preferred_cols]
+                        st.dataframe(df_orders[cols].style.hide(axis="index"), use_container_width=True)
                     else:
-                        st.info("אין היום פקודות שעברו את כל שומרי הסף. אפשר לעיין ברדאר למטה.")
+                        st.info("אין היום פקודות ביצוע. לא בכוח. אפשר לעיין ברדאר למטה.")
                     st.markdown("---")
                     st.markdown("### 🔍 רדאר שוק")
                     scanner_list = [r["scanner"] for r in raw_results]
