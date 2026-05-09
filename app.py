@@ -2,6 +2,7 @@ import os
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="SwingHunter V7.1 - Active Balanced", layout="wide")
+st.set_page_config(page_title="SwingHunter V7.2 - Diagnostics 7/12", layout="wide")
 
 # ==========================================================
 # 1. Security + Settings
@@ -77,9 +78,9 @@ def get_params(mode: str) -> StrategyParams:
             max_20d_run=25,
             stop_atr_breakout=1.9,
             stop_atr_pullback=1.6,
-            tp1_pct=0.08,
+            tp1_pct=0.07,
             tp1_fraction=0.50,
-            runner_target_pct=0.16,
+            runner_target_pct=0.12,
             use_trailing_runner=True,
             max_positions_default=4,
         )
@@ -100,9 +101,9 @@ def get_params(mode: str) -> StrategyParams:
             max_20d_run=55,
             stop_atr_breakout=2.6,
             stop_atr_pullback=2.1,
-            tp1_pct=0.06,
+            tp1_pct=0.07,
             tp1_fraction=0.50,
-            runner_target_pct=0.18,
+            runner_target_pct=0.12,
             use_trailing_runner=True,
             max_positions_default=7,
         )
@@ -525,6 +526,167 @@ def get_panel(data: pd.DataFrame, field: str) -> pd.DataFrame:
     raise ValueError("Expected MultiIndex data from yfinance for multi-ticker backtest")
 
 
+def diagnose_missed_ticker(prices, highs, lows, ticker: str, spy_series: pd.Series, start_idx: int, end_idx: int, params: StrategyParams):
+    """Post-hoc diagnostic for top movers: why did the strategy probably miss them?"""
+    blockers = Counter()
+    orders_possible = 0
+    leader_days = 0
+    near_resistance_days = 0
+    already_triggered_days = 0
+    days_above_ema8 = 0
+    days_above_ema21 = 0
+    max_rs5 = -999.0
+    max_rs20 = -999.0
+    max_rsi = 0.0
+    max_20d_run = -999.0
+
+    # We scan each historical day in the tested window, using the same rough logic as the backtest order generator.
+    for i in range(max(220, start_idx), end_idx):
+        try:
+            c = prices[ticker].iloc[i - 220:i + 1].dropna()
+            h = highs[ticker].iloc[i - 220:i + 1].dropna()
+            l = lows[ticker].iloc[i - 220:i + 1].dropna()
+            spy_slice = spy_series.iloc[i - 220:i + 1].dropna()
+
+            if len(c) < 220 or len(h) < 220 or len(l) < 220 or len(spy_slice) < 220:
+                blockers["Insufficient data"] += 1
+                continue
+
+            last_p = float(c.iloc[-1])
+            sma200 = float(c.rolling(200).mean().iloc[-1])
+            ema8 = float(c.ewm(span=8, adjust=False).mean().iloc[-1])
+            ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+            prev_hi = float(h.iloc[-2])
+            res20 = float(h.iloc[-21:-1].max())
+
+            atr = float(pd.concat([
+                h - l,
+                (h - c.shift()).abs(),
+                (l - c.shift()).abs()
+            ], axis=1).max(axis=1).rolling(14).mean().iloc[-1])
+
+            rsi = float(calc_rsi(c).iloc[-1])
+            chg20 = (last_p / c.iloc[-21] - 1) * 100
+            max_rsi = max(max_rsi, rsi if np.isfinite(rsi) else 0)
+            max_20d_run = max(max_20d_run, chg20 if np.isfinite(chg20) else -999)
+
+            if last_p > ema8:
+                days_above_ema8 += 1
+            if last_p > ema21:
+                days_above_ema21 += 1
+
+            if last_p < sma200:
+                blockers["Below SMA200"] += 1
+                continue
+
+            spy_sma20 = spy_slice.rolling(20).mean().iloc[-1]
+            market_bull = float(spy_slice.iloc[-1]) > float(spy_sma20)
+            if not market_bull and not params.allow_bear_market_orders:
+                blockers["Market BEAR"] += 1
+                continue
+
+            common = c.index.intersection(spy_slice.index)
+            if len(common) < 21:
+                rs5, rs20 = 0.0, 0.0
+            else:
+                rs5, rs20 = relative_strength_vs_spy(c.loc[common], spy_slice.loc[common])
+
+            max_rs5 = max(max_rs5, rs5)
+            max_rs20 = max(max_rs20, rs20)
+            edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
+
+            strong_leader = (
+                rs20 > params.rs20_min + 2
+                and chg20 > 10
+                and last_p > ema8
+                and last_p > ema21
+            )
+            if strong_leader:
+                leader_days += 1
+
+            if (rsi > params.overbought_rsi or chg20 > params.max_20d_run) and not strong_leader:
+                blockers["Overextended filter"] += 1
+                continue
+
+            if not edge_ok and not strong_leader:
+                blockers["Weak relative strength"] += 1
+                continue
+
+            dist_to_res = (res20 / last_p - 1)
+            possible = False
+
+            if 0 < dist_to_res < 0.045:
+                near_resistance_days += 1
+                entry = round(res20 * 1.002, 2)
+                if last_p < entry:
+                    stop = round(entry - params.stop_atr_breakout * atr, 2)
+                    possible = True
+                else:
+                    already_triggered_days += 1
+                    blockers["Already above breakout trigger"] += 1
+
+            elif strong_leader:
+                # Leader Mode: shallow EMA8 pullback or stop above yesterday high.
+                shallow_entry = round(min(ema8 * 1.003, last_p * 0.995), 2)
+                momentum_entry = round(prev_hi * 1.002, 2)
+                if last_p > shallow_entry and (last_p / ema8 - 1) < 0.05:
+                    entry = shallow_entry
+                    stop = round(entry - params.stop_atr_pullback * atr, 2)
+                    possible = True
+                elif last_p < momentum_entry:
+                    entry = momentum_entry
+                    stop = round(entry - params.stop_atr_breakout * atr, 2)
+                    possible = True
+                else:
+                    blockers["Leader too extended / no clean entry"] += 1
+
+            elif last_p > ema21 and (last_p / ema8 - 1) < 0.035:
+                base = ema8 if rs5 > params.rs5_min else ema21
+                entry = min(round(base * 1.003, 2), round(last_p * 0.995, 2))
+                if last_p > entry:
+                    stop = round(entry - params.stop_atr_pullback * atr, 2)
+                    possible = True
+                else:
+                    blockers["No pullback entry"] += 1
+            else:
+                blockers["No valid setup"] += 1
+
+            if possible:
+                if entry <= stop:
+                    blockers["Invalid risk structure"] += 1
+                    continue
+                risk = entry - stop
+                risk_pct = risk / entry * 100
+                rr = (entry * params.tp1_pct) / risk
+                if risk_pct > params.max_risk_pct:
+                    blockers[f"Risk too high"] += 1
+                    continue
+                if rr < params.min_rr:
+                    blockers[f"R/R too low"] += 1
+                    continue
+                orders_possible += 1
+
+        except Exception:
+            blockers["Data/Calc error"] += 1
+            continue
+
+    likely_reason = blockers.most_common(1)[0][0] if blockers else "No blocker identified"
+    return {
+        "Orders Possible": orders_possible,
+        "Likely Miss Reason": likely_reason,
+        "Top Blockers": "; ".join([f"{k} ({v})" for k, v in blockers.most_common(3)]),
+        "Max RS 5D": round(max_rs5, 1) if max_rs5 > -900 else None,
+        "Max RS 20D": round(max_rs20, 1) if max_rs20 > -900 else None,
+        "Max RSI": round(max_rsi, 1),
+        "Max 20D Run": round(max_20d_run, 1) if max_20d_run > -900 else None,
+        "Leader Days": leader_days,
+        "Near Resistance Days": near_resistance_days,
+        "Already Triggered Days": already_triggered_days,
+        "Days > EMA8": days_above_ema8,
+        "Days > EMA21": days_above_ema21,
+    }
+
+
 def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, params: StrategyParams, months: int,
                             starting_capital: float = 10000.0, max_positions: int = 6):
     prices = get_panel(data, "Close")
@@ -770,16 +932,27 @@ def run_backtest_simulation(data: pd.DataFrame, investment_per_trade: float, par
     except Exception:
         benchmarks = {}
 
-    # Missed winners report: which top movers were not traded
+    # Missed Winner Diagnostics: which top movers were not traded, and why.
     missed_rows = []
     traded_tickers = set(df_trades["Ticker"].unique()) if not df_trades.empty and "Ticker" in df_trades else set()
     try:
+        spy_series = prices["SPY"]
+        end_idx = len(prices) - 1
         for ticker in WATCHLIST:
-            s = prices[ticker].iloc[test_start_idx:len(prices)-1].dropna()
+            s = prices[ticker].iloc[test_start_idx:end_idx].dropna()
             if len(s) > 1:
                 ret = (float(s.iloc[-1]) / float(s.iloc[0]) - 1) * 100
-                missed_rows.append({"Ticker": ticker, "Return %": round(ret, 1), "Traded?": "YES" if ticker in traded_tickers else "NO"})
-        df_missed = pd.DataFrame(missed_rows).sort_values(by="Return %", ascending=False).head(15)
+                diag = diagnose_missed_ticker(prices, highs, lows, ticker, spy_series, test_start_idx, end_idx, params)
+                row = {
+                    "Ticker": ticker,
+                    "Return %": round(ret, 1),
+                    "Traded?": "YES" if ticker in traded_tickers else "NO",
+                }
+                row.update(diag)
+                if row["Traded?"] == "YES":
+                    row["Likely Miss Reason"] = "Traded"
+                missed_rows.append(row)
+        df_missed = pd.DataFrame(missed_rows).sort_values(by="Return %", ascending=False).head(20)
     except Exception:
         df_missed = pd.DataFrame()
 
@@ -804,7 +977,7 @@ if not st.session_state["authenticated"]:
         else:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 else:
-    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.1 - Active Balanced</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V7.2 - Diagnostics 7/12</h1>", unsafe_allow_html=True)
     st.sidebar.header("ניהול כספי")
     investment_amount = st.sidebar.number_input("סכום קבוע להשקעה בכל עסקה ($)", value=1000, step=100)
     mode = st.sidebar.selectbox("מצב אסטרטגיה", ["Conservative", "Balanced", "Aggressive"], index=1)
@@ -889,7 +1062,7 @@ else:
                 st.line_chart(df_eq)
 
                 if not df_missed.empty:
-                    with st.expander("🏃 Missed Winners — מי עלו הכי הרבה והאם נכנסנו אליהן"):
+                    with st.expander("🏃 Missed Winner Diagnostics — מי עלו הכי הרבה ולמה פספסנו"):
                         st.dataframe(df_missed, use_container_width=True)
 
                 if not df_trades.empty:
