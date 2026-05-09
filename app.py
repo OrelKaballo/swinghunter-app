@@ -13,10 +13,10 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. הגדרות משתמש (User Settings) - ערוך כאן!
 # ==========================================
-APP_PASSWORD = "Pk0105Ak2701" # שנה לסיסמה שתשמש אותך לכניסה לאתר
-MY_EMAIL = "orel@peleg-eng.com"      # המייל שלך (שולח ומקבל)
+APP_PASSWORD = "Pk0105Ak2701" # שנה לסיסמה שלך
+MY_EMAIL = "orel@peleg-eng.com"      # שנה למייל שלך
 
-# רשימת מניות חזקות וסחירות (אפשר להוסיף/להוריד)
+# רשימת מניות חזקות וסחירות
 WATCHLIST = [
     'AAPL','MSFT','NVDA','TSLA','AMZN','META','GOOGL','AMD','AVGO','PLTR',
     'CRWD','PANW','SMCI','COIN','MSTR','HOOD','SOFI','RIVN','UBER','SHOP',
@@ -44,7 +44,6 @@ def atr(high, low, close, period=14):
     return tr.rolling(period).mean()
 
 def get_market_context():
-    """בודק את מצב השוק לפי ה-S&P 500"""
     try:
         spy = yf.download('SPY', period='50d', progress=False)
         last_close = spy['Close'].iloc[-1].item() if isinstance(spy['Close'].iloc[-1], pd.Series) else float(spy['Close'].iloc[-1])
@@ -55,12 +54,10 @@ def get_market_context():
         return "UNKNOWN"
 
 def analyze_ticker(ticker, market_trend):
-    """מנתח מניה בודדת ומחזיר ציון ויעדים דינמיים"""
     try:
         df = yf.download(ticker, period='180d', progress=False)
         if df.empty or len(df) < 60: return None
         
-        # השטחת כותרות אם yfinance מחזיר MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -69,7 +66,6 @@ def analyze_ticker(ticker, market_trend):
         low = df['Low']
         vol = df['Volume']
 
-        # חישוב מתנדים
         df['SMA20'] = close.rolling(20).mean()
         df['EMA8'] = close.ewm(span=8, adjust=False).mean()
         df['EMA21'] = close.ewm(span=21, adjust=False).mean()
@@ -83,62 +79,61 @@ def analyze_ticker(ticker, market_trend):
         avg_vol = float(last['Vol20'])
         atr_val = float(last['ATR14'])
 
-        # סינון נפח ומחיר מינימלי
         if price < 5 or avg_vol < 1_000_000 or pd.isna(atr_val): return None
 
-        # -- ניהול סיכונים דינמי (ATR) --
-        # סטופ לוס: 1.5 פעמים ATR מתחת למחיר
         stop = price - (atr_val * 1.5)
-        # יעדים מבוססי תנודתיות
         target1 = price + (atr_val * 2.0)
-        target2 = price + (atr_val * 3.5)
         
         risk = price - stop
         reward = target1 - price
         rr = reward / risk if risk > 0 else 0
 
-        # -- לוגיקת סטאפים משופרת --
         setup = []
-        # פריצה עם ווליום עולה בנר ירוק
         if price > df['High'].iloc[-2] and last['RelVol'] > 1.2 and price > last['Open']:
             setup.append('Momentum Breakout')
-        # מגמה חזקה לטווח קצר
         if price > last['EMA8'] and last['EMA8'] > last['EMA21']:
             setup.append('Strong Trend (8/21)')
-        # תיקון תנודתי (Pullback) מעל תמיכה
         if last['RSI14'] < 40 and price > last['SMA20']:
             setup.append('SMA20 Pullback')
 
-        if not setup: return None # מסנן מניות ללא סטאפ
-        setup_txt = ' + '.join(setup)
+        setup_txt = ' + '.join(setup) if setup else "No clear setup"
 
-        # -- שיטת ניקוד חדשה וקשוחה --
-        score = 50 # ציון התחלתי
+        score = 50 
+        remarks = []
 
-        # בונוסים
         if 'Breakout' in setup_txt: score += 15
         if last['RelVol'] > 1.5: score += 15
         if rr >= 2.0: score += 20
         elif rr >= 1.5: score += 10
 
-        # קנסות (ניהול סיכונים)
-        if market_trend == "BEARISH": score -= 20 # השוק נגדנו
-        if rr < 1.3: score -= 30 # פוסל טריידים מסוכנים מדי
-        if last['RSI14'] > 75: score -= 15 # קניית יתר
-        if price > last['SMA20'] + (atr_val * 2): score -= 20 # מתוח מדי
+        if market_trend == "BEARISH": 
+            score -= 20
+            remarks.append("Bearish Market")
+        if rr < 1.3: 
+            score -= 30
+            remarks.append("Weak R/R (<1.3)")
+        if last['RSI14'] > 75: 
+            score -= 15
+            remarks.append("Overbought")
+        if price > last['SMA20'] + (atr_val * 2): 
+            score -= 20
+            remarks.append("Extended above SMA20")
+        if not setup:
+            remarks.append("No Setup")
 
-        score = max(0, min(100, score)) # תוחם בין 0 ל-100
-
-        if score < 65: return None # מחזיר רק מניות חזקות
+        score = max(0, min(100, score)) 
+        status = "✅ PASS" if score >= 65 else "❌ FAIL"
 
         return {
+            'Status': status,
             'Ticker': ticker,
             'Score': int(score),
+            'Remarks': ", ".join(remarks) if remarks else "Good",
             'Setup': setup_txt,
             'Price': round(price, 2),
-            'Target 1 (ATR)': round(target1, 2),
+            'Target 1': round(target1, 2),
             'Stop Loss': round(stop, 2),
-            'Risk/Reward': round(rr, 2),
+            'R/R': round(rr, 2),
             'RSI': round(float(last['RSI14']), 1),
             'RelVol': round(float(last['RelVol']), 2)
         }
@@ -149,12 +144,15 @@ def analyze_ticker(ticker, market_trend):
 # 3. פונקציית שליחת המייל
 # ==========================================
 def send_email_report(df, email_pw):
+    # שולחים במייל רק את המניות שעברו את הסינון
+    df_passed = df[df['Status'] == '✅ PASS']
+    
     msg = MIMEMultipart()
     msg['From'] = MY_EMAIL
     msg['To'] = MY_EMAIL
     msg['Subject'] = f"📈 סורק SwingHunter - {datetime.now().strftime('%d/%m/%Y')}"
 
-    html_table = df.to_html(index=False, justify='center', classes='table table-striped')
+    html_table = df_passed.to_html(index=False, justify='center', classes='table table-striped')
     body = f"""
     <html dir="rtl">
       <head>
@@ -167,7 +165,7 @@ def send_email_report(df, email_pw):
       </head>
       <body>
         <h2>תוצאות סריקת SwingHunter Pro</h2>
-        <p>להלן המניות המובילות שעברו את סינוני ה-Risk/Reward וה-ATR:</p>
+        <p>להלן המניות שעמדו בקריטריונים (ציון 65 ומעלה):</p>
         {html_table}
       </body>
     </html>
@@ -189,7 +187,6 @@ def send_email_report(df, email_pw):
 # 4. ממשק המשתמש (Streamlit UI)
 # ==========================================
 def check_password():
-    """מוודא שרק אתה יכול להיכנס לאפליקציה"""
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
     
@@ -208,9 +205,8 @@ def check_password():
 if check_password():
     st.set_page_config(page_title="SwingHunter Pro", layout="wide")
     st.title("🎯 SwingHunter Pro Dashboard")
-    st.markdown("מנוע סריקה חכם מבוסס תנודתיות (ATR) וניהול סיכונים מתקדם.")
+    st.markdown("מנוע סריקה חכם מבוסס תנודתיות (ATR). מציג את כל התוצאות ומדגיש סטאפים חזקים.")
 
-    # תפריט צד
     st.sidebar.header("הגדרות סריקה ומייל")
     st.sidebar.write(f"**מייל מוגדר:** {MY_EMAIL}")
     email_app_pw = st.sidebar.text_input("סיסמת אפליקציה של Gmail (לצורך שליחה):", type="password")
@@ -220,11 +216,10 @@ if check_password():
             market_trend = get_market_context()
         
         if market_trend == "BEARISH":
-            st.error(f"🚨 אזהרת שוק: ה-S&P 500 במגמת ירידה (מתחת ל-SMA20). המערכת תחמיר עם ניקוד המניות.")
+            st.error(f"🚨 אזהרת שוק: ה-S&P 500 במגמת ירידה (מתחת ל-SMA20).")
         else:
-            st.success(f"✅ מצב שוק: חיובי (BULLISH). הסורק מחפש מומנטום.")
+            st.success(f"✅ מצב שוק: חיובי (BULLISH).")
 
-        # הרצת הסריקה עם סרגל התקדמות
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -238,18 +233,19 @@ if check_password():
 
         status_text.text("הסריקה הושלמה!")
         
-        # הצגת תוצאות
         if results:
             df_res = pd.DataFrame(results).sort_values(by="Score", ascending=False).reset_index(drop=True)
-            st.dataframe(df_res, use_container_width=True)
+            
+            # פונקציה לצביעת שורות שעברו
+            def highlight_passed(row):
+                if row['Score'] >= 65:
+                    return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
+                return [''] * len(row)
 
-            # שליחת המייל אוטומטית אם הוזנה סיסמת אפליקציה
+            st.dataframe(df_res.style.apply(highlight_passed, axis=1), use_container_width=True, height=600)
+
             if email_app_pw:
                 with st.spinner("שולח דו\"ח למייל..."):
                     if send_email_report(df_res, email_app_pw):
                         st.balloons()
-                        st.success("📩 הדו\"ח נשלח בהצלחה למייל שלך!")
-            else:
-                st.warning("⚠️ לא הוזנה 'סיסמת אפליקציה' של Gmail בתפריט הצד. התוצאות לא נשלחו למייל.")
-        else:
-            st.info("לא נמצאו מניות שעומדות בקריטריונים הקשוחים של הסורק כרגע.")
+                        st.success("📩 הדו\"ח נשלח בהצלחה למייל שלך! (המייל יכיל רק את המניות שעברו).")
