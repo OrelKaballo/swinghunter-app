@@ -17,11 +17,11 @@ st.set_page_config(page_title="SwingHunter V7 - Edge Engine", layout="wide")
 # IMPORTANT:
 # Do NOT hardcode real passwords/emails in this file.
 # In Streamlit Cloud use:
-# APP_PASSWORD="Pk0105Ak2701"
-# MY_EMAIL="orel@peleg-eng.com"
+# APP_PASSWORD="..."
+# MY_EMAIL="..."
 try:
-    APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
-    MY_EMAIL = st.secrets.get("MY_EMAIL", "")
+    APP_PASSWORD = st.secrets.get("Pk0105Ak2701", "")
+    MY_EMAIL = st.secrets.get("orel@peleg-eng.com", "")
 except Exception:
     APP_PASSWORD = os.getenv("APP_PASSWORD", "")
     MY_EMAIL = os.getenv("MY_EMAIL", "")
