@@ -2,12 +2,12 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.request
 import xml.etree.ElementTree as ET
 import warnings
 
-st.set_page_config(page_title="SwingHunter V6.1 - Edge Engine", layout="wide")
+st.set_page_config(page_title="SwingHunter V6.4 - Quant Terminal", layout="wide")
 warnings.filterwarnings('ignore')
 
 # ==========================================
@@ -90,7 +90,7 @@ def get_headlines_sentiment(ticker):
     except: return "⚪"
 
 # ==========================================
-# 3. מודולי Edge משופרים (V6.1)
+# 3. מודולי Edge
 # ==========================================
 def compression_score(df):
     try:
@@ -124,7 +124,6 @@ def failed_breakdown_recovery(df):
         sma5 = close.rolling(5).mean().iloc[-1]
         support_20 = float(low.iloc[-21:-5].min())
         broke_support = float(low.iloc[-5:-1].min()) < support_20 * 0.99
-        # דורש גם חזרה מעל התמיכה וגם מעל ממוצע 5 כדי לוודא עוצמה
         reclaimed = float(close.iloc[-1]) > support_20 * 1.005 and float(close.iloc[-1]) > sma5
         if broke_support and reclaimed: return True, support_20
     except: pass
@@ -139,29 +138,22 @@ def post_event_drift(df):
         if recent_vol.max() > avg_vol * 2.5:
             event_idx = recent_vol.idxmax()
             event_pos = df.index.get_loc(event_idx)
-            
             if event_pos < len(df) - 1:
                 event_open = float(open_p.iloc[event_pos])
                 event_close = float(close.iloc[event_pos])
-                event_return = (event_close / event_open - 1) * 100
-                
-                # פסילה אם יום האירוע היה התרסקות מוחלטת
-                if event_return < -5.0: return False, 0, 0
+                if (event_close / event_open - 1) * 100 < -5.0: return False, 0, 0
                 
                 event_high = float(high.iloc[event_pos])
                 event_low = float(low.iloc[event_pos])
-                
-                holds_above_low = float(close.iloc[-1]) > event_low
-                higher_lows = low.tail(3).is_monotonic_increasing
-                
-                if holds_above_low and higher_lows: return True, event_high, event_low
+                if float(close.iloc[-1]) > event_low and low.tail(3).is_monotonic_increasing:
+                    return True, event_high, event_low
     except: pass
     return False, 0, 0
 
 # ==========================================
-# 4. מנוע האנליזה וההחלטות
+# 4. מנוע האנליזה היומי (Live Engine)
 # ==========================================
-def analyze_edge(ticker, spy_close, market_trend, risk_budget):
+def analyze_edge(ticker, spy_close, market_trend, investment_budget):
     try:
         df = yf.download(ticker, period='250d', progress=False)
         if df.empty or len(df) < 200: return None
@@ -181,16 +173,12 @@ def analyze_edge(ticker, spy_close, market_trend, risk_budget):
         delta = close.diff()
         rsi_val = 100 - (100 / (1 + ((delta.where(delta > 0, 0)).rolling(14).mean() / (-delta.where(delta < 0, 0)).rolling(14).mean()).iloc[-1]))
 
-        # --- מודולי Edge ---
         raw_comp_score = compression_score(df)
         rs_5d, rs_20d = relative_strength_vs_spy(close, spy_close)
         failed_break, reclaimed_level = failed_breakdown_recovery(df)
         drift, event_high, event_low = post_event_drift(df)
         watch_days, score_trend = get_setup_persistence(ticker)
 
-        # ----------------------------------------
-        # חישוב ציונים ו-Edge Notes
-        # ----------------------------------------
         setup_score = 0
         if last_price > sma200: setup_score += 15
         if last_price > ema21: setup_score += 10
@@ -200,11 +188,9 @@ def analyze_edge(ticker, spy_close, market_trend, risk_budget):
         edge_notes = []
         reject_reason = ""
         
-        # התניית Compression - תופס רק אם קרוב להתנגדות או חזק מהשוק
-        if raw_comp_score >= 25:
-            if dist_to_res < 4.0 or rs_5d > 0 or rs_20d > 0:
-                edge_score += raw_comp_score
-                edge_notes.append("Compression")
+        if raw_comp_score >= 25 and (dist_to_res < 4.0 or rs_5d > 0 or rs_20d > 0):
+            edge_score += raw_comp_score
+            edge_notes.append("Compression")
                 
         if rs_5d > 2.0 or rs_20d > 5.0:
             edge_score += 20
@@ -219,54 +205,30 @@ def analyze_edge(ticker, spy_close, market_trend, risk_budget):
             edge_score += 15
             edge_notes.append("Building Pressure")
 
-        # ----------------------------------------
-        # שומרי סף וסיווג (Guards)
-        # ----------------------------------------
         final_rank = setup_score + edge_score
         setup_type = "No Setup"
-        instruction = "אין טריגר."
-        
         is_overextended = rsi_val > 78
         earn_status, earn_days = get_earnings_status(ticker)
 
         if earn_status == "DANGER":
-            icon, decision = "⚠️", "DANGER"
-            instruction = f"דוח כספי בעוד {earn_days} ימים. סכנה בינארית."
-            reject_reason = "דוח קרוב"
-            final_rank = 0
+            icon, decision, reject_reason, final_rank = "⚠️", "DANGER", "דוח קרוב", 0
         elif is_overextended:
-            icon, decision = "🔥", "חם מדי"
-            instruction = "סכנת רדיפה."
-            reject_reason = "RSI גבוה מ-78"
-            final_rank = min(final_rank, 30)
+            icon, decision, reject_reason, final_rank = "🔥", "חם מדי", "RSI גבוה מ-78", min(final_rank, 30)
         elif market_trend == "BEAR" and edge_score < 40:
-            icon, decision = "🔴", "Dormant"
-            instruction = "שוק חלש. המניה חסרת אדג' קיצוני."
-            reject_reason = "Market BEAR + Edge נמוך"
-            final_rank = min(final_rank, 40)
+            icon, decision, reject_reason, final_rank = "🔴", "Dormant", "Market BEAR + Edge נמוך", min(final_rank, 40)
         elif final_rank >= 80 and len(edge_notes) > 0:
             icon, decision = "🟢", "ARMED"
         elif final_rank >= 45:
             icon, decision = "🟡", "Building Pressure"
         else:
-            icon, decision = "🔴", "Dormant"
-            reject_reason = "ציון נמוך מדי"
+            icon, decision, reject_reason = "🔴", "Dormant", "ציון נמוך מדי"
 
-        # הגדרת התבנית
-        if "Compression" in edge_notes and dist_to_res < 3.0:
-            setup_type = "Pre-Breakout Compression"
-        elif failed_break:
-            setup_type = "Failed Breakdown Recovery"
-        elif drift:
-            setup_type = "Post-Event Drift"
-        elif "RS Leader" in edge_notes and last_price > ema21:
-            setup_type = "RS Pullback"
-        elif last_price > res_20d:
-            setup_type = "Momentum Breakout"
+        if "Compression" in edge_notes and dist_to_res < 3.0: setup_type = "Pre-Breakout Compression"
+        elif failed_break: setup_type = "Failed Breakdown Recovery"
+        elif drift: setup_type = "Post-Event Drift"
+        elif "RS Leader" in edge_notes and last_price > ema21: setup_type = "RS Pullback"
+        elif last_price > res_20d: setup_type = "Momentum Breakout"
 
-        # ----------------------------------------
-        # ייצור פקודות (רק למצב ARMED שעבר את שומרי הסף)
-        # ----------------------------------------
         order_data = None
         if decision == "ARMED":
             p_type, entry, e_disp = None, 0, ""
@@ -275,128 +237,277 @@ def analyze_edge(ticker, spy_close, market_trend, risk_budget):
                 trigger = res_20d if setup_type != "Post-Event Drift" else event_high
                 entry = round(trigger * 1.002, 2)
                 if last_price < entry:
-                    p_type = "BUY STOP LIMIT"
-                    e_disp = f"Stop {entry} / Lmt {round(entry*1.008, 2)}"
+                    p_type, e_disp = "BUY STOP LIMIT", f"Stop {entry} / Lmt {round(entry*1.008, 2)}"
                 else:
-                    reject_reason = "כבר פרצה. לא רודפים."
-                    icon, decision = "🟡", "Building Pressure" # מוריד סטטוס
+                    reject_reason, icon, decision = "כבר פרצה. לא רודפים.", "🟡", "Building Pressure"
             
             elif setup_type in ["Failed Breakdown Recovery", "RS Pullback"]:
                 entry = min(round(ema21 * 1.005, 2), round(last_price * 0.995, 2))
-                p_type = "BUY LIMIT"
-                e_disp = f"{entry}"
+                p_type, e_disp = "BUY LIMIT", f"{entry}"
 
             if p_type:
                 stop = round(min(ema21, entry - (1.5 * atr_val)), 2)
                 if setup_type == "Failed Breakdown Recovery": stop = round(reclaimed_level * 0.985, 2)
                 
                 risk_ps = entry - stop
-                if risk_ps > 0:
-                    risk_p = (risk_ps / entry) * 100
-                    rr = (entry * 0.10) / risk_ps 
-                    
-                    if risk_p <= 7.0 and rr >= 1.5:
-                        shares = int(risk_budget / risk_ps)
-                        if shares > 0:
-                            order_data = {
-                                'מניה': ticker, 'פעולה': p_type,
-                                'Edge': " + ".join(edge_notes),
-                                'כניסה': e_disp, 'כמות': shares, 
-                                'יעד 10%': round(entry * 1.10, 2), 'יעד 15%': round(entry * 1.15, 2),
-                                'סטופ': stop, 'סיכון $': f"${round(shares * risk_ps, 2)}",
-                                'R/R': round(rr, 2), 'תוקף': 'DAY ONLY'
-                            }
-                    else:
-                        reject_reason = f"R/R נמוך ({round(rr,1)}) או סיכון גבוה"
+                if risk_ps > 0 and (entry * 0.10) / risk_ps >= 1.5:
+                    # שינוי מהותי: כמות המניות מחושבת לפי תקציב השקעה קבוע של 1000$ (ולא לפי סיכון)
+                    shares = int(investment_budget / entry)
+                    if shares > 0:
+                        order_data = {
+                            'מניה': ticker, 'פעולה': p_type, 'Edge': " + ".join(edge_notes),
+                            'כניסה': e_disp, 'כמות': shares, 
+                            'השקעה $': f"${round(shares * entry, 2)}",
+                            'יעד 10%': round(entry * 1.10, 2), 'יעד 15%': round(entry * 1.15, 2),
+                            'סטופ': stop, 'R/R': round((entry * 0.10) / risk_ps, 2), 'תוקף': 'DAY ONLY'
+                        }
+                else: reject_reason = "R/R נמוך מ-1.5"
 
         return {
             'scanner': {
                 'מניה': ticker, 'החלטה': f"{icon} {decision}", 'ציון_כולל': int(final_rank),
                 'תבנית': setup_type, 'Market': market_trend, 'Watch Days': watch_days,
                 'Comp. Score': raw_comp_score, 'RS (5D)': f"{round(rs_5d,1)}%", 'RS (20D)': f"{round(rs_20d,1)}%",
-                'Edge Notes': " + ".join(edge_notes) if edge_notes else "None",
-                'סיבת פסילה': reject_reason
+                'Edge Notes': " + ".join(edge_notes) if edge_notes else "None", 'סיבת פסילה': reject_reason
             },
             'order': order_data
         }
     except: return None
 
 # ==========================================
-# 5. UI וממשק משולב
+# 5. מנוע הסימולציה (Backtester Engine)
+# ==========================================
+@st.cache_data(show_spinner=False)
+def fetch_backtest_data(months):
+    end = datetime.now()
+    start = end - timedelta(days=months * 30 + 250)
+    return yf.download(WATCHLIST + ['SPY'], start=start, end=end, progress=False)
+
+def run_backtest_simulation(data, investment_per_trade, starting_capital=10000.0):
+    prices, highs, lows, opens = data['Close'], data['High'], data['Low'], data['Open']
+    
+    cash = starting_capital
+    positions = {}
+    pending_orders = {}
+    equity_curve, dates, trade_log = [], [], []
+    
+    wins, losses = 0, 0
+    total_invested_dollars = 0.0 # סופר כל דולר שהושקע בעסקאות
+    total_gross_profit = 0.0     # סופר רק רווחים מתנועות חיוביות
+    total_gross_loss = 0.0       # סופר רק הפסדים
+
+    start_idx = 200 
+    for i in range(start_idx, len(prices) - 1):
+        today_str = prices.index[i].strftime('%Y-%m-%d')
+        
+        # 1. הפעלת פקודות מאתמול (רק אם אנחנו לא כבר מחזיקים את המניה)
+        executed_tickers = []
+        for ticker, order in pending_orders.items():
+            if ticker in positions: continue # כלל ברזל: לא קונים מניה שכבר מחזיקים בה
+            
+            try:
+                t_open, t_high, t_low = float(opens[ticker].iloc[i]), float(highs[ticker].iloc[i]), float(lows[ticker].iloc[i])
+            except: continue
+            if pd.isna(t_open): continue
+            
+            executed, exec_price = False, 0
+            if order['type'] == 'BUY LIMIT' and t_low <= order['price']:
+                exec_price, executed = order['price'], True
+            elif order['type'] == 'BUY STOP LIMIT' and t_high >= order['price']:
+                exec_price, executed = max(t_open, order['price']), True
+                
+            if executed:
+                cost = exec_price * order['shares']
+                if cash >= cost: # יש מספיק מזומן בחשבון
+                    cash -= cost
+                    total_invested_dollars += cost # רישום השקעה
+                    positions[ticker] = {
+                        'shares': order['shares'], 'entry': exec_price,
+                        'target': order['target'], 'stop': order['stop']
+                    }
+                    executed_tickers.append(ticker)
+        
+        pending_orders.clear() # פקודות שלא נתפסו נמחקות
+        
+        # 2. ניהול פוזיציות וסגירתן ברווח/הפסד
+        closed_tickers = []
+        for ticker, pos in positions.items():
+            try: t_high, t_low = float(highs[ticker].iloc[i]), float(lows[ticker].iloc[i])
+            except: continue
+            
+            sell_price = 0
+            if t_low <= pos['stop']:
+                sell_price = pos['stop']
+                losses += 1
+            elif t_high >= pos['target']:
+                sell_price = pos['target']
+                wins += 1
+                
+            if sell_price > 0:
+                revenue = sell_price * pos['shares']
+                cash += revenue
+                pnl = revenue - (pos['entry'] * pos['shares'])
+                
+                # חלוקה לרווח והפסד
+                if pnl > 0: total_gross_profit += pnl
+                else: total_gross_loss += abs(pnl)
+                
+                trade_log.append({'Date': today_str, 'Ticker': ticker, 'Invested': round(pos['entry']*pos['shares'],2), 'PnL': round(pnl, 2)})
+                closed_tickers.append(ticker)
+                
+        for t in closed_tickers: del positions[t]
+
+        # 3. שערוך תיק יומי
+        portfolio_value = cash
+        for ticker, pos in positions.items():
+            t_close = prices[ticker].iloc[i]
+            if not pd.isna(t_close): portfolio_value += pos['shares'] * float(t_close)
+                
+        equity_curve.append(portfolio_value)
+        dates.append(today_str)
+        
+        # 4. סריקה למחר (רק למניות שלא מוחזקות כרגע בתיק!)
+        try:
+            spy_slice = prices['SPY'].iloc[i-20:i+1]
+            market_bull = float(spy_slice.iloc[-1]) > float(spy_slice.rolling(20).mean().iloc[-1])
+        except: continue
+        
+        if not market_bull: continue # בשוק יורד לא קונים חדשות
+        
+        for ticker in WATCHLIST:
+            if ticker in positions: continue # כבר "בפנים" - לא מייצר סטאפ חדש
+            
+            try:
+                c_hist, h_hist, l_hist = prices[ticker].iloc[i-200:i+1], highs[ticker].iloc[i-21:i+1], lows[ticker].iloc[i-21:i+1]
+                if len(c_hist) < 200 or pd.isna(c_hist.iloc[-1]): continue
+                
+                last_p = float(c_hist.iloc[-1])
+                sma200, ema21, res_20d = float(c_hist.mean()), float(c_hist.ewm(span=21, adjust=False).mean().iloc[-1]), float(h_hist.iloc[:-1].max())
+                
+                if last_p < sma200: continue
+                
+                tr = pd.concat([h_hist-l_hist, (h_hist-c_hist.shift()).abs(), (l_hist-c_hist.shift()).abs()], axis=1).max(axis=1)
+                atr_val = float(tr.rolling(14).mean().iloc[-1])
+                
+                order_type, entry_price = None, 0
+                dist_to_res = (res_20d / last_p - 1)
+                
+                if 0 < dist_to_res < 0.03: 
+                    entry_price = round(res_20d * 1.002, 2)
+                    if last_p < entry_price: order_type = 'BUY STOP LIMIT'
+                elif last_p > ema21 and (last_p / ema21 - 1) < 0.03:
+                    entry_price = round(ema21 * 1.005, 2)
+                    if last_p > entry_price: order_type = 'BUY LIMIT'
+                        
+                if order_type:
+                    stop_price = round(min(ema21, entry_price - (1.5 * atr_val)), 2)
+                    if entry_price - stop_price > 0 and (entry_price * 0.10) / (entry_price - stop_price) >= 1.5:
+                        # השקעה קבועה של 1000$ (או מה שהוגדר)
+                        shares = int(investment_per_trade / entry_price)
+                        if shares > 0 and (shares * entry_price) <= cash:
+                            pending_orders[ticker] = {
+                                'type': order_type, 'price': entry_price,
+                                'target': round(entry_price * 1.10, 2), 'stop': stop_price, 'shares': shares
+                            }
+            except: continue
+
+    df_equity = pd.DataFrame({'Date': dates, 'Portfolio Value': equity_curve}).set_index('Date')
+    df_trades = pd.DataFrame(trade_log)
+    return df_equity, df_trades, wins, losses, total_invested_dollars, total_gross_profit, total_gross_loss
+
+# ==========================================
+# 6. UI Dashboard
 # ==========================================
 if "authenticated" not in st.session_state: st.session_state["authenticated"] = False
 
 if not st.session_state["authenticated"]:
-    st.title("🔒 Edge Engine Access")
+    st.title("🔒 Terminal Access")
     pwd = st.text_input("סיסמה:", type="password")
     if st.button("כניסה"):
         if pwd == APP_PASSWORD: st.session_state["authenticated"] = True; st.rerun()
 else:
-    st.markdown("<h1 style='text-align: right;'>🧠 SwingHunter V6.1 - The Fortress Edition</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: right;'>🎯 SwingHunter V6.4 - Bottom Line Edition</h1>", unsafe_allow_html=True)
     
-    st.sidebar.header("ניהול סיכונים")
-    risk_sum = st.sidebar.number_input("סיכון מקסימלי לעסקה ($)", value=150, step=50)
+    st.sidebar.header("ניהול כספי")
+    investment_amount = st.sidebar.number_input("סכום קבוע להשקעה בכל עסקה ($)", value=1000, step=100)
     
-    if st.button("🚀 הרץ אנליזת פרימיום", use_container_width=True):
-        with st.spinner("מחשב אדג', בודק יומן דוחות ומאמת מבנה מחירים..."):
-            spy_close, market_trend = get_spy_context()
-            if spy_close is not None:
-                raw_results = [analyze_edge(t, spy_close, market_trend, risk_sum) for t in WATCHLIST]
-                raw_results = [r for r in raw_results if r is not None]
-            
-                # --- הגדרות Hoover (Tooltips) לטבלת הפקודות ---
-                order_column_config = {
-                    "מניה": st.column_config.TextColumn("מניה", help="סימול המניה בוול סטריט"),
-                    "פעולה": st.column_config.TextColumn("פעולה", help="BUY STOP LIMIT = פריצה (מעל המחיר הנוכחי) | BUY LIMIT = פולבק (מתחת למחיר הנוכחי)"),
-                    "Edge": st.column_config.TextColumn("Edge", help="היתרונות הייחודיים שהצדיקו את הפקודה הזו"),
-                    "כניסה": st.column_config.TextColumn("כניסה", help="מחיר ההפעלה לפקודה בברוקר"),
-                    "כמות": st.column_config.NumberColumn("כמות", help="כמות המניות שחושבה אוטומטית לפי תקציב הסיכון שלך"),
-                    "יעד 10%": st.column_config.NumberColumn("יעד 10%", help="תחנת לקיחת רווח ראשונה (יעד מינימלי)"),
-                    "יעד 15%": st.column_config.NumberColumn("יעד 15%", help="תחנת לקיחת רווח שנייה לניהול הפוזיציה"),
-                    "סטופ": st.column_config.NumberColumn("סטופ", help="המחיר שבו חותכים הפסד. נגזר מהתנודתיות (ATR) או מרמת התמיכה"),
-                    "סיכון $": st.column_config.TextColumn("סיכון $", help="ההפסד בדולרים אם הסטופ יופעל (מותאם לסיכון שהגדרת)"),
-                    "סיכון %": st.column_config.TextColumn("סיכון %", help="המרחק באחוזים ממחיר הכניסה לסטופ (המערכת פוסלת מעל 7%)"),
-                    "R/R": st.column_config.NumberColumn("R/R", help="יחס סיכוי-סיכון. על כל 1$ שאתה מסכן, כמה דולרים תרוויח ביעד הראשון? (מינימום 1.5)"),
-                    "תוקף": st.column_config.TextColumn("תוקף", help="זמן תוקף הפקודה. DAY ONLY אומר שהפקודה מתבטלת בסוף יום המסחר")
-                }
-
-                # 1. פקודות היום
-                order_list = [r['order'] for r in raw_results if r['order'] is not None]
-                st.markdown(f"### 📝 פקודות ביצוע מוגנות (Market: {market_trend})")
-                if order_list:
-                    df_orders = pd.DataFrame(order_list).sort_values(by="R/R", ascending=False).head(3)
-                    st.dataframe(df_orders.style.hide(axis="index"), column_config=order_column_config, use_container_width=True)
-                else:
-                    st.info("אין היום פקודות שעברו את כל שומרי הסף (דוחות, R/R, ומצב שוק).")
-
-                # --- הגדרות Hoover (Tooltips) לטבלת הסורק ---
-                scan_column_config = {
-                    "החלטה": st.column_config.TextColumn("החלטה", help="ARMED = מוכנה לפקודה | Building Pressure = צוברת לחץ למעקב | Dormant = רדומה, אין יתרון | DANGER = מסוכנת (דוח וכו')"),
-                    "ציון_כולל": st.column_config.NumberColumn("ציון כולל", help="שקלול של המבנה הטכני והיתרון היחסי. מעל 80 = פקודת עבודה"),
-                    "תבנית": st.column_config.TextColumn("תבנית", help="סוג הסטאפ (למשל: דחיסה לפני פריצה, פולבק מניית עוצמה, שבירת שווא)"),
-                    "Watch Days": st.column_config.NumberColumn("Watch Days", help="כמה ימים ברצף המניה נמצאת תחת המעקב של המערכת (זיכרון שוק)"),
-                    "Comp. Score": st.column_config.NumberColumn("Comp. Score", help="מדד דחיסה: בודק אם הטווח מתכווץ והנפח מתייבש (מעל 25 מעיד על לחץ שעומד להשתחרר)"),
-                    "RS (5D)": st.column_config.TextColumn("RS (5D)", help="עוצמה יחסית מול SPY ב-5 ימים האחרונים. מספר חיובי = המניה חזקה מהשוק"),
-                    "RS (20D)": st.column_config.TextColumn("RS (20D)", help="עוצמה יחסית מול SPY בחודש האחרון. המסנן המרכזי למניות מובילות (Leaders)"),
-                    "Edge Notes": st.column_config.TextColumn("Edge Notes", help="פירוט של הגורמים שנותנים למניה 'אלפא' (היתרון על פני שאר השוק)"),
-                    "סיבת פסילה": st.column_config.TextColumn("סיבת פסילה", help="למה המניה לא הפכה לפקודה היום? שומר עליך מטעויות (למשל R/R נמוך, דוח קרוב, מרדף)")
-                }
-
-                # 2. סורק מעקב
-                st.markdown("---")
-                st.markdown("### 🔍 רדאר התהוות וניתוח פסילות")
-                scanner_list = [r['scanner'] for r in raw_results]
-                df_scan = pd.DataFrame(scanner_list).sort_values(by="ציון_כולל", ascending=False)
+    tab_daily, tab_backtest = st.tabs(["🚀 מסך עבודה יומי", "🔬 מעבדת סימולציות"])
+    
+    # --- לשונית עבודה יומית ---
+    with tab_daily:
+        if st.button("⚡ הפק תוכנית עבודה להיום", use_container_width=True):
+            with st.spinner("מנתח את השוק ומייצר פקודות..."):
+                spy_close, market_trend = get_spy_context()
+                if spy_close is not None:
+                    raw_results = [analyze_edge(t, spy_close, market_trend, investment_amount) for t in WATCHLIST]
+                    raw_results = [r for r in raw_results if r is not None]
                 
-                save_scan_history(df_scan)
-                
-                def color_logic(row):
-                    val = str(row['החלטה'])
-                    if "ARMED" in val: return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
-                    if "Building Pressure" in val: return ['background-color: rgba(241, 196, 15, 0.1)'] * len(row)
-                    if "DANGER" in val: return ['background-color: rgba(231, 76, 60, 0.1)'] * len(row)
-                    return [''] * len(row)
+                    order_column_config = {
+                        "מניה": st.column_config.TextColumn("מניה"), "פעולה": st.column_config.TextColumn("פעולה"),
+                        "Edge": st.column_config.TextColumn("Edge"), "כניסה": st.column_config.TextColumn("כניסה"),
+                        "כמות": st.column_config.NumberColumn("כמות", help=f"מספר מניות לקנייה. מחושב כדי להגיע לכ-{investment_amount}$ השקעה"),
+                        "השקעה $": st.column_config.TextColumn("השקעה $", help="סכום הכסף המדויק שינעל בפקודה הזו (הכמות כפול שער הכניסה)"),
+                        "יעד 10%": st.column_config.NumberColumn("יעד 10%"), "יעד 15%": st.column_config.NumberColumn("יעד 15%"),
+                        "סטופ": st.column_config.NumberColumn("סטופ"), "R/R": st.column_config.NumberColumn("R/R"),
+                        "תוקף": st.column_config.TextColumn("תוקף")
+                    }
 
-                st.dataframe(df_scan.style.apply(color_logic, axis=1), column_config=scan_column_config, use_container_width=True)
-            else:
-                st.error("שגיאה במשיכת נתוני SPY (שוק כללי).")
+                    order_list = [r['order'] for r in raw_results if r['order'] is not None]
+                    st.markdown(f"### 📝 פקודות (סכום להשקעה מבוקש בעסקה: {investment_amount}$)")
+                    if order_list:
+                        df_orders = pd.DataFrame(order_list).sort_values(by="R/R", ascending=False).head(3)
+                        st.dataframe(df_orders.style.hide(axis="index"), column_config=order_column_config, use_container_width=True)
+                    else: st.info("אין היום פקודות שעברו את כל שומרי הסף.")
+
+                    scan_column_config = {"החלטה": st.column_config.TextColumn("החלטה"), "סיבת פסילה": st.column_config.TextColumn("סיבת פסילה")}
+                    st.markdown("---")
+                    st.markdown("### 🔍 רדאר שוק")
+                    scanner_list = [r['scanner'] for r in raw_results]
+                    df_scan = pd.DataFrame(scanner_list).sort_values(by="ציון_כולל", ascending=False)
+                    save_scan_history(df_scan)
+                    
+                    def color_logic(row):
+                        val = str(row['החלטה'])
+                        if "ARMED" in val: return ['background-color: rgba(46, 204, 113, 0.2)'] * len(row)
+                        if "Building Pressure" in val: return ['background-color: rgba(241, 196, 15, 0.1)'] * len(row)
+                        if "DANGER" in val: return ['background-color: rgba(231, 76, 60, 0.1)'] * len(row)
+                        return [''] * len(row)
+                    st.dataframe(df_scan.style.apply(color_logic, axis=1), column_config=scan_column_config, use_container_width=True)
+                else: st.error("שגיאה במשיכת נתוני השוק.")
+
+    # --- לשונית מעבדה וסטטיסטיקה ---
+    with tab_backtest:
+        st.markdown(f"### 🧪 בדיקת אלגוריתם - 3 חודשים (השקעה של {investment_amount}$ בעסקה)")
+        if st.button("⚙️ הרץ בדיקה היסטורית (לוקח כדקה)", type="primary"):
+            with st.spinner("מריץ אלפי סימולציות. זה עשוי לקחת קצת זמן..."):
+                data = fetch_backtest_data(months=3)
+                df_eq, df_trades, wins, losses, tot_invested, tot_g_profit, tot_g_loss = run_backtest_simulation(data, investment_amount, 10000.0)
+                
+                total_trades = wins + losses
+                net_pnl = tot_g_profit - tot_g_loss
+                final_val = df_eq['Portfolio Value'].iloc[-1] if not df_eq.empty else 10000.0
+                roi = ((final_val / 10000.0) - 1) * 100
+                
+                # מתן ציון למערכת
+                grade_str, desc_str = "", ""
+                if roi > 15: grade_str, desc_str = "10/10 🏆", "מכונת מזומנים. המערכת קוראת את השוק בצורה מבריקה."
+                elif roi > 5: grade_str, desc_str = "8/10 🟢", "אלגוריתם חזק ויציב. מייצר אלפא יפה על הכסף."
+                elif roi > 0: grade_str, desc_str = "6/10 🟡", "רווחי אבל מתקשה לייצר תנופה אגרסיבית (שומר על ההון)."
+                elif roi > -5: grade_str, desc_str = "4/10 🟠", "הפסד קל. השוק כנראה חותך את הסטופים."
+                else: grade_str, desc_str = "2/10 🔴", "ביצועים חלשים. נדרש כיול מחדש ללוגיקת הכניסות."
+
+                st.markdown("#### 💰 שורה תחתונה (Bottom Line)")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("סך הכל השקעה מצטברת", f"${tot_invested:,.0f}")
+                col2.metric("הרווחנו בעסקאות טובות", f"+${tot_g_profit:,.0f}")
+                col3.metric("הפסדנו בעסקאות רעות", f"-${tot_g_loss:,.0f}")
+                col4.metric("רווח נקי בכיס (Net PnL)", f"${net_pnl:,.0f}", delta=f"{roi:.1f}% תשואה על התיק")
+                
+                st.info(f"**ציון המערכת לתקופה זו: {grade_str}** | {desc_str}")
+                
+                st.markdown("#### 📈 התפתחות שווי התיק (מ-10,000$)")
+                st.line_chart(df_eq)
+                
+                if not df_trades.empty:
+                    with st.expander("📝 יומן עסקאות מפורט (לראות כל דולר שנכנס ויצא)"):
+                        st.dataframe(df_trades, use_container_width=True)
