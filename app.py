@@ -23,8 +23,8 @@ try:
     APP_PASSWORD = st.secrets.get("Pk0105Ak2701", "")
     MY_EMAIL = st.secrets.get("orel@peleg-eng.com", "")
 except Exception:
-    APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-    MY_EMAIL = os.getenv("MY_EMAIL", "")
+    APP_PASSWORD = os.getenv("Pk0105Ak2701", "")
+    MY_EMAIL = os.getenv("orel@peleg-eng.com", "")
 
 WATCHLIST = [
     'AAPL','MSFT','NVDA','TSLA','AMZN','META','GOOGL','NFLX','AMD','AVGO','TSM','QCOM',
