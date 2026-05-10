@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.3 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.3"
+st.set_page_config(page_title="SwingHunter V11.4 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.4"
 
 # ==========================================================
 # 1. Security
@@ -102,7 +102,6 @@ def safe_float(x, default=np.nan):
         return default
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def download_single(ticker: str, period: str = "370d") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
@@ -1333,16 +1332,26 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.3 — Intraday Refresh + Pullback Watch</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.4 — Hard Refresh + Live Quotes Fix</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.3 כוללת רענון נתונים מהיר, כפתור רענון ידני, ו-Pullback Watch Price למניות חזקות מדי במקום WAIT כללי. "
+        "V11.4 מתקנת את הרענון: מסכי היום והתיק מושכים נתונים מחדש בכל הרצה, וכפתור הרענון מנקה cache ומציג זמן רענון אחרון. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
     st.sidebar.header("הגדרות קצרות")
-    if st.sidebar.button("🔄 רענן נתונים עכשיו"):
+
+    if "refresh_counter" not in st.session_state:
+        st.session_state["refresh_counter"] = 0
+    if "last_refresh_time" not in st.session_state:
+        st.session_state["last_refresh_time"] = "טרם בוצע רענון ידני"
+
+    if st.sidebar.button("🔄 רענן נתונים עכשיו", use_container_width=True):
+        st.session_state["refresh_counter"] += 1
+        st.session_state["last_refresh_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.cache_data.clear()
         st.rerun()
+
+    st.sidebar.caption(f"רענון אחרון: {st.session_state['last_refresh_time']}")
     months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 24, 12)
     starting_bank = st.sidebar.number_input("בנק התחלתי ($)", value=50000, step=5000)
     max_risk_pct = st.sidebar.slider("סיכון מקסימלי לעסקה (%)", 4.0, 15.0, 9.5, 0.5)
