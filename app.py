@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V10.8 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V10.8"
+st.set_page_config(page_title="SwingHunter V11.0 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.0"
 
 # ==========================================================
 # 1. Security
@@ -38,14 +38,18 @@ WATCHLIST = [
     'COST','HD','UBER','ABNB','BKNG','EXPE','DAL','UAL','SPOT',
     'ROKU','DKNG','DIS','NKE','SBUX','MCD','JPM','BAC','GS','MS',
     'V','MA','AXP','LLY','NVO','JNJ','UNH','PFE','MRNA','CAT',
-    'BA','XOM','CVX','GE'
+    'BA','XOM','CVX','GE',
+    # V11.0 additions: important QQQ / Nasdaq-100 names we were missing
+    'LRCX','AMAT','KLAC','TXN','CSCO','TMUS','LIN','PEP'
 ]
 
 MOMENTUM_TICKERS = {
     'AMD','NVDA','TSLA','DDOG','NET','QCOM','CRWD','PANW','AVGO','AMZN',
     'MSTR','COIN','SMCI','PLTR','ARM','MU','MRVL','TSM','META','GOOGL',
     'HOOD','AFRM','SHOP','NFLX','SNOW','ZS','MDB','SOFI','SQ','PYPL',
-    'MARA','RIOT','ASML'
+    'MARA','RIOT','ASML',
+    # V11.0 additions: semiconductor / chip-equipment momentum candidates
+    'LRCX','AMAT','KLAC','TXN'
 }
 
 NOTIONAL_PER_TRADE = 1000.0
@@ -1267,9 +1271,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.8 — Protection Stop + Profit Checkpoint</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.0 — Unified Portfolio Only</h1>", unsafe_allow_html=True)
     st.info(
-        "V10.8 מתקנת את הבלבול: יש שער הגנה נוכחי שהוא מתחת למחיר, ויש יעד רווח לבדיקה שהוא מעל המחיר. "
+        "V11.0 מרחיבה את רשימת המעקב עם מניות QQQ/Nasdaq-100 חסרות, בעיקר ציוד שבבים: LRCX, AMAT, KLAC, TXN, וגם CSCO, TMUS, LIN, PEP. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1281,7 +1285,7 @@ else:
 
     params = StrategyParams(max_risk_pct=max_risk_pct, position_pct=position_pct)
 
-    tab_daily, tab_portfolio, tab_positions, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "📌 ניהול פוזיציות", "🔬 בדיקת בנק"])
+    tab_daily, tab_portfolio, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "🔬 בדיקת בנק"])
 
     with tab_daily:
         if st.button("⚡ הפק פקודות/מעקב להיום", use_container_width=True):
@@ -1331,8 +1335,13 @@ else:
     with tab_portfolio:
         st.markdown("## 💼 תיק השקעות — אמת + וירטואלי")
         st.caption(
-            "זה יומן פעולות ידני. קנית/מכרת בפועל או וירטואלית — מזינים פעולה. "
+            "זה המקום היחיד לניהול פוזיציות. קנית/מכרת בפועל או וירטואלית — מזינים פעולה. "
             "המערכת מחשבת החזקות, שווי נוכחי, רווח/הפסד, ו-HOLD/SELL לפי EMA21/Trailing Stop."
+        )
+
+        st.info(
+            "הבהרה: ביטלנו את הטאב הישן 'ניהול פוזיציות'. מעכשיו הכל נעשה כאן: "
+            "BUY מוסיף/מגדיל פוזיציה, SELL מקטין/סוגר פוזיציה, והתיק מחושב אוטומטית לפי יומן הפעולות."
         )
 
         if "ledger" not in st.session_state:
@@ -1457,69 +1466,6 @@ else:
         st.write(
             "מוסיף פעולה חדשה מסוג SELL עם אותה מניה וכמות למכירה. הכמות חייבת להיות קטנה או שווה לכמות הפתוחה. "
             "אם מכרת הכול — הכמות תתאפס ולא תופיע בהחזקות. אם מכרת חלק — הכמות שנותרה תמשיך להיות מנוהלת."
-        )
-
-    with tab_positions:
-        st.markdown("## 📌 ניהול פוזיציות פתוחות")
-        st.caption(
-            "כאן מזינים את המניות שכבר קנית בפועל. המערכת מחשבת האם להחזיק או למכור לפי אותה לוגיקת יציאה של V10.2: "
-            "Trailing Stop שעולה עם EMA21, ויציאה מלאה כשהמגמה נשברת."
-        )
-
-        st.markdown("#### הזן פוזיציות פתוחות")
-        st.caption("עמודות חובה: Ticker, Entry, Entry Date. מומלץ להזין גם Initial Stop מהפקודה המקורית.")
-
-        template = build_positions_template()
-        positions_input = st.data_editor(
-            template,
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "Entry": st.column_config.NumberColumn("Entry", min_value=0.0, step=0.01),
-                "Entry Date": st.column_config.TextColumn("Entry Date YYYY-MM-DD"),
-                "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01),
-            }
-        )
-
-        if st.button("🔎 בדוק מה לעשות עם הפוזיציות", use_container_width=True):
-            rows = []
-            for _, row in positions_input.iterrows():
-                ticker = str(row.get("Ticker", "")).strip().upper()
-                entry = safe_float(row.get("Entry", np.nan))
-                entry_date = row.get("Entry Date", "")
-                initial_stop = safe_float(row.get("Initial Stop", np.nan))
-
-                if not ticker or not np.isfinite(entry) or entry <= 0:
-                    continue
-
-                rows.append(analyze_open_position(ticker, entry, entry_date, initial_stop))
-
-            if rows:
-                df_pos = pd.DataFrame(rows)
-                cols = [
-                    "Ticker", "Action", "Status", "Reason", "Current", "Entry", "PnL %",
-                    "Trailing Stop", "Current Protection Stop", "Profit Checkpoint", "Distance to Trail %", "EMA21", "Exit Close Level",
-                    "Initial Stop", "Last Date"
-                ]
-                cols = [c for c in cols if c in df_pos.columns]
-                st.dataframe(df_pos[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
-
-                st.download_button(
-                    "⬇️ הורד CSV פוזיציות",
-                    df_pos.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"swinghunter_{APP_VERSION}_open_positions.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            else:
-                st.warning("לא הוזנו פוזיציות תקינות.")
-
-        st.markdown("#### כלל היציאה בפועל")
-        st.write(
-            "במודל V10.2/V10.3 אין יעד רווח קשיח. בפועל בודקים את הפוזיציה בסוף יום מסחר: "
-            "אם הסגירה מתחת EMA21×0.995 — מוכרים. בנוסף, אם המחיר נוגע ב-Trailing Stop — זו יציאה."
         )
 
     with tab_backtest:
