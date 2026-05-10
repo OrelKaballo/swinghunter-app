@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.1 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.1"
+st.set_page_config(page_title="SwingHunter V11.2 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.2"
 
 # ==========================================================
 # 1. Security
@@ -1280,6 +1280,25 @@ def summarize_portfolio(df: pd.DataFrame, include_virtual: bool):
     }
 
 
+
+def unique_existing_columns(columns, df):
+    """Return existing DataFrame columns without duplicates, preserving order."""
+    seen = set()
+    result = []
+    for col in columns:
+        if col in df.columns and col not in seen:
+            result.append(col)
+            seen.add(col)
+    return result
+
+
+def dedupe_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Defensive fix for Streamlit/PyArrow duplicate-column errors."""
+    if df is None or df.empty:
+        return df
+    return df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+
+
 # ==========================================================
 # 9. UI
 # ==========================================================
@@ -1297,9 +1316,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.1 — Unified Portfolio Only</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.2 — Expanded Watchlist + Overextension Filter</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.1 מוסיפה מסנן Overextension: מעל 30% ריצה ב-20 יום לא קונים פריצה רגילה אלא מחכים לפולבק איכותי; מעל 45% נשארים ברדאר בלבד. "
+        "V11.2 כוללת Watchlist מורחב של QQQ/Nasdaq-100, מסנן Overextension, תיק השקעות מאוחד, ועמודות שער הגנה/יעד רווח לבדיקה. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1324,9 +1343,10 @@ else:
                     cols = [
                         "Ticker","Action Now","Order","Current","Entry","Distance to Entry %",
                         "Stop","Current Protection Stop","Profit Checkpoint","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
-                        "Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone","Run Zone"
+                        "Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
                     ]
-                    cols = [c for c in cols if c in df_orders.columns]
+                    df_orders = dedupe_dataframe_columns(df_orders)
+                    cols = unique_existing_columns(cols, df_orders)
                     st.dataframe(df_orders[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                 else:
                     st.warning("אין היום פקודות ביצוע. זה לא אומר שאין מידע — ראה רדאר למטה.")
@@ -1335,9 +1355,10 @@ else:
                 if not df_radar.empty:
                     cols = [
                         "Ticker","Status","Decision","Score","Reason","Current","Entry","Distance to Entry %",
-                        "Stop","Current Protection Stop","Profit Checkpoint","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone","Run Zone"
+                        "Stop","Current Protection Stop","Profit Checkpoint","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
                     ]
-                    cols = [c for c in cols if c in df_radar.columns]
+                    df_radar = dedupe_dataframe_columns(df_radar)
+                    cols = unique_existing_columns(cols, df_radar)
                     st.dataframe(df_radar[cols].head(80), use_container_width=True, hide_index=True, column_config=get_column_config())
 
                 zip_bytes = build_zip_report(
@@ -1477,7 +1498,8 @@ else:
                     "Trailing Stop", "Current Protection Stop", "Profit Checkpoint", "Distance to Trail %", "EMA21", "Exit Close Level",
                     "Initial Stop", "Entry Date", "Last Date"
                 ]
-                cols = [c for c in cols if c in df_portfolio.columns]
+                df_portfolio = dedupe_dataframe_columns(df_portfolio)
+                cols = unique_existing_columns(cols, df_portfolio)
                 st.dataframe(df_portfolio[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
 
                 st.download_button(
