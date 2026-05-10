@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.0 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.0"
+st.set_page_config(page_title="SwingHunter V11.1 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.1"
 
 # ==========================================================
 # 1. Security
@@ -70,7 +70,7 @@ class StrategyParams:
     min_rr: float = 0.00
     min_atr_pct: float = 1.4
     overbought_rsi: float = 86.0
-    max_20d_run: float = 60.0
+    max_20d_run: float = 45.0  # V11.1: above 45% in 20d is too extended for auto trade
     stop_atr_breakout: float = 2.4
     stop_atr_pullback: float = 2.0
     rs5_min: float = 0.5
@@ -242,6 +242,7 @@ def evaluate_ticker(
         "RSI": np.nan,
         "ATR%": np.nan,
         "20D Run": np.nan,
+        "Run Zone": "",
         "Reason": ""
     }
 
@@ -264,6 +265,15 @@ def evaluate_ticker(
         rs5, rs20 = relative_strength_vs(qqq_slice, c)
         regime = market_regime(qqq_slice)
 
+        if run20 <= 15:
+            run_zone = "NORMAL"
+        elif run20 <= 30:
+            run_zone = "HOT"
+        elif run20 <= 45:
+            run_zone = "EXTENDED"
+        else:
+            run_zone = "TOO_EXTENDED"
+
         base.update({
             "Current": round(last_p, 2),
             "Regime": regime,
@@ -273,7 +283,8 @@ def evaluate_ticker(
             "RS20": round(rs20, 1),
             "RSI": round(rsi, 1),
             "ATR%": round(atr_pct, 1) if np.isfinite(atr_pct) else np.nan,
-            "20D Run": round(run20, 1)
+            "20D Run": round(run20, 1),
+            "Run Zone": run_zone
         })
 
         edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
@@ -303,8 +314,14 @@ def evaluate_ticker(
             base.update(Status="WATCH", Decision="WAIT", Reason=f"שוק לא מספיק חזק ({regime})")
             return base
 
-        if (rsi > params.overbought_rsi or run20 > params.max_20d_run) and not exceptional:
-            base.update(Status="WATCH", Decision="WAIT", Reason="מתוחה מדי כרגע")
+        if rsi > params.overbought_rsi and not exceptional:
+            base.update(Status="WATCH", Decision="WAIT", Reason="RSI גבוה מדי / המניה מתוחה")
+            return base
+
+        # V11.1 overextension gate:
+        # A stock that already ran hard can stay on the radar, but auto-entry is restricted.
+        if run20 > params.max_20d_run:
+            base.update(Status="WATCH", Decision="WAIT", Reason=f"ריצה חזקה מדי ב-20 יום ({run20:.1f}%) — לא רודפים אחרי הנר")
             return base
 
         if not edge_ok and not exceptional:
@@ -317,8 +334,13 @@ def evaluate_ticker(
 
         dist_to_res = (res20 / last_p - 1)
 
+        # V11.1: do not chase breakouts after a 30%+ 20-day run.
+        # If a name already ran 30%-45%, it may only enter via a quality pullback.
+        allow_breakout = run20 <= 30 or (exceptional and run20 <= 35 and rs20 > 30 and rs5 > 5)
+        allow_pullback = run20 <= 45
+
         # 1) Breakout near resistance.
-        if 0 < dist_to_res < 0.045 and edge_ok:
+        if allow_breakout and 0 < dist_to_res < 0.045 and edge_ok:
             entry = round(res20 * 1.002, 2)
             if last_p < entry:
                 order_type = "BUY STOP LIMIT"
@@ -341,25 +363,28 @@ def evaluate_ticker(
             and higher_low_2
         )
 
-        if order_type is None and pullback_quality_ok and (last_p / ema8 - 1) < 0.035:
+        if order_type is None and allow_pullback and pullback_quality_ok and (last_p / ema8 - 1) < 0.035:
             entry = min(round(ema8 * 1.003, 2), round(last_p * 0.995, 2))
             if last_p > entry:
                 order_type = "BUY LIMIT"
                 setup = "RS Pullback"
 
         # 3) Momentum continuation is WATCH only unless exceptional.
-        if order_type is None and exceptional and last_p > ema21 and (prev_hi / last_p - 1) < 0.025:
+        if order_type is None and allow_breakout and exceptional and last_p > ema21 and (prev_hi / last_p - 1) < 0.025:
             entry = round(prev_hi * 1.002, 2)
             if last_p < entry:
                 order_type = "BUY STOP LIMIT"
                 setup = "Exceptional Momentum Continuation"
 
         if order_type is None:
+            reason = "אין נקודת כניסה נקייה כרגע"
+            if run20 > 30:
+                reason = "רצה מעל 30% ב-20 יום — ממתינים לפולבק איכותי, לא קונים פריצה"
             base.update(
                 Status="WATCH",
                 Decision="WAIT",
                 Score=round(score_candidate(rs5, rs20, run20, 1.0, params.max_risk_pct, "WATCH", exceptional, momentum_name), 2),
-                Reason="אין נקודת כניסה נקייה כרגע"
+                Reason=reason
             )
             return base
 
@@ -1044,6 +1069,7 @@ def get_column_config():
         "RSI": st.column_config.NumberColumn("RSI", help="מדד מומנטום 0–100. גבוה מאוד יכול להעיד שהמניה מתוחה.", format="%.1f"),
         "ATR%": st.column_config.NumberColumn("ATR%", help="תנודתיות יומית ממוצעת כאחוז מהמחיר. עוזר להבין אם המניה זזה מספיק לסווינג.", format="%.1f%%"),
         "20D Run": st.column_config.NumberColumn("ריצה 20 יום", help="כמה המניה עלתה/ירדה ב-20 ימי המסחר האחרונים.", format="%.1f%%"),
+        "Run Zone": st.column_config.TextColumn("אזור ריצה", help="NORMAL עד 15%, HOT עד 30%, EXTENDED עד 45%, TOO_EXTENDED מעל 45%. מעל 30% לא קונים פריצה אלא מחכים לפולבק."),
         "Status": st.column_config.TextColumn("סטטוס", help="SIGNAL = איתות ביצוע. WATCH = במעקב. REJECT = לא רלוונטית כרגע."),
         "Decision": st.column_config.TextColumn("החלטה", help="ACTION / WAIT / NO TRADE לפי תנאי המודל."),
         "Reason": st.column_config.TextColumn("סיבה", help="הסיבה המרכזית למה המניה לא נכנסה או למה צריך למכור/להחזיק."),
@@ -1271,9 +1297,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.0 — Unified Portfolio Only</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.1 — Unified Portfolio Only</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.0 מרחיבה את רשימת המעקב עם מניות QQQ/Nasdaq-100 חסרות, בעיקר ציוד שבבים: LRCX, AMAT, KLAC, TXN, וגם CSCO, TMUS, LIN, PEP. "
+        "V11.1 מוסיפה מסנן Overextension: מעל 30% ריצה ב-20 יום לא קונים פריצה רגילה אלא מחכים לפולבק איכותי; מעל 45% נשארים ברדאר בלבד. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1298,7 +1324,7 @@ else:
                     cols = [
                         "Ticker","Action Now","Order","Current","Entry","Distance to Entry %",
                         "Stop","Current Protection Stop","Profit Checkpoint","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
-                        "Regime","RS5","RS20","RSI","ATR%","20D Run"
+                        "Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone","Run Zone"
                     ]
                     cols = [c for c in cols if c in df_orders.columns]
                     st.dataframe(df_orders[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
@@ -1309,7 +1335,7 @@ else:
                 if not df_radar.empty:
                     cols = [
                         "Ticker","Status","Decision","Score","Reason","Current","Entry","Distance to Entry %",
-                        "Stop","Current Protection Stop","Profit Checkpoint","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run"
+                        "Stop","Current Protection Stop","Profit Checkpoint","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone","Run Zone"
                     ]
                     cols = [c for c in cols if c in df_radar.columns]
                     st.dataframe(df_radar[cols].head(80), use_container_width=True, hide_index=True, column_config=get_column_config())
