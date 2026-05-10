@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V10.5 - Hebrew Tooltips Dashboard", layout="wide")
-APP_VERSION = "V10.5"
+st.set_page_config(page_title="SwingHunter V10.8 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V10.8"
 
 # ==========================================================
 # 1. Security
@@ -231,6 +231,8 @@ def evaluate_ticker(
         "Regime": "",
         "EMA21": np.nan,
         "Exit Close Level": np.nan,
+        "Current Protection Stop": np.nan,
+        "Profit Checkpoint": np.nan,
         "RS5": np.nan,
         "RS20": np.nan,
         "RSI": np.nan,
@@ -418,8 +420,10 @@ def evaluate_ticker(
             "Entry": round(entry, 2),
             "Distance to Entry %": round(distance, 2),
             "Stop": stop,
+            "Current Protection Stop": stop,
+            "Profit Checkpoint": round(entry * 1.15, 2),
             "Target": "No fixed target",
-            "Exit Rule": "Close below EMA21 trail",
+            "Exit Rule": "Initial stop, then EMA21 trailing exit",
             "Risk %": round(risk_pct, 2),
             "R/R": "Trend",
             "Order": order_type,
@@ -918,6 +922,8 @@ def analyze_open_position(ticker: str, entry_price: float, entry_date, initial_s
         "EMA21": round(ema21_now, 2),
         "Exit Close Level": round(close_exit_level, 2),
         "Trailing Stop": round(trail_stop, 2),
+        "Current Protection Stop": round(max(trail_stop, close_exit_level), 2),
+        "Profit Checkpoint": round(max(entry_price * 1.15, last_close * 1.05), 2),
         "Distance to Trail %": round(distance_to_exit, 2),
     }
 
@@ -973,6 +979,8 @@ def analyze_virtual_portfolio(df_positions: pd.DataFrame):
             "Action": status.get("Action", ""),
             "Reason": status.get("Reason", ""),
             "Trailing Stop": status.get("Trailing Stop", np.nan),
+            "Current Protection Stop": status.get("Current Protection Stop", np.nan),
+            "Profit Checkpoint": status.get("Profit Checkpoint", np.nan),
             "Distance to Trail %": status.get("Distance to Trail %", np.nan),
             "EMA21": status.get("EMA21", np.nan),
             "Exit Close Level": status.get("Exit Close Level", np.nan),
@@ -1015,6 +1023,8 @@ def get_column_config():
         "Distance to Entry %": st.column_config.NumberColumn("מרחק לכניסה %", help="כמה אחוזים המחיר צריך לעלות/לרדת כדי להגיע לשער הכניסה.", format="%.2f%%"),
         "Stop": st.column_config.NumberColumn("סטופ", help="שער הגנה התחלתי. אם המחיר מגיע אליו, המודל יוצא מהעסקה.", format="%.2f"),
         "Trailing Stop": st.column_config.NumberColumn("Trailing Stop", help="סטופ עוקב שעולה עם המגמה ולא יורד. מיועד לשמור על רווחים כשהמניה עולה.", format="%.2f"),
+        "Current Protection Stop": st.column_config.NumberColumn("שער הגנה נוכחי", help="זה לא יעד רווח. זה שער ההגנה הנוכחי: סטופ התחלתי / Trailing Stop / רמת יציאה לפי EMA21. אם המחיר נשבר אליו — יוצאים.", format="%.2f"),
+        "Profit Checkpoint": st.column_config.NumberColumn("יעד רווח לבדיקה", help="יעד רווח אינדיקטיבי מעל המחיר: בכניסה חדשה כ-15% מעל שער הכניסה; בפוזיציה קיימת הגבוה מבין 15% מעל הכניסה או 5% מעל המחיר הנוכחי. לא פקודת מכירה אוטומטית.", format="%.2f"),
         "Exit Close Level": st.column_config.NumberColumn("רמת יציאה בסגירה", help="אם המניה סוגרת יום מתחת לרמה הזו, המודל מסמן יציאה. מחושב כ-EMA21 × 0.995.", format="%.2f"),
         "EMA21": st.column_config.NumberColumn("EMA21", help="ממוצע נע אקספוננציאלי של 21 ימי מסחר. משמש למדידת המגמה ולכללי יציאה.", format="%.2f"),
         "Exit Rule": st.column_config.TextColumn("כלל יציאה", help="בגרסת Trend אין יעד רווח קשיח. יוצאים כשהמניה שוברת EMA21/Trailing Stop."),
@@ -1043,6 +1053,200 @@ def get_column_config():
         "Initial Stop": st.column_config.NumberColumn("סטופ התחלתי", help="הסטופ המקורי מהיום שנכנסת לעסקה.", format="%.2f"),
         "Last Date": st.column_config.TextColumn("תאריך נתון אחרון", help="תאריך יום המסחר האחרון שהנתונים מתייחסים אליו."),
         "Action": st.column_config.TextColumn("פעולה", help="HOLD = להחזיק. SELL = יציאה לפי המודל."),
+        "Account": st.column_config.TextColumn("סוג תיק", help="אמת או וירטואלי. מאפשר לסכם בנפרד השקעות אמיתיות וסימולציות."),
+        "Open PnL $": st.column_config.NumberColumn("רווח פתוח $", help="רווח/הפסד על פוזיציות שעדיין פתוחות.", format="$%.2f"),
+        "Open PnL %": st.column_config.NumberColumn("רווח פתוח %", help="אחוז רווח/הפסד על הפוזיציה הפתוחה.", format="%.2f%%"),
+        "Realized PnL": st.column_config.NumberColumn("רווח ממומש", help="רווח/הפסד ממכירות שכבר בוצעו לפי יומן הפעולות.", format="$%.2f"),
+    }
+
+
+
+def empty_ledger():
+    return pd.DataFrame(columns=[
+        "Date", "Account", "Action", "Ticker", "Quantity", "Price", "Initial Stop", "Note"
+    ])
+
+
+def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
+    required = ["Date", "Account", "Action", "Ticker", "Quantity", "Price", "Initial Stop", "Note"]
+    if df is None or df.empty:
+        return empty_ledger()
+
+    out = df.copy()
+    for col in required:
+        if col not in out.columns:
+            out[col] = "" if col in ["Date", "Account", "Action", "Ticker", "Note"] else 0.0
+
+    out = out[required]
+    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+    out["Account"] = out["Account"].astype(str).replace({"real": "אמת", "virtual": "וירטואלי", "REAL": "אמת", "VIRTUAL": "וירטואלי"})
+    out["Action"] = out["Action"].astype(str).replace({"buy": "BUY", "sell": "SELL", "קניה": "BUY", "מכירה": "SELL"})
+    out["Action"] = out["Action"].str.upper().str.strip()
+    out["Quantity"] = pd.to_numeric(out["Quantity"], errors="coerce").fillna(0.0)
+    out["Price"] = pd.to_numeric(out["Price"], errors="coerce").fillna(0.0)
+    out["Initial Stop"] = pd.to_numeric(out["Initial Stop"], errors="coerce").fillna(0.0)
+    return out
+
+
+def ledger_to_holdings(ledger: pd.DataFrame):
+    ledger = normalize_ledger(ledger)
+    errors = []
+    state = {}
+
+    for idx, tx in ledger.iterrows():
+        account = str(tx["Account"]).strip() or "אמת"
+        action = str(tx["Action"]).strip().upper()
+        ticker = str(tx["Ticker"]).strip().upper()
+        qty = safe_float(tx["Quantity"], 0)
+        price = safe_float(tx["Price"], 0)
+        stop = safe_float(tx["Initial Stop"], 0)
+        date = tx["Date"]
+
+        if not ticker or qty <= 0 or price <= 0 or action not in ["BUY", "SELL"]:
+            continue
+
+        key = (account, ticker)
+        if key not in state:
+            state[key] = {
+                "Account": account,
+                "Ticker": ticker,
+                "Quantity": 0.0,
+                "Cost Basis": 0.0,
+                "Avg Entry": 0.0,
+                "Initial Stop Total": 0.0,
+                "First Entry Date": date,
+                "Realized PnL": 0.0,
+            }
+
+        pos = state[key]
+
+        if action == "BUY":
+            if pos["Quantity"] <= 0:
+                pos["First Entry Date"] = date
+
+            pos["Cost Basis"] += qty * price
+            if stop > 0:
+                pos["Initial Stop Total"] += qty * stop
+            pos["Quantity"] += qty
+            pos["Avg Entry"] = pos["Cost Basis"] / pos["Quantity"] if pos["Quantity"] > 0 else 0
+
+        elif action == "SELL":
+            if qty > pos["Quantity"] + 1e-9:
+                errors.append({
+                    "Row": idx + 1,
+                    "Ticker": ticker,
+                    "Account": account,
+                    "Error": f"מכירה של {qty} גדולה מהכמות הקיימת {pos['Quantity']:.4f}",
+                })
+                continue
+
+            avg_entry = pos["Avg Entry"] if pos["Avg Entry"] > 0 else price
+            realized = qty * (price - avg_entry)
+            pos["Realized PnL"] += realized
+            pos["Cost Basis"] -= qty * avg_entry
+
+            if pos["Quantity"] > 0 and pos["Initial Stop Total"] > 0:
+                pos["Initial Stop Total"] *= max(0.0, (pos["Quantity"] - qty) / pos["Quantity"])
+
+            pos["Quantity"] -= qty
+            if pos["Quantity"] <= 1e-9:
+                pos["Quantity"] = 0.0
+                pos["Cost Basis"] = 0.0
+                pos["Avg Entry"] = 0.0
+                pos["Initial Stop Total"] = 0.0
+            else:
+                pos["Avg Entry"] = pos["Cost Basis"] / pos["Quantity"]
+
+    rows = []
+    for pos in state.values():
+        if pos["Quantity"] > 0:
+            avg_stop = (pos["Initial Stop Total"] / pos["Quantity"]) if pos["Initial Stop Total"] > 0 else 0.0
+            rows.append({
+                "Account": pos["Account"],
+                "Ticker": pos["Ticker"],
+                "Quantity": pos["Quantity"],
+                "Avg Entry": pos["Avg Entry"],
+                "Entry Date": pos["First Entry Date"],
+                "Initial Stop": avg_stop,
+                "Cost": pos["Cost Basis"],
+                "Realized PnL": pos["Realized PnL"],
+            })
+
+    return pd.DataFrame(rows), pd.DataFrame(errors)
+
+
+def analyze_unified_portfolio(ledger: pd.DataFrame):
+    holdings, errors = ledger_to_holdings(ledger)
+    if holdings.empty:
+        return holdings, errors
+
+    analyzed = []
+    for _, row in holdings.iterrows():
+        status = analyze_open_position(
+            row["Ticker"],
+            safe_float(row["Avg Entry"]),
+            row["Entry Date"],
+            safe_float(row["Initial Stop"])
+        )
+
+        current = safe_float(status.get("Current", np.nan))
+        qty = safe_float(row["Quantity"])
+        avg_entry = safe_float(row["Avg Entry"])
+        cost = safe_float(row["Cost"])
+        market_value = qty * current if np.isfinite(current) else np.nan
+        open_pnl = market_value - cost if np.isfinite(market_value) else np.nan
+        open_pnl_pct = (current / avg_entry - 1) * 100 if np.isfinite(current) and avg_entry else np.nan
+
+        analyzed.append({
+            "Account": row["Account"],
+            "Ticker": row["Ticker"],
+            "Quantity": round(qty, 4),
+            "Avg Entry": round(avg_entry, 2),
+            "Current": round(current, 2) if np.isfinite(current) else np.nan,
+            "Cost": round(cost, 2),
+            "Market Value": round(market_value, 2) if np.isfinite(market_value) else np.nan,
+            "Open PnL $": round(open_pnl, 2) if np.isfinite(open_pnl) else np.nan,
+            "Open PnL %": round(open_pnl_pct, 2) if np.isfinite(open_pnl_pct) else np.nan,
+            "Realized PnL": round(safe_float(row["Realized PnL"]), 2),
+            "Action": status.get("Action", ""),
+            "Reason": status.get("Reason", ""),
+            "Trailing Stop": status.get("Trailing Stop", np.nan),
+            "Current Protection Stop": status.get("Current Protection Stop", np.nan),
+            "Profit Checkpoint": status.get("Profit Checkpoint", np.nan),
+            "Distance to Trail %": status.get("Distance to Trail %", np.nan),
+            "EMA21": status.get("EMA21", np.nan),
+            "Exit Close Level": status.get("Exit Close Level", np.nan),
+            "Initial Stop": status.get("Initial Stop", row["Initial Stop"]),
+            "Entry Date": row["Entry Date"],
+            "Last Date": status.get("Last Date", ""),
+        })
+
+    return pd.DataFrame(analyzed), errors
+
+
+def summarize_portfolio(df: pd.DataFrame, include_virtual: bool):
+    if df.empty:
+        return {"cost": 0, "value": 0, "open_pnl": 0, "realized": 0, "total_pnl": 0, "pnl_pct": 0, "count": 0}
+
+    scope = df if include_virtual else df[df["Account"] == "אמת"]
+    if scope.empty:
+        return {"cost": 0, "value": 0, "open_pnl": 0, "realized": 0, "total_pnl": 0, "pnl_pct": 0, "count": 0}
+
+    cost = float(scope["Cost"].sum())
+    value = float(scope["Market Value"].sum())
+    open_pnl = float(scope["Open PnL $"].sum())
+    realized = float(scope["Realized PnL"].sum()) if "Realized PnL" in scope else 0
+    total_pnl = open_pnl + realized
+    pnl_pct = (total_pnl / cost * 100) if cost else 0
+
+    return {
+        "cost": cost,
+        "value": value,
+        "open_pnl": open_pnl,
+        "realized": realized,
+        "total_pnl": total_pnl,
+        "pnl_pct": pnl_pct,
+        "count": len(scope),
     }
 
 
@@ -1063,10 +1267,10 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.5 — Hebrew Tooltips Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.8 — Protection Stop + Profit Checkpoint</h1>", unsafe_allow_html=True)
     st.info(
-        "V10.5 מוסיפה הסברים בעברית ב-hover על העמודות, ומציגה EMA21 ורמת יציאה גם במסכי הפקודות/הרדאר. "
-        "בתיק הווירטואלי מקבלים שווי עדכני והחלטת HOLD/SELL לפי EMA21 ו-Trailing Stop."
+        "V10.8 מתקנת את הבלבול: יש שער הגנה נוכחי שהוא מתחת למחיר, ויש יעד רווח לבדיקה שהוא מעל המחיר. "
+        "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
     st.sidebar.header("הגדרות קצרות")
@@ -1077,7 +1281,7 @@ else:
 
     params = StrategyParams(max_risk_pct=max_risk_pct, position_pct=position_pct)
 
-    tab_daily, tab_portfolio, tab_positions, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק וירטואלי", "📌 ניהול פוזיציות", "🔬 בדיקת בנק"])
+    tab_daily, tab_portfolio, tab_positions, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "📌 ניהול פוזיציות", "🔬 בדיקת בנק"])
 
     with tab_daily:
         if st.button("⚡ הפק פקודות/מעקב להיום", use_container_width=True):
@@ -1089,7 +1293,7 @@ else:
                 if not df_orders.empty:
                     cols = [
                         "Ticker","Action Now","Order","Current","Entry","Distance to Entry %",
-                        "Stop","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
+                        "Stop","Current Protection Stop","Profit Checkpoint","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
                         "Regime","RS5","RS20","RSI","ATR%","20D Run"
                     ]
                     cols = [c for c in cols if c in df_orders.columns]
@@ -1101,7 +1305,7 @@ else:
                 if not df_radar.empty:
                     cols = [
                         "Ticker","Status","Decision","Score","Reason","Current","Entry","Distance to Entry %",
-                        "Stop","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run"
+                        "Stop","Current Protection Stop","Profit Checkpoint","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run"
                     ]
                     cols = [c for c in cols if c in df_radar.columns]
                     st.dataframe(df_radar[cols].head(80), use_container_width=True, hide_index=True, column_config=get_column_config())
@@ -1125,66 +1329,118 @@ else:
 
 
     with tab_portfolio:
-        st.markdown("## 💼 תיק השקעות וירטואלי")
+        st.markdown("## 💼 תיק השקעות — אמת + וירטואלי")
         st.caption(
-            "זה לא מחובר לברוקר. זה יומן מעקב שאתה שומר כ-CSV: מזין פוזיציות, מקבל שווי עדכני והחלטת HOLD/SELL. "
-            "אחרי קנייה/מכירה בפועל — מעדכן את הטבלה ושומר CSV חדש."
+            "זה יומן פעולות ידני. קנית/מכרת בפועל או וירטואלית — מזינים פעולה. "
+            "המערכת מחשבת החזקות, שווי נוכחי, רווח/הפסד, ו-HOLD/SELL לפי EMA21/Trailing Stop."
         )
 
-        uploaded_positions = st.file_uploader("העלה קובץ פוזיציות CSV קודם, אם יש", type=["csv"])
+        if "ledger" not in st.session_state:
+            st.session_state["ledger"] = empty_ledger()
 
-        if uploaded_positions is not None:
+        uploaded_ledger = st.file_uploader("העלה קובץ פעולות CSV קודם, אם יש", type=["csv"], key="ledger_upload")
+        if uploaded_ledger is not None:
             try:
-                portfolio_template = pd.read_csv(uploaded_positions)
+                st.session_state["ledger"] = normalize_ledger(pd.read_csv(uploaded_ledger))
+                st.success("הקובץ נטען.")
             except Exception:
                 st.error("לא הצלחתי לקרוא את הקובץ. ודא שזה CSV.")
-                portfolio_template = build_virtual_portfolio_template()
-        else:
-            portfolio_template = build_virtual_portfolio_template()
 
-        positions_portfolio = st.data_editor(
-            portfolio_template,
+        st.markdown("### הוספת פעולה")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+        with c1:
+            account = st.selectbox("תיק", ["אמת", "וירטואלי"], key="tx_account")
+        with c2:
+            action = st.selectbox("פעולה", ["BUY", "SELL"], key="tx_action")
+        with c3:
+            ticker = st.text_input("Ticker", value="", key="tx_ticker").upper().strip()
+        with c4:
+            qty = st.number_input("כמות", min_value=0.0, step=0.01, key="tx_qty")
+        with c5:
+            price = st.number_input("מחיר", min_value=0.0, step=0.01, key="tx_price")
+        with c6:
+            initial_stop = st.number_input("Initial Stop", min_value=0.0, step=0.01, key="tx_stop")
+
+        note = st.text_input("הערה", value="", key="tx_note")
+
+        if st.button("➕ הוסף פעולה ליומן", use_container_width=True):
+            if not ticker or qty <= 0 or price <= 0:
+                st.error("צריך Ticker, כמות ומחיר תקינים.")
+            else:
+                new_row = pd.DataFrame([{
+                    "Date": datetime.now().strftime("%Y-%m-%d"),
+                    "Account": account,
+                    "Action": action,
+                    "Ticker": ticker,
+                    "Quantity": qty,
+                    "Price": price,
+                    "Initial Stop": initial_stop,
+                    "Note": note,
+                }])
+                st.session_state["ledger"] = normalize_ledger(pd.concat([st.session_state["ledger"], new_row], ignore_index=True))
+                st.success("הפעולה נוספה. אל תשכח לשמור CSV.")
+
+        st.markdown("### יומן פעולות")
+        ledger_edit = st.data_editor(
+            st.session_state["ledger"],
             num_rows="dynamic",
             use_container_width=True,
             hide_index=True,
+            key="ledger_editor",
             column_config={
+                "Date": st.column_config.TextColumn("Date"),
+                "Account": st.column_config.SelectboxColumn("Account", options=["אמת", "וירטואלי"]),
+                "Action": st.column_config.SelectboxColumn("Action", options=["BUY", "SELL"]),
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=0.01),
-                "Avg Entry": st.column_config.NumberColumn("Avg Entry", min_value=0.0, step=0.01),
-                "Entry Date": st.column_config.TextColumn("Entry Date YYYY-MM-DD"),
+                "Price": st.column_config.NumberColumn("Price", min_value=0.0, step=0.01),
                 "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01),
+                "Note": st.column_config.TextColumn("Note"),
             }
         )
+        st.session_state["ledger"] = normalize_ledger(ledger_edit)
 
         st.download_button(
-            "⬇️ שמור קובץ פוזיציות לעריכה עתידית",
-            positions_portfolio.to_csv(index=False).encode("utf-8-sig"),
-            file_name="swinghunter_virtual_portfolio_positions.csv",
+            "⬇️ שמור יומן פעולות CSV",
+            st.session_state["ledger"].to_csv(index=False).encode("utf-8-sig"),
+            file_name="swinghunter_portfolio_ledger.csv",
             mime="text/csv",
             use_container_width=True
         )
 
-        if st.button("🔎 נתח תיק וירטואלי עכשיו", use_container_width=True):
-            df_portfolio = analyze_virtual_portfolio(positions_portfolio)
+        if st.button("🔎 נתח תיק השקעות עכשיו", use_container_width=True):
+            df_portfolio, df_errors = analyze_unified_portfolio(st.session_state["ledger"])
+
+            if not df_errors.empty:
+                st.error("יש שגיאות ביומן הפעולות:")
+                st.dataframe(df_errors, use_container_width=True, hide_index=True)
 
             if df_portfolio.empty:
-                st.warning("אין פוזיציות תקינות לניתוח.")
+                st.warning("אין החזקות פתוחות לניתוח.")
             else:
-                total_cost = df_portfolio["Cost"].sum()
-                total_value = df_portfolio["Market Value"].sum()
-                total_pnl = df_portfolio["PnL $"].sum()
-                total_pnl_pct = (total_value / total_cost - 1) * 100 if total_cost else 0
+                summary_real = summarize_portfolio(df_portfolio, include_virtual=False)
+                summary_all = summarize_portfolio(df_portfolio, include_virtual=True)
 
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("עלות", f"${total_cost:,.0f}")
-                k2.metric("שווי נוכחי", f"${total_value:,.0f}")
-                k3.metric("רווח/הפסד", f"${total_pnl:,.0f}", f"{total_pnl_pct:.2f}%")
-                k4.metric("פוזיציות", len(df_portfolio))
+                st.markdown("### סיכום תיק אמת בלבד")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("עלות", f"${summary_real['cost']:,.0f}")
+                r2.metric("שווי נוכחי", f"${summary_real['value']:,.0f}")
+                r3.metric("רווח/הפסד כולל", f"${summary_real['total_pnl']:,.0f}", f"{summary_real['pnl_pct']:.2f}%")
+                r4.metric("פוזיציות", summary_real["count"])
+
+                st.markdown("### סיכום כולל אמת + וירטואלי")
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("עלות", f"${summary_all['cost']:,.0f}")
+                a2.metric("שווי נוכחי", f"${summary_all['value']:,.0f}")
+                a3.metric("רווח/הפסד כולל", f"${summary_all['total_pnl']:,.0f}", f"{summary_all['pnl_pct']:.2f}%")
+                a4.metric("פוזיציות", summary_all["count"])
 
                 cols = [
-                    "Ticker", "Action", "Reason", "Quantity", "Avg Entry", "Current",
-                    "Market Value", "PnL $", "PnL %", "Trailing Stop", "Distance to Trail %",
-                    "EMA21", "Exit Close Level", "Initial Stop", "Entry Date", "Last Date"
+                    "Account", "Ticker", "Action", "Reason", "Quantity", "Avg Entry", "Current",
+                    "Market Value", "Open PnL $", "Open PnL %", "Realized PnL",
+                    "Trailing Stop", "Current Protection Stop", "Profit Checkpoint", "Distance to Trail %", "EMA21", "Exit Close Level",
+                    "Initial Stop", "Entry Date", "Last Date"
                 ]
                 cols = [c for c in cols if c in df_portfolio.columns]
                 st.dataframe(df_portfolio[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
@@ -1192,16 +1448,15 @@ else:
                 st.download_button(
                     "⬇️ הורד ניתוח תיק CSV",
                     df_portfolio.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"swinghunter_{APP_VERSION}_virtual_portfolio_analysis.csv",
+                    file_name=f"swinghunter_{APP_VERSION}_portfolio_analysis.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
 
-        st.markdown("#### איך מעדכנים פעולה?")
+        st.markdown("#### איך מבצעים מכירה?")
         st.write(
-            "קנית? הוסף שורה עם הטיקר, כמות, שער כניסה ותאריך. "
-            "מכרת חלק? עדכן את Quantity לכמות שנשארה. מכרת הכול? מחק את השורה או שנה Quantity ל-0. "
-            "אחרי כל שינוי שמור CSV חדש כדי להמשיך ממנו בפעם הבאה."
+            "מוסיף פעולה חדשה מסוג SELL עם אותה מניה וכמות למכירה. הכמות חייבת להיות קטנה או שווה לכמות הפתוחה. "
+            "אם מכרת הכול — הכמות תתאפס ולא תופיע בהחזקות. אם מכרת חלק — הכמות שנותרה תמשיך להיות מנוהלת."
         )
 
     with tab_positions:
@@ -1245,7 +1500,7 @@ else:
                 df_pos = pd.DataFrame(rows)
                 cols = [
                     "Ticker", "Action", "Status", "Reason", "Current", "Entry", "PnL %",
-                    "Trailing Stop", "Distance to Trail %", "EMA21", "Exit Close Level",
+                    "Trailing Stop", "Current Protection Stop", "Profit Checkpoint", "Distance to Trail %", "EMA21", "Exit Close Level",
                     "Initial Stop", "Last Date"
                 ]
                 cols = [c for c in cols if c in df_pos.columns]
