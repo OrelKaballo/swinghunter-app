@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V10.2 - Trend Bank Engine", layout="wide")
-APP_VERSION = "V10.2"
+st.set_page_config(page_title="SwingHunter V10.5 - Hebrew Tooltips Dashboard", layout="wide")
+APP_VERSION = "V10.5"
 
 # ==========================================================
 # 1. Security
@@ -229,6 +229,8 @@ def evaluate_ticker(
         "Order": "",
         "Action Now": "",
         "Regime": "",
+        "EMA21": np.nan,
+        "Exit Close Level": np.nan,
         "RS5": np.nan,
         "RS20": np.nan,
         "RSI": np.nan,
@@ -259,6 +261,8 @@ def evaluate_ticker(
         base.update({
             "Current": round(last_p, 2),
             "Regime": regime,
+            "EMA21": round(ema21, 2),
+            "Exit Close Level": round(ema21 * 0.995, 2),
             "RS5": round(rs5, 1),
             "RS20": round(rs20, 1),
             "RSI": round(rsi, 1),
@@ -813,6 +817,172 @@ def get_today_actions(params: StrategyParams):
     return df_orders, df_radar
 
 
+
+# ==========================================================
+# 8. Exit / Position Management Dashboard
+# ==========================================================
+def analyze_open_position(ticker: str, entry_price: float, entry_date, initial_stop: float = np.nan):
+    """
+    Reconstructs the current exit status for a real open position.
+    Required:
+    - ticker
+    - entry price
+    - entry date
+    Optional:
+    - initial stop. If missing, uses entry * (1 - max_risk_pct) is NOT available here,
+      so caller should pass one when possible.
+    """
+    df = download_single(ticker, "370d")
+    if df.empty or len(df) < 30:
+        return {
+            "Ticker": ticker,
+            "Status": "ERROR",
+            "Action": "NO DATA",
+            "Reason": "אין מספיק נתונים",
+        }
+
+    try:
+        entry_date = pd.to_datetime(entry_date)
+    except Exception:
+        entry_date = df.index[-30]
+
+    c = df["Close"].dropna()
+    h = df["High"].dropna()
+    l = df["Low"].dropna()
+
+    if c.empty:
+        return {
+            "Ticker": ticker,
+            "Status": "ERROR",
+            "Action": "NO DATA",
+            "Reason": "אין נתוני Close",
+        }
+
+    last_close = float(c.iloc[-1])
+    last_low = float(l.iloc[-1])
+    last_date = c.index[-1].strftime("%Y-%m-%d")
+
+    # EMA21 trail is reconstructed only from dates after entry.
+    hist_from_entry = c[c.index >= entry_date]
+    if len(hist_from_entry) < 2:
+        hist_from_entry = c.iloc[-25:]
+
+    ema21_series = c.ewm(span=21, adjust=False).mean()
+    ema21_now = float(ema21_series.iloc[-1])
+
+    # Initial stop fallback if user did not enter one.
+    if not np.isfinite(initial_stop) or initial_stop <= 0:
+        initial_stop = entry_price * 0.905  # fallback = 9.5% risk
+
+    # Reconstruct trailing stop from entry date onward:
+    # trail never moves down, it is max(initial_stop, EMA21*0.995 since entry).
+    ema_after_entry = ema21_series[ema21_series.index >= entry_date]
+    if len(ema_after_entry) == 0:
+        ema_after_entry = ema21_series.iloc[-25:]
+
+    trail_series = (ema_after_entry * 0.995).cummax()
+    trail_stop = max(float(initial_stop), float(trail_series.iloc[-1]))
+
+    pnl_pct = (last_close / entry_price - 1) * 100
+
+    # Two exit signals:
+    # 1. Hard/trailing stop touched intraday.
+    # 2. Daily close below EMA21*0.995.
+    close_exit_level = ema21_now * 0.995
+
+    if last_low <= trail_stop:
+        action = "SELL / STOP HIT"
+        status = "EXIT"
+        reason = "המחיר היומי נגע בסטופ/Trailing Stop"
+    elif last_close < close_exit_level:
+        action = "SELL AT CLOSE / NEXT OPEN"
+        status = "EXIT"
+        reason = "הסגירה מתחת EMA21"
+    else:
+        action = "HOLD"
+        status = "HOLD"
+        reason = "המגמה עדיין לא נשברה"
+
+    distance_to_exit = (last_close / trail_stop - 1) * 100 if trail_stop > 0 else np.nan
+
+    return {
+        "Ticker": ticker,
+        "Status": status,
+        "Action": action,
+        "Reason": reason,
+        "Last Date": last_date,
+        "Entry": round(entry_price, 2),
+        "Current": round(last_close, 2),
+        "PnL %": round(pnl_pct, 2),
+        "Initial Stop": round(initial_stop, 2),
+        "EMA21": round(ema21_now, 2),
+        "Exit Close Level": round(close_exit_level, 2),
+        "Trailing Stop": round(trail_stop, 2),
+        "Distance to Trail %": round(distance_to_exit, 2),
+    }
+
+
+def build_positions_template():
+    return pd.DataFrame([
+        {"Ticker": "AMD", "Entry": 0.0, "Entry Date": "2026-05-01", "Initial Stop": 0.0},
+    ])
+
+
+def build_virtual_portfolio_template():
+    return pd.DataFrame([
+        {
+            "Ticker": "AMD",
+            "Quantity": 0.0,
+            "Avg Entry": 0.0,
+            "Entry Date": "2026-05-01",
+            "Initial Stop": 0.0,
+        }
+    ])
+
+
+def analyze_virtual_portfolio(df_positions: pd.DataFrame):
+    rows = []
+
+    for _, row in df_positions.iterrows():
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        qty = safe_float(row.get("Quantity", np.nan))
+        avg_entry = safe_float(row.get("Avg Entry", np.nan))
+        entry_date = row.get("Entry Date", "")
+        initial_stop = safe_float(row.get("Initial Stop", np.nan))
+
+        if not ticker or not np.isfinite(qty) or qty <= 0 or not np.isfinite(avg_entry) or avg_entry <= 0:
+            continue
+
+        status = analyze_open_position(ticker, avg_entry, entry_date, initial_stop)
+
+        current = safe_float(status.get("Current", np.nan))
+        cost = qty * avg_entry
+        market_value = qty * current if np.isfinite(current) else np.nan
+        pnl_dollar = market_value - cost if np.isfinite(market_value) else np.nan
+        pnl_pct = (current / avg_entry - 1) * 100 if np.isfinite(current) and avg_entry else np.nan
+
+        rows.append({
+            "Ticker": ticker,
+            "Quantity": qty,
+            "Avg Entry": round(avg_entry, 2),
+            "Current": round(current, 2) if np.isfinite(current) else np.nan,
+            "Cost": round(cost, 2),
+            "Market Value": round(market_value, 2) if np.isfinite(market_value) else np.nan,
+            "PnL $": round(pnl_dollar, 2) if np.isfinite(pnl_dollar) else np.nan,
+            "PnL %": round(pnl_pct, 2) if np.isfinite(pnl_pct) else np.nan,
+            "Action": status.get("Action", ""),
+            "Reason": status.get("Reason", ""),
+            "Trailing Stop": status.get("Trailing Stop", np.nan),
+            "Distance to Trail %": status.get("Distance to Trail %", np.nan),
+            "EMA21": status.get("EMA21", np.nan),
+            "Exit Close Level": status.get("Exit Close Level", np.nan),
+            "Initial Stop": status.get("Initial Stop", initial_stop),
+            "Entry Date": entry_date,
+            "Last Date": status.get("Last Date", ""),
+        })
+
+    return pd.DataFrame(rows)
+
 # ==========================================================
 # 8. Export
 # ==========================================================
@@ -834,6 +1004,48 @@ def build_zip_report(df_equity, df_trades, ticker_summary, metrics, daily_orders
     return output.getvalue()
 
 
+
+def get_column_config():
+    return {
+        "Ticker": st.column_config.TextColumn("Ticker", help="סימול המניה בבורסה, למשל AMD או TSLA."),
+        "Action Now": st.column_config.TextColumn("מה לעשות עכשיו", help="הוראת פעולה יומית: PLACE LIMIT, PLACE STOP LIMIT, WAIT או SELL/HOLD."),
+        "Order": st.column_config.TextColumn("סוג פקודה", help="BUY LIMIT = קנייה בירידה למחיר מסוים. BUY STOP LIMIT = קנייה רק אם המחיר פורץ למעלה לרמת הכניסה."),
+        "Current": st.column_config.NumberColumn("מחיר נוכחי", help="המחיר האחרון שהמערכת משכה מ-Yahoo Finance.", format="%.2f"),
+        "Entry": st.column_config.NumberColumn("שער כניסה", help="השער שבו המודל רוצה להיכנס. לא בהכרח השער הנוכחי.", format="%.2f"),
+        "Distance to Entry %": st.column_config.NumberColumn("מרחק לכניסה %", help="כמה אחוזים המחיר צריך לעלות/לרדת כדי להגיע לשער הכניסה.", format="%.2f%%"),
+        "Stop": st.column_config.NumberColumn("סטופ", help="שער הגנה התחלתי. אם המחיר מגיע אליו, המודל יוצא מהעסקה.", format="%.2f"),
+        "Trailing Stop": st.column_config.NumberColumn("Trailing Stop", help="סטופ עוקב שעולה עם המגמה ולא יורד. מיועד לשמור על רווחים כשהמניה עולה.", format="%.2f"),
+        "Exit Close Level": st.column_config.NumberColumn("רמת יציאה בסגירה", help="אם המניה סוגרת יום מתחת לרמה הזו, המודל מסמן יציאה. מחושב כ-EMA21 × 0.995.", format="%.2f"),
+        "EMA21": st.column_config.NumberColumn("EMA21", help="ממוצע נע אקספוננציאלי של 21 ימי מסחר. משמש למדידת המגמה ולכללי יציאה.", format="%.2f"),
+        "Exit Rule": st.column_config.TextColumn("כלל יציאה", help="בגרסת Trend אין יעד רווח קשיח. יוצאים כשהמניה שוברת EMA21/Trailing Stop."),
+        "Risk %": st.column_config.NumberColumn("סיכון %", help="המרחק באחוזים בין שער הכניסה לסטופ ההתחלתי.", format="%.2f%%"),
+        "Target": st.column_config.TextColumn("יעד", help="בגרסת Trend אין יעד רווח קשיח; הרווח רץ כל עוד המגמה חיה."),
+        "Target %": st.column_config.TextColumn("יעד %", help="בגרסת Trend לא משתמשים ביעד אחוזי קבוע."),
+        "R/R": st.column_config.TextColumn("R/R", help="Risk/Reward. בגרסת Trend אין יעד קשיח ולכן זה מסומן כ-Trend."),
+        "Setup": st.column_config.TextColumn("תבנית", help="סוג האיתות: פריצה, פולבק איכותי, או המשך מומנטום חריג."),
+        "Score": st.column_config.NumberColumn("ניקוד", help="ציון איכות של האיתות לפי חוזק יחסי, מומנטום, סיכון, תבנית ומצב שוק.", format="%.2f"),
+        "Regime": st.column_config.TextColumn("מצב שוק", help="מצב QQQ: BULL_STRONG, BULL_WEAK, PULLBACK או BEAR."),
+        "RS5": st.column_config.NumberColumn("RS5", help="חוזק יחסי של המניה מול QQQ ב-5 ימי מסחר. חיובי = המניה חזקה מ-QQQ.", format="%.1f"),
+        "RS20": st.column_config.NumberColumn("RS20", help="חוזק יחסי של המניה מול QQQ ב-20 ימי מסחר. חיובי = המניה מובילה את QQQ.", format="%.1f"),
+        "RSI": st.column_config.NumberColumn("RSI", help="מדד מומנטום 0–100. גבוה מאוד יכול להעיד שהמניה מתוחה.", format="%.1f"),
+        "ATR%": st.column_config.NumberColumn("ATR%", help="תנודתיות יומית ממוצעת כאחוז מהמחיר. עוזר להבין אם המניה זזה מספיק לסווינג.", format="%.1f%%"),
+        "20D Run": st.column_config.NumberColumn("ריצה 20 יום", help="כמה המניה עלתה/ירדה ב-20 ימי המסחר האחרונים.", format="%.1f%%"),
+        "Status": st.column_config.TextColumn("סטטוס", help="SIGNAL = איתות ביצוע. WATCH = במעקב. REJECT = לא רלוונטית כרגע."),
+        "Decision": st.column_config.TextColumn("החלטה", help="ACTION / WAIT / NO TRADE לפי תנאי המודל."),
+        "Reason": st.column_config.TextColumn("סיבה", help="הסיבה המרכזית למה המניה לא נכנסה או למה צריך למכור/להחזיק."),
+        "Quantity": st.column_config.NumberColumn("כמות", help="כמות המניות שאתה מחזיק בפועל בתיק הווירטואלי.", format="%.4f"),
+        "Avg Entry": st.column_config.NumberColumn("שער כניסה ממוצע", help="שער הקנייה הממוצע שלך בפוזיציה.", format="%.2f"),
+        "Market Value": st.column_config.NumberColumn("שווי נוכחי", help="כמות × מחיר נוכחי.", format="$%.2f"),
+        "Cost": st.column_config.NumberColumn("עלות", help="כמות × שער כניסה ממוצע.", format="$%.2f"),
+        "PnL $": st.column_config.NumberColumn("רווח/הפסד $", help="שווי נוכחי פחות עלות.", format="$%.2f"),
+        "PnL %": st.column_config.NumberColumn("רווח/הפסד %", help="אחוז הרווח/הפסד מהכניסה.", format="%.2f%%"),
+        "Distance to Trail %": st.column_config.NumberColumn("מרחק מהסטופ %", help="כמה אחוזים המחיר הנוכחי מעל ה-Trailing Stop. נמוך = קרוב ליציאה.", format="%.2f%%"),
+        "Initial Stop": st.column_config.NumberColumn("סטופ התחלתי", help="הסטופ המקורי מהיום שנכנסת לעסקה.", format="%.2f"),
+        "Last Date": st.column_config.TextColumn("תאריך נתון אחרון", help="תאריך יום המסחר האחרון שהנתונים מתייחסים אליו."),
+        "Action": st.column_config.TextColumn("פעולה", help="HOLD = להחזיק. SELL = יציאה לפי המודל."),
+    }
+
+
 # ==========================================================
 # 9. UI
 # ==========================================================
@@ -851,10 +1063,10 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.2 — Trend Bank Engine</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V10.5 — Hebrew Tooltips Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V10.2 משנה את חוקי המשחק: 10% מהבנק לכל עסקה, בלי יעד רווח קשיח, "
-        "ויציאה מלאה רק כשהמגמה נשברת לפי EMA21/Trailing Stop. זה בודק אם יש Trend Following אמיתי מול QQQ."
+        "V10.5 מוסיפה הסברים בעברית ב-hover על העמודות, ומציגה EMA21 ורמת יציאה גם במסכי הפקודות/הרדאר. "
+        "בתיק הווירטואלי מקבלים שווי עדכני והחלטת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
     st.sidebar.header("הגדרות קצרות")
@@ -865,7 +1077,7 @@ else:
 
     params = StrategyParams(max_risk_pct=max_risk_pct, position_pct=position_pct)
 
-    tab_daily, tab_backtest = st.tabs(["🚀 מה עושים היום", "🔬 בדיקת בנק"])
+    tab_daily, tab_portfolio, tab_positions, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק וירטואלי", "📌 ניהול פוזיציות", "🔬 בדיקת בנק"])
 
     with tab_daily:
         if st.button("⚡ הפק פקודות/מעקב להיום", use_container_width=True):
@@ -877,11 +1089,11 @@ else:
                 if not df_orders.empty:
                     cols = [
                         "Ticker","Action Now","Order","Current","Entry","Distance to Entry %",
-                        "Stop","Exit Rule","Risk %","Setup","Score",
+                        "Stop","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
                         "Regime","RS5","RS20","RSI","ATR%","20D Run"
                     ]
                     cols = [c for c in cols if c in df_orders.columns]
-                    st.dataframe(df_orders[cols], use_container_width=True, hide_index=True)
+                    st.dataframe(df_orders[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                 else:
                     st.warning("אין היום פקודות ביצוע. זה לא אומר שאין מידע — ראה רדאר למטה.")
 
@@ -892,7 +1104,7 @@ else:
                         "Stop","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run"
                     ]
                     cols = [c for c in cols if c in df_radar.columns]
-                    st.dataframe(df_radar[cols].head(80), use_container_width=True, hide_index=True)
+                    st.dataframe(df_radar[cols].head(80), use_container_width=True, hide_index=True, column_config=get_column_config())
 
                 zip_bytes = build_zip_report(
                     pd.DataFrame(),
@@ -909,6 +1121,151 @@ else:
                     mime="application/zip",
                     use_container_width=True
                 )
+
+
+
+    with tab_portfolio:
+        st.markdown("## 💼 תיק השקעות וירטואלי")
+        st.caption(
+            "זה לא מחובר לברוקר. זה יומן מעקב שאתה שומר כ-CSV: מזין פוזיציות, מקבל שווי עדכני והחלטת HOLD/SELL. "
+            "אחרי קנייה/מכירה בפועל — מעדכן את הטבלה ושומר CSV חדש."
+        )
+
+        uploaded_positions = st.file_uploader("העלה קובץ פוזיציות CSV קודם, אם יש", type=["csv"])
+
+        if uploaded_positions is not None:
+            try:
+                portfolio_template = pd.read_csv(uploaded_positions)
+            except Exception:
+                st.error("לא הצלחתי לקרוא את הקובץ. ודא שזה CSV.")
+                portfolio_template = build_virtual_portfolio_template()
+        else:
+            portfolio_template = build_virtual_portfolio_template()
+
+        positions_portfolio = st.data_editor(
+            portfolio_template,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=0.01),
+                "Avg Entry": st.column_config.NumberColumn("Avg Entry", min_value=0.0, step=0.01),
+                "Entry Date": st.column_config.TextColumn("Entry Date YYYY-MM-DD"),
+                "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01),
+            }
+        )
+
+        st.download_button(
+            "⬇️ שמור קובץ פוזיציות לעריכה עתידית",
+            positions_portfolio.to_csv(index=False).encode("utf-8-sig"),
+            file_name="swinghunter_virtual_portfolio_positions.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+        if st.button("🔎 נתח תיק וירטואלי עכשיו", use_container_width=True):
+            df_portfolio = analyze_virtual_portfolio(positions_portfolio)
+
+            if df_portfolio.empty:
+                st.warning("אין פוזיציות תקינות לניתוח.")
+            else:
+                total_cost = df_portfolio["Cost"].sum()
+                total_value = df_portfolio["Market Value"].sum()
+                total_pnl = df_portfolio["PnL $"].sum()
+                total_pnl_pct = (total_value / total_cost - 1) * 100 if total_cost else 0
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("עלות", f"${total_cost:,.0f}")
+                k2.metric("שווי נוכחי", f"${total_value:,.0f}")
+                k3.metric("רווח/הפסד", f"${total_pnl:,.0f}", f"{total_pnl_pct:.2f}%")
+                k4.metric("פוזיציות", len(df_portfolio))
+
+                cols = [
+                    "Ticker", "Action", "Reason", "Quantity", "Avg Entry", "Current",
+                    "Market Value", "PnL $", "PnL %", "Trailing Stop", "Distance to Trail %",
+                    "EMA21", "Exit Close Level", "Initial Stop", "Entry Date", "Last Date"
+                ]
+                cols = [c for c in cols if c in df_portfolio.columns]
+                st.dataframe(df_portfolio[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+
+                st.download_button(
+                    "⬇️ הורד ניתוח תיק CSV",
+                    df_portfolio.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"swinghunter_{APP_VERSION}_virtual_portfolio_analysis.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+        st.markdown("#### איך מעדכנים פעולה?")
+        st.write(
+            "קנית? הוסף שורה עם הטיקר, כמות, שער כניסה ותאריך. "
+            "מכרת חלק? עדכן את Quantity לכמות שנשארה. מכרת הכול? מחק את השורה או שנה Quantity ל-0. "
+            "אחרי כל שינוי שמור CSV חדש כדי להמשיך ממנו בפעם הבאה."
+        )
+
+    with tab_positions:
+        st.markdown("## 📌 ניהול פוזיציות פתוחות")
+        st.caption(
+            "כאן מזינים את המניות שכבר קנית בפועל. המערכת מחשבת האם להחזיק או למכור לפי אותה לוגיקת יציאה של V10.2: "
+            "Trailing Stop שעולה עם EMA21, ויציאה מלאה כשהמגמה נשברת."
+        )
+
+        st.markdown("#### הזן פוזיציות פתוחות")
+        st.caption("עמודות חובה: Ticker, Entry, Entry Date. מומלץ להזין גם Initial Stop מהפקודה המקורית.")
+
+        template = build_positions_template()
+        positions_input = st.data_editor(
+            template,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Entry": st.column_config.NumberColumn("Entry", min_value=0.0, step=0.01),
+                "Entry Date": st.column_config.TextColumn("Entry Date YYYY-MM-DD"),
+                "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01),
+            }
+        )
+
+        if st.button("🔎 בדוק מה לעשות עם הפוזיציות", use_container_width=True):
+            rows = []
+            for _, row in positions_input.iterrows():
+                ticker = str(row.get("Ticker", "")).strip().upper()
+                entry = safe_float(row.get("Entry", np.nan))
+                entry_date = row.get("Entry Date", "")
+                initial_stop = safe_float(row.get("Initial Stop", np.nan))
+
+                if not ticker or not np.isfinite(entry) or entry <= 0:
+                    continue
+
+                rows.append(analyze_open_position(ticker, entry, entry_date, initial_stop))
+
+            if rows:
+                df_pos = pd.DataFrame(rows)
+                cols = [
+                    "Ticker", "Action", "Status", "Reason", "Current", "Entry", "PnL %",
+                    "Trailing Stop", "Distance to Trail %", "EMA21", "Exit Close Level",
+                    "Initial Stop", "Last Date"
+                ]
+                cols = [c for c in cols if c in df_pos.columns]
+                st.dataframe(df_pos[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+
+                st.download_button(
+                    "⬇️ הורד CSV פוזיציות",
+                    df_pos.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"swinghunter_{APP_VERSION}_open_positions.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.warning("לא הוזנו פוזיציות תקינות.")
+
+        st.markdown("#### כלל היציאה בפועל")
+        st.write(
+            "במודל V10.2/V10.3 אין יעד רווח קשיח. בפועל בודקים את הפוזיציה בסוף יום מסחר: "
+            "אם הסגירה מתחת EMA21×0.995 — מוכרים. בנוסף, אם המחיר נוגע ב-Trailing Stop — זו יציאה."
+        )
 
     with tab_backtest:
         st.markdown(f"### 🧪 Banked Backtest — {months} חודשים — בנק ${starting_bank:,.0f} — 10% מהבנק לכל כניסה")
@@ -956,8 +1313,8 @@ else:
 
                 if not df_trades.empty:
                     with st.expander("📌 כל העסקאות"):
-                        st.dataframe(df_trades, use_container_width=True, hide_index=True)
+                        st.dataframe(df_trades, use_container_width=True, hide_index=True, column_config=get_column_config())
 
                 if not ticker_summary.empty:
                     with st.expander("🏷️ PnL לפי טיקר"):
-                        st.dataframe(ticker_summary, use_container_width=True, hide_index=True)
+                        st.dataframe(ticker_summary, use_container_width=True, hide_index=True, column_config=get_column_config())
