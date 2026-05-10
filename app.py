@@ -12,8 +12,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.2 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.2"
+st.set_page_config(page_title="SwingHunter V11.3 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.3"
 
 # ==========================================================
 # 1. Security
@@ -102,7 +102,7 @@ def safe_float(x, default=np.nan):
         return default
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def download_single(ticker: str, period: str = "370d") -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=False)
@@ -111,7 +111,7 @@ def download_single(ticker: str, period: str = "370d") -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_backtest_data(months: int):
     end = datetime.now()
     start = end - timedelta(days=months * 31 + 340)
@@ -243,6 +243,9 @@ def evaluate_ticker(
         "ATR%": np.nan,
         "20D Run": np.nan,
         "Run Zone": "",
+        "Action State": "",
+        "Pullback Watch Price": np.nan,
+        "Pullback Deep Price": np.nan,
         "Reason": ""
     }
 
@@ -284,7 +287,9 @@ def evaluate_ticker(
             "RSI": round(rsi, 1),
             "ATR%": round(atr_pct, 1) if np.isfinite(atr_pct) else np.nan,
             "20D Run": round(run20, 1),
-            "Run Zone": run_zone
+            "Run Zone": run_zone,
+            "Pullback Watch Price": round(ema8 * 1.003, 2),
+            "Pullback Deep Price": round(ema21 * 1.005, 2)
         })
 
         edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
@@ -302,7 +307,7 @@ def evaluate_ticker(
 
         # Hard rejects, but still with full radar info.
         if last_p < sma200:
-            base.update(Status="REJECT", Decision="NO TRADE", Reason="מתחת SMA200")
+            base.update(Status="REJECT", Decision="NO TRADE", **{"Action State": "NO TRADE"}, Reason="מתחת SMA200")
             return base
 
         if not np.isfinite(atr_pct) or atr_pct < params.min_atr_pct:
@@ -311,7 +316,7 @@ def evaluate_ticker(
 
         # Regime filter: normal trades only in BULL_STRONG. Exceptional leaders can pass in weaker regimes.
         if regime != "BULL_STRONG" and not exceptional:
-            base.update(Status="WATCH", Decision="WAIT", Reason=f"שוק לא מספיק חזק ({regime})")
+            base.update(Status="WATCH", Decision="WAIT", **{"Action State": "WAIT"}, Reason=f"שוק לא מספיק חזק ({regime})")
             return base
 
         if rsi > params.overbought_rsi and not exceptional:
@@ -321,11 +326,16 @@ def evaluate_ticker(
         # V11.1 overextension gate:
         # A stock that already ran hard can stay on the radar, but auto-entry is restricted.
         if run20 > params.max_20d_run:
-            base.update(Status="WATCH", Decision="WAIT", Reason=f"ריצה חזקה מדי ב-20 יום ({run20:.1f}%) — לא רודפים אחרי הנר")
+            base.update(
+                Status="WATCH",
+                Decision="WAIT",
+                **{"Action State": "WAIT FOR PULLBACK"},
+                Reason=f"ריצה חזקה מדי ב-20 יום ({run20:.1f}%) — לא קונים עכשיו; ממתינים לפולבק לאזור EMA8/EMA21"
+            )
             return base
 
         if not edge_ok and not exceptional:
-            base.update(Status="WATCH", Decision="WAIT", Reason="RS חלש מול QQQ")
+            base.update(Status="WATCH", Decision="WAIT", **{"Action State": "WAIT"}, Reason="RS חלש מול QQQ")
             return base
 
         order_type = None
@@ -378,11 +388,14 @@ def evaluate_ticker(
 
         if order_type is None:
             reason = "אין נקודת כניסה נקייה כרגע"
+            action_state = "WAIT"
             if run20 > 30:
                 reason = "רצה מעל 30% ב-20 יום — ממתינים לפולבק איכותי, לא קונים פריצה"
+                action_state = "WAIT FOR PULLBACK"
             base.update(
                 Status="WATCH",
                 Decision="WAIT",
+                **{"Action State": action_state},
                 Score=round(score_candidate(rs5, rs20, run20, 1.0, params.max_risk_pct, "WATCH", exceptional, momentum_name), 2),
                 Reason=reason
             )
@@ -444,6 +457,7 @@ def evaluate_ticker(
         base.update({
             "Status": "SIGNAL",
             "Decision": "ACTION",
+            "Action State": "PLACE ORDER",
             "Score": round(score, 2),
             "Setup": setup,
             "Entry": round(entry, 2),
@@ -1070,6 +1084,9 @@ def get_column_config():
         "ATR%": st.column_config.NumberColumn("ATR%", help="תנודתיות יומית ממוצעת כאחוז מהמחיר. עוזר להבין אם המניה זזה מספיק לסווינג.", format="%.1f%%"),
         "20D Run": st.column_config.NumberColumn("ריצה 20 יום", help="כמה המניה עלתה/ירדה ב-20 ימי המסחר האחרונים.", format="%.1f%%"),
         "Run Zone": st.column_config.TextColumn("אזור ריצה", help="NORMAL עד 15%, HOT עד 30%, EXTENDED עד 45%, TOO_EXTENDED מעל 45%. מעל 30% לא קונים פריצה אלא מחכים לפולבק."),
+        "Action State": st.column_config.TextColumn("מצב פעולה", help="PLACE ORDER / WAIT FOR PULLBACK / WAIT / NO TRADE. מסכם מה לעשות עם המניה עכשיו."),
+        "Pullback Watch Price": st.column_config.NumberColumn("מחיר מעקב לפולבק", help="אזור כניסה מעניין אם מניה חזקה מדי תתקן לכיוון EMA8. לא פקודת קנייה אוטומטית.", format="%.2f"),
+        "Pullback Deep Price": st.column_config.NumberColumn("מחיר פולבק עמוק", help="אזור כניסה עמוק יותר סביב EMA21. מתאים למניות שרצו חזק מדי וצריך לחכות להן.", format="%.2f"),
         "Status": st.column_config.TextColumn("סטטוס", help="SIGNAL = איתות ביצוע. WATCH = במעקב. REJECT = לא רלוונטית כרגע."),
         "Decision": st.column_config.TextColumn("החלטה", help="ACTION / WAIT / NO TRADE לפי תנאי המודל."),
         "Reason": st.column_config.TextColumn("סיבה", help="הסיבה המרכזית למה המניה לא נכנסה או למה צריך למכור/להחזיק."),
@@ -1316,13 +1333,16 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.2 — Expanded Watchlist + Overextension Filter</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.3 — Intraday Refresh + Pullback Watch</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.2 כוללת Watchlist מורחב של QQQ/Nasdaq-100, מסנן Overextension, תיק השקעות מאוחד, ועמודות שער הגנה/יעד רווח לבדיקה. "
+        "V11.3 כוללת רענון נתונים מהיר, כפתור רענון ידני, ו-Pullback Watch Price למניות חזקות מדי במקום WAIT כללי. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
     st.sidebar.header("הגדרות קצרות")
+    if st.sidebar.button("🔄 רענן נתונים עכשיו"):
+        st.cache_data.clear()
+        st.rerun()
     months = st.sidebar.slider("תקופת בדיקה היסטורית (חודשים)", 3, 24, 12)
     starting_bank = st.sidebar.number_input("בנק התחלתי ($)", value=50000, step=5000)
     max_risk_pct = st.sidebar.slider("סיכון מקסימלי לעסקה (%)", 4.0, 15.0, 9.5, 0.5)
@@ -1341,7 +1361,7 @@ else:
 
                 if not df_orders.empty:
                     cols = [
-                        "Ticker","Action Now","Order","Current","Entry","Distance to Entry %",
+                        "Ticker","Action State","Action Now","Order","Current","Entry","Distance to Entry %",
                         "Stop","Current Protection Stop","Profit Checkpoint","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
                         "Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
                     ]
@@ -1354,8 +1374,8 @@ else:
                 st.markdown("## 🔍 רדאר מלא — למה מניות לא נכנסו")
                 if not df_radar.empty:
                     cols = [
-                        "Ticker","Status","Decision","Score","Reason","Current","Entry","Distance to Entry %",
-                        "Stop","Current Protection Stop","Profit Checkpoint","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
+                        "Ticker","Status","Decision","Action State","Score","Reason","Current","Entry","Distance to Entry %",
+                        "Stop","Current Protection Stop","Profit Checkpoint","Pullback Watch Price","Pullback Deep Price","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
                     ]
                     df_radar = dedupe_dataframe_columns(df_radar)
                     cols = unique_existing_columns(cols, df_radar)
