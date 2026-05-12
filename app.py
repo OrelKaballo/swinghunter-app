@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import BytesIO
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.4 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.4"
+st.set_page_config(page_title="SwingHunter V11.5 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.5"
 
 # ==========================================================
 # 1. Security
@@ -54,6 +55,7 @@ MOMENTUM_TICKERS = {
 
 NOTIONAL_PER_TRADE = 1000.0
 DEFAULT_STARTING_BANK = 50000.0
+LEDGER_DIR = Path(os.getenv("SWINGHUNTER_LEDGER_DIR", ".swinghunter_ledgers"))
 DEFAULT_POSITION_PCT = 0.10
 
 
@@ -1315,6 +1317,43 @@ def dedupe_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
 
 
+
+def safe_profile_name(profile: str) -> str:
+    profile = str(profile).strip().lower()
+    allowed = "".join(ch for ch in profile if ch.isalnum() or ch in ["_", "-"])
+    return allowed or "user1"
+
+
+def ledger_file_path(profile: str) -> Path:
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    return LEDGER_DIR / f"{safe_profile_name(profile)}_ledger.csv"
+
+
+def load_profile_ledger(profile: str) -> pd.DataFrame:
+    path = ledger_file_path(profile)
+    if path.exists():
+        try:
+            return normalize_ledger(pd.read_csv(path))
+        except Exception:
+            return empty_ledger()
+    return empty_ledger()
+
+
+def save_profile_ledger(profile: str, ledger: pd.DataFrame):
+    path = ledger_file_path(profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalize_ledger(ledger).to_csv(path, index=False, encoding="utf-8-sig")
+    return path
+
+
+def reset_profile_ledger(profile: str):
+    path = ledger_file_path(profile)
+    if path.exists():
+        path.unlink()
+    return empty_ledger()
+
+
+
 # ==========================================================
 # 9. UI
 # ==========================================================
@@ -1332,9 +1371,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.4 — Hard Refresh + Live Quotes Fix</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.5 — Persistent Portfolio Profiles</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.4 מתקנת את הרענון: מסכי היום והתיק מושכים נתונים מחדש בכל הרצה, וכפתור הרענון מנקה cache ומציג זמן רענון אחרון. "
+        "V11.5 מוסיפה שמירה קבועה של תיק ההשקעות לפי פרופילים user1/user2/user3, כולל שמירה אוטומטית וכפתור איפוס. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1416,20 +1455,47 @@ else:
         )
 
         st.info(
-            "הבהרה: ביטלנו את הטאב הישן 'ניהול פוזיציות'. מעכשיו הכל נעשה כאן: "
-            "BUY מוסיף/מגדיל פוזיציה, SELL מקטין/סוגר פוזיציה, והתיק מחושב אוטומטית לפי יומן הפעולות."
+            "חדש ב-V11.5: התיק נשמר אוטומטית לפי פרופיל. אפשר לעבוד עם user1 / user2 / user3, "
+            "ולא צריך להעלות CSV בכל פתיחה. כפתור איפוס מוחק רק את הפרופיל הפעיל."
         )
 
-        if "ledger" not in st.session_state:
-            st.session_state["ledger"] = empty_ledger()
+        profile = st.selectbox("בחר תיק / משתמש", ["user1", "user2", "user3"], key="ledger_profile")
 
-        uploaded_ledger = st.file_uploader("העלה קובץ פעולות CSV קודם, אם יש", type=["csv"], key="ledger_upload")
-        if uploaded_ledger is not None:
-            try:
-                st.session_state["ledger"] = normalize_ledger(pd.read_csv(uploaded_ledger))
-                st.success("הקובץ נטען.")
-            except Exception:
-                st.error("לא הצלחתי לקרוא את הקובץ. ודא שזה CSV.")
+        if "active_ledger_profile" not in st.session_state or st.session_state["active_ledger_profile"] != profile:
+            st.session_state["active_ledger_profile"] = profile
+            st.session_state["ledger"] = load_profile_ledger(profile)
+
+        if "ledger" not in st.session_state:
+            st.session_state["ledger"] = load_profile_ledger(profile)
+
+        st.caption(f"שמירה מקומית פעילה לפרופיל: {profile}")
+
+        pcol1, pcol2, pcol3 = st.columns(3)
+
+        with pcol1:
+            if st.button("💾 שמור עכשיו", use_container_width=True):
+                save_profile_ledger(profile, st.session_state["ledger"])
+                st.success("נשמר.")
+
+        with pcol2:
+            uploaded_ledger = st.file_uploader("ייבוא CSV לפרופיל הפעיל", type=["csv"], key=f"ledger_upload_{profile}")
+            if uploaded_ledger is not None:
+                try:
+                    st.session_state["ledger"] = normalize_ledger(pd.read_csv(uploaded_ledger))
+                    save_profile_ledger(profile, st.session_state["ledger"])
+                    st.success("הקובץ נטען ונשמר לפרופיל הפעיל.")
+                except Exception:
+                    st.error("לא הצלחתי לקרוא את הקובץ. ודא שזה CSV.")
+
+        with pcol3:
+            confirm_reset = st.checkbox("אשר איפוס", key=f"confirm_reset_{profile}")
+            if st.button("🗑️ איפוס התיק הפעיל", use_container_width=True):
+                if confirm_reset:
+                    st.session_state["ledger"] = reset_profile_ledger(profile)
+                    st.success("התיק אופס.")
+                    st.rerun()
+                else:
+                    st.warning("סמן קודם 'אשר איפוס'.")
 
         st.markdown("### הוספת פעולה")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1464,7 +1530,8 @@ else:
                     "Note": note,
                 }])
                 st.session_state["ledger"] = normalize_ledger(pd.concat([st.session_state["ledger"], new_row], ignore_index=True))
-                st.success("הפעולה נוספה. אל תשכח לשמור CSV.")
+                save_profile_ledger(profile, st.session_state["ledger"])
+                st.success("הפעולה נוספה ונשמרה.")
 
         st.markdown("### יומן פעולות")
         ledger_edit = st.data_editor(
@@ -1472,7 +1539,7 @@ else:
             num_rows="dynamic",
             use_container_width=True,
             hide_index=True,
-            key="ledger_editor",
+            key=f"ledger_editor_{profile}",
             column_config={
                 "Date": st.column_config.TextColumn("Date"),
                 "Account": st.column_config.SelectboxColumn("Account", options=["אמת", "וירטואלי"]),
@@ -1484,12 +1551,17 @@ else:
                 "Note": st.column_config.TextColumn("Note"),
             }
         )
-        st.session_state["ledger"] = normalize_ledger(ledger_edit)
+
+        edited_ledger = normalize_ledger(ledger_edit)
+        if not edited_ledger.equals(st.session_state["ledger"]):
+            st.session_state["ledger"] = edited_ledger
+            save_profile_ledger(profile, st.session_state["ledger"])
+            st.caption("השינויים בטבלה נשמרו אוטומטית.")
 
         st.download_button(
-            "⬇️ שמור יומן פעולות CSV",
+            "⬇️ הורד גיבוי CSV",
             st.session_state["ledger"].to_csv(index=False).encode("utf-8-sig"),
-            file_name="swinghunter_portfolio_ledger.csv",
+            file_name=f"swinghunter_{profile}_portfolio_ledger.csv",
             mime="text/csv",
             use_container_width=True
         )
@@ -1534,7 +1606,7 @@ else:
                 st.download_button(
                     "⬇️ הורד ניתוח תיק CSV",
                     df_portfolio.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"swinghunter_{APP_VERSION}_portfolio_analysis.csv",
+                    file_name=f"swinghunter_{APP_VERSION}_{profile}_portfolio_analysis.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
