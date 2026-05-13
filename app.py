@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.5 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.5"
+st.set_page_config(page_title="SwingHunter V11.6 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V11.6"
 
 # ==========================================================
 # 1. Security
@@ -220,7 +220,7 @@ def evaluate_ticker(
         "Ticker": ticker,
         "Status": "ERROR",
         "Decision": "NO DATA",
-        "Score": 0.0,
+        "Score": np.nan,
         "Setup": "",
         "Current": np.nan,
         "Entry": np.nan,
@@ -244,9 +244,11 @@ def evaluate_ticker(
         "ATR%": np.nan,
         "20D Run": np.nan,
         "Run Zone": "",
-        "Action State": "",
+        "Setup Type": "",
+        "Action State": "WAIT",
         "Pullback Watch Price": np.nan,
         "Pullback Deep Price": np.nan,
+        "Breakout Watch Price": np.nan,
         "Reason": ""
     }
 
@@ -289,9 +291,14 @@ def evaluate_ticker(
             "ATR%": round(atr_pct, 1) if np.isfinite(atr_pct) else np.nan,
             "20D Run": round(run20, 1),
             "Run Zone": run_zone,
-            "Pullback Watch Price": round(ema8 * 1.003, 2),
-            "Pullback Deep Price": round(ema21 * 1.005, 2)
+            "Breakout Watch Price": round(res20 * 1.002, 2)
         })
+
+        radar_score = round(score_candidate(
+            rs5, rs20, run20, 1.0, params.max_risk_pct, "RADAR",
+            False, ticker in MOMENTUM_TICKERS
+        ), 2)
+        base["Score"] = radar_score
 
         edge_ok = rs5 > params.rs5_min or rs20 > params.rs20_min
         momentum_name = ticker in MOMENTUM_TICKERS
@@ -306,13 +313,43 @@ def evaluate_ticker(
             and atr_pct >= params.min_atr_pct
         )
 
+        # V11.6: route the stock instead of judging everything only by RS vs QQQ.
+        rs_improving = rs5 > rs20 + 3
+        base_candidate = (
+            last_p > sma200
+            and last_p >= ema21 * 0.99
+            and rs_improving
+            and 35 <= rsi <= 72
+            and run20 <= 25
+        )
+        turnaround_candidate = (
+            last_p > sma200
+            and rs20 < 0
+            and rs_improving
+            and last_p >= ema21 * 0.97
+            and 30 <= rsi <= 65
+        )
+
+        if last_p < sma200:
+            setup_type = "Weak / Ignore"
+        elif edge_ok and last_p > ema21:
+            setup_type = "Momentum Leader"
+        elif base_candidate:
+            setup_type = "Base Breakout"
+        elif turnaround_candidate:
+            setup_type = "Turnaround Watch"
+        else:
+            setup_type = "Weak / Ignore"
+
+        base["Setup Type"] = setup_type
+
         # Hard rejects, but still with full radar info.
         if last_p < sma200:
             base.update(Status="REJECT", Decision="NO TRADE", **{"Action State": "NO TRADE"}, Reason="מתחת SMA200")
             return base
 
         if not np.isfinite(atr_pct) or atr_pct < params.min_atr_pct:
-            base.update(Status="REJECT", Decision="NO TRADE", Reason=f"ATR% נמוך מדי ({atr_pct:.1f}%)")
+            base.update(Status="REJECT", Decision="NO TRADE", **{"Action State": "NO TRADE"}, Reason=f"ATR% נמוך מדי ({atr_pct:.1f}%)")
             return base
 
         # Regime filter: normal trades only in BULL_STRONG. Exceptional leaders can pass in weaker regimes.
@@ -321,7 +358,7 @@ def evaluate_ticker(
             return base
 
         if rsi > params.overbought_rsi and not exceptional:
-            base.update(Status="WATCH", Decision="WAIT", Reason="RSI גבוה מדי / המניה מתוחה")
+            base.update(Status="WATCH", Decision="WAIT", **{"Action State": "WAIT"}, Reason="RSI גבוה מדי / המניה מתוחה")
             return base
 
         # V11.1 overextension gate:
@@ -330,12 +367,16 @@ def evaluate_ticker(
             base.update(
                 Status="WATCH",
                 Decision="WAIT",
-                **{"Action State": "WAIT FOR PULLBACK"},
+                **{
+                    "Action State": "WAIT FOR PULLBACK",
+                    "Pullback Watch Price": round(ema8 * 1.003, 2),
+                    "Pullback Deep Price": round(ema21 * 1.005, 2),
+                },
                 Reason=f"ריצה חזקה מדי ב-20 יום ({run20:.1f}%) — לא קונים עכשיו; ממתינים לפולבק לאזור EMA8/EMA21"
             )
             return base
 
-        if not edge_ok and not exceptional:
+        if not edge_ok and not exceptional and not base_candidate and not turnaround_candidate:
             base.update(Status="WATCH", Decision="WAIT", **{"Action State": "WAIT"}, Reason="RS חלש מול QQQ")
             return base
 
@@ -350,12 +391,20 @@ def evaluate_ticker(
         allow_breakout = run20 <= 30 or (exceptional and run20 <= 35 and rs20 > 30 and rs5 > 5)
         allow_pullback = run20 <= 45
 
-        # 1) Breakout near resistance.
+        # 1) Breakout near resistance for momentum leaders.
         if allow_breakout and 0 < dist_to_res < 0.045 and edge_ok:
             entry = round(res20 * 1.002, 2)
             if last_p < entry:
                 order_type = "BUY STOP LIMIT"
                 setup = "Near Resistance Breakout"
+
+        # 1b) Base Breakout / Turnaround route:
+        # Does not require positive RS20 yet, but does require improving short-term RS and recovery above EMA21 area.
+        if order_type is None and allow_breakout and base_candidate and 0 < dist_to_res < 0.055:
+            entry = round(res20 * 1.002, 2)
+            if last_p < entry:
+                order_type = "BUY STOP LIMIT"
+                setup = "Base Breakout"
 
         # 2) Quality pullback.
         higher_low_2 = False
@@ -390,13 +439,27 @@ def evaluate_ticker(
         if order_type is None:
             reason = "אין נקודת כניסה נקייה כרגע"
             action_state = "WAIT"
+            extra = {}
+
             if run20 > 30:
                 reason = "רצה מעל 30% ב-20 יום — ממתינים לפולבק איכותי, לא קונים פריצה"
                 action_state = "WAIT FOR PULLBACK"
+                extra = {
+                    "Pullback Watch Price": round(ema8 * 1.003, 2),
+                    "Pullback Deep Price": round(ema21 * 1.005, 2),
+                }
+            elif setup_type == "Turnaround Watch":
+                reason = "שיפור ראשוני, אבל עדיין לא פריצה; לעקוב אחרי Breakout Watch Price"
+                action_state = "TURNAROUND WATCH"
+            elif setup_type == "Base Breakout":
+                reason = "בסיס מעניין, אבל אין טריגר כניסה נקי כרגע"
+                action_state = "WAIT FOR BREAKOUT"
+
             base.update(
                 Status="WATCH",
                 Decision="WAIT",
                 **{"Action State": action_state},
+                **extra,
                 Score=round(score_candidate(rs5, rs20, run20, 1.0, params.max_risk_pct, "WATCH", exceptional, momentum_name), 2),
                 Reason=reason
             )
@@ -425,6 +488,7 @@ def evaluate_ticker(
                 Target="No fixed target",
                 **{"Risk %": round(risk_pct, 2)},
                 Score=round(score, 2),
+                **{"Action State": "WAIT"},
                 Reason=f"סיכון גבוה מדי ({risk_pct:.1f}%)"
             )
             return base
@@ -439,6 +503,7 @@ def evaluate_ticker(
                 Target="No fixed target",
                 **{"Risk %": round(risk_pct, 2)},
                 Score=round(score, 2),
+                **{"Action State": "WAIT"},
                 Reason=f"Score נמוך מדי לביצוע ({score:.1f})"
             )
             return base
@@ -461,6 +526,7 @@ def evaluate_ticker(
             "Action State": "PLACE ORDER",
             "Score": round(score, 2),
             "Setup": setup,
+            "Setup Type": setup_type,
             "Entry": round(entry, 2),
             "Distance to Entry %": round(distance, 2),
             "Stop": stop,
@@ -1085,9 +1151,11 @@ def get_column_config():
         "ATR%": st.column_config.NumberColumn("ATR%", help="תנודתיות יומית ממוצעת כאחוז מהמחיר. עוזר להבין אם המניה זזה מספיק לסווינג.", format="%.1f%%"),
         "20D Run": st.column_config.NumberColumn("ריצה 20 יום", help="כמה המניה עלתה/ירדה ב-20 ימי המסחר האחרונים.", format="%.1f%%"),
         "Run Zone": st.column_config.TextColumn("אזור ריצה", help="NORMAL עד 15%, HOT עד 30%, EXTENDED עד 45%, TOO_EXTENDED מעל 45%. מעל 30% לא קונים פריצה אלא מחכים לפולבק."),
-        "Action State": st.column_config.TextColumn("מצב פעולה", help="PLACE ORDER / WAIT FOR PULLBACK / WAIT / NO TRADE. מסכם מה לעשות עם המניה עכשיו."),
+        "Setup Type": st.column_config.TextColumn("סוג מסלול", help="Momentum Leader = מניה מובילה; Base Breakout = בסיס לפני פריצה; Turnaround Watch = התחלת שיפור; Weak/Ignore = כרגע לא מעניין."),
+        "Action State": st.column_config.TextColumn("מצב פעולה", help="PLACE ORDER / WAIT FOR PULLBACK / WAIT FOR BREAKOUT / TURNAROUND WATCH / WAIT / NO TRADE."),
         "Pullback Watch Price": st.column_config.NumberColumn("מחיר מעקב לפולבק", help="אזור כניסה מעניין אם מניה חזקה מדי תתקן לכיוון EMA8. לא פקודת קנייה אוטומטית.", format="%.2f"),
         "Pullback Deep Price": st.column_config.NumberColumn("מחיר פולבק עמוק", help="אזור כניסה עמוק יותר סביב EMA21. מתאים למניות שרצו חזק מדי וצריך לחכות להן.", format="%.2f"),
+        "Breakout Watch Price": st.column_config.NumberColumn("מחיר מעקב לפריצה", help="רמה שמעליה מתחיל להיות מעניין לבדוק פריצה. שימושי במיוחד למסלול Base Breakout / Turnaround.", format="%.2f"),
         "Status": st.column_config.TextColumn("סטטוס", help="SIGNAL = איתות ביצוע. WATCH = במעקב. REJECT = לא רלוונטית כרגע."),
         "Decision": st.column_config.TextColumn("החלטה", help="ACTION / WAIT / NO TRADE לפי תנאי המודל."),
         "Reason": st.column_config.TextColumn("סיבה", help="הסיבה המרכזית למה המניה לא נכנסה או למה צריך למכור/להחזיק."),
@@ -1371,9 +1439,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.5 — Persistent Portfolio Profiles</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.6 — Setup Routes + Clean Radar</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.5 מוסיפה שמירה קבועה של תיק ההשקעות לפי פרופילים user1/user2/user3, כולל שמירה אוטומטית וכפתור איפוס. "
+        "V11.6 מנקה את הרדאר: אין Action State ריק, Pullback Price מוצג רק כשבאמת מחכים לפולבק, ונוסף מסלול Base Breakout/Turnaround כדי לא לפסול מניות רק בגלל RS חלש מול QQQ. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1409,7 +1477,7 @@ else:
 
                 if not df_orders.empty:
                     cols = [
-                        "Ticker","Action State","Action Now","Order","Current","Entry","Distance to Entry %",
+                        "Ticker","Action State","Setup Type","Action Now","Order","Current","Entry","Distance to Entry %",
                         "Stop","Current Protection Stop","Profit Checkpoint","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
                         "Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
                     ]
@@ -1422,8 +1490,8 @@ else:
                 st.markdown("## 🔍 רדאר מלא — למה מניות לא נכנסו")
                 if not df_radar.empty:
                     cols = [
-                        "Ticker","Status","Decision","Action State","Score","Reason","Current","Entry","Distance to Entry %",
-                        "Stop","Current Protection Stop","Profit Checkpoint","Pullback Watch Price","Pullback Deep Price","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
+                        "Ticker","Status","Decision","Action State","Setup Type","Score","Reason","Current","Entry","Distance to Entry %",
+                        "Stop","Current Protection Stop","Profit Checkpoint","Pullback Watch Price","Pullback Deep Price","Breakout Watch Price","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
                     ]
                     df_radar = dedupe_dataframe_columns(df_radar)
                     cols = unique_existing_columns(cols, df_radar)
