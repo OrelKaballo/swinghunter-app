@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V11.6 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V11.6"
+st.set_page_config(page_title="SwingHunter V12.0 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V12.0"
 
 # ==========================================================
 # 1. Security
@@ -897,6 +897,373 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 # 7. Live Daily Dashboard
 # ==========================================================
+
+# ==========================================================
+# 7A. V12 Breakout Action Engine
+# ==========================================================
+def calc_breakout_score(
+    current,
+    breakout_dist,
+    risk_pct,
+    rr8,
+    atr_pct,
+    rsi,
+    run20,
+    range10,
+    rs5,
+    rs20,
+    setup_type,
+):
+    """
+    Practical score: not academic momentum score.
+    Rewards: close trigger, manageable risk, ability to move 8%-12%, improving RS, tight base.
+    Penalizes: overextension, far trigger, wide range, high risk.
+    """
+    score = 50.0
+
+    # Trigger proximity
+    if 0 <= breakout_dist <= 1.0:
+        score += 18
+    elif 1.0 < breakout_dist <= 3.0:
+        score += 12
+    elif 3.0 < breakout_dist <= 6.0:
+        score += 4
+    else:
+        score -= 12
+
+    # Risk / reward
+    score += min(rr8, 3.0) * 8
+    score -= max(risk_pct - 6.0, 0) * 4
+
+    # Volatility: we need movement, not dead money
+    if 1.5 <= atr_pct <= 6.5:
+        score += 8
+    elif atr_pct < 1.2:
+        score -= 8
+    elif atr_pct > 9.0:
+        score -= 6
+
+    # RSI zone
+    if 45 <= rsi <= 68:
+        score += 8
+    elif 68 < rsi <= 75:
+        score += 2
+    elif rsi > 80:
+        score -= 12
+    elif rsi < 35:
+        score -= 8
+
+    # Overextension
+    if run20 <= 15:
+        score += 8
+    elif run20 <= 25:
+        score += 2
+    elif run20 <= 30:
+        score -= 6
+    else:
+        score -= 20
+
+    # Consolidation quality
+    if range10 <= 7:
+        score += 8
+    elif range10 <= 12:
+        score += 3
+    else:
+        score -= 5
+
+    # Relative strength: useful, but not the only thing
+    if rs20 > 3:
+        score += 6
+    if rs5 > rs20 + 3:
+        score += 6
+    elif rs5 > 0:
+        score += 3
+    if rs5 < -5 and rs20 < -5:
+        score -= 10
+
+    # Route
+    if setup_type == "Momentum Breakout":
+        score += 6
+    elif setup_type == "Base Breakout":
+        score += 4
+    elif setup_type == "Turnaround Watch":
+        score -= 2
+
+    return round(score, 2)
+
+
+def evaluate_breakout_action_plan(
+    ticker: str,
+    c: pd.Series,
+    h: pd.Series,
+    l: pd.Series,
+    qqq_slice: pd.Series,
+    params: StrategyParams,
+):
+    """
+    V12 practical output:
+    - BUY SETUP READY: actionable now/near now
+    - WAIT FOR BREAKOUT: has a trigger price
+    - WAIT FOR PULLBACK: too extended; has pullback prices
+    - TURNAROUND WATCH: improving, not ready
+    - IGNORE: hidden by default
+    """
+    base = {
+        "Ticker": ticker,
+        "State": "IGNORE",
+        "Setup Type": "Weak / Ignore",
+        "Current": np.nan,
+        "Buy Trigger": np.nan,
+        "Distance to Trigger %": np.nan,
+        "Next Action Price": np.nan,
+        "Distance to Action %": np.nan,
+        "Stop": np.nan,
+        "Risk %": np.nan,
+        "Target 8%": np.nan,
+        "Target 12%": np.nan,
+        "RR 8%": np.nan,
+        "RR 12%": np.nan,
+        "Breakout Score": np.nan,
+        "What We Need": "",
+        "Why": "",
+        "EMA21": np.nan,
+        "SMA200": np.nan,
+        "RS5": np.nan,
+        "RS20": np.nan,
+        "RSI": np.nan,
+        "ATR%": np.nan,
+        "20D Run": np.nan,
+        "10D Range %": np.nan,
+        "Run Zone": "",
+        "Pullback Watch Price": np.nan,
+        "Pullback Deep Price": np.nan,
+        "Breakout Watch Price": np.nan,
+        "Regime": "",
+    }
+
+    try:
+        if len(c) < 220:
+            base.update(State="IGNORE", **{"What We Need": "More Data"}, Why="אין מספיק היסטוריה")
+            return base
+
+        last_p = float(c.iloc[-1])
+        sma200 = float(c.rolling(200).mean().iloc[-1])
+        sma50 = float(c.rolling(50).mean().iloc[-1])
+        ema8 = float(c.ewm(span=8, adjust=False).mean().iloc[-1])
+        ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+        high20 = float(h.iloc[-21:-1].max())
+        high50 = float(h.iloc[-51:-1].max())
+        breakout_level = max(high20, high50 if high50 <= last_p * 1.08 else high20)
+        breakout_trigger = round(breakout_level * 1.002, 2)
+
+        atr = float(calc_atr_from_series(h, l, c, 14).iloc[-1])
+        atr_pct = atr / last_p * 100 if last_p else np.nan
+        rsi = float(calc_rsi(c, 14).iloc[-1])
+        run20 = (last_p / c.iloc[-21] - 1) * 100
+        rs5, rs20 = relative_strength_vs(qqq_slice, c)
+        regime = market_regime(qqq_slice)
+
+        high10 = float(h.iloc[-10:].max())
+        low10 = float(l.iloc[-10:].min())
+        range10 = (high10 / low10 - 1) * 100 if low10 > 0 else np.nan
+
+        if run20 <= 15:
+            run_zone = "NORMAL"
+        elif run20 <= 25:
+            run_zone = "WARM"
+        elif run20 <= 30:
+            run_zone = "HOT"
+        elif run20 <= 45:
+            run_zone = "EXTENDED"
+        else:
+            run_zone = "TOO_EXTENDED"
+
+        trigger_dist = (breakout_trigger / last_p - 1) * 100
+        pullback_watch = round(ema8 * 1.003, 2)
+        pullback_deep = round(ema21 * 1.005, 2)
+
+        base.update({
+            "Current": round(last_p, 2),
+            "Buy Trigger": breakout_trigger,
+            "Next Action Price": breakout_trigger,
+            "Distance to Trigger %": round(trigger_dist, 2),
+            "Distance to Action %": round(trigger_dist, 2),
+            "Breakout Watch Price": breakout_trigger,
+            "EMA21": round(ema21, 2),
+            "SMA200": round(sma200, 2),
+            "RS5": round(rs5, 1),
+            "RS20": round(rs20, 1),
+            "RSI": round(rsi, 1),
+            "ATR%": round(atr_pct, 1) if np.isfinite(atr_pct) else np.nan,
+            "20D Run": round(run20, 1),
+            "10D Range %": round(range10, 1) if np.isfinite(range10) else np.nan,
+            "Run Zone": run_zone,
+            "Regime": regime,
+        })
+
+        if last_p < sma200:
+            base.update(State="IGNORE", **{"What We Need": "Above SMA200"}, Why="מתחת SMA200 — לא מחפשים פריצה בכיוון לונג")
+            return base
+
+        if not np.isfinite(atr_pct) or atr_pct < 1.2:
+            base.update(State="IGNORE", **{"What We Need": "More Volatility"}, Why="ATR% נמוך מדי — פחות מתאים לסווינג של 8%-12%")
+            return base
+
+        # Too extended: not an entry plan, but still very useful.
+        if run20 > 30:
+            base.update({
+                "State": "WAIT FOR PULLBACK",
+                "Setup Type": "Extended Leader",
+                "Next Action Price": pullback_watch,
+                "Distance to Action %": round((pullback_watch / last_p - 1) * 100, 2),
+                "Pullback Watch Price": pullback_watch,
+                "Pullback Deep Price": pullback_deep,
+                "What We Need": "Pullback to EMA8/EMA21",
+                "Why": "המניה חזקה אבל כבר רצה מעל 30% ב-20 יום — לא רודפים; מחכים לפולבק"
+            })
+            return base
+
+        # Route classification.
+        rs_improving = rs5 > rs20 + 3
+        price_recovered = last_p > ema21 and ema21 >= sma50 * 0.92
+        momentum_leader = (rs20 > 3 or rs5 > 3) and last_p > ema21
+        base_breakout = price_recovered and run20 <= 25 and 40 <= rsi <= 72 and (rs5 > 0 or rs_improving)
+        turnaround_watch = (rs20 < 0) and rs_improving and last_p >= ema21 * 0.97 and 32 <= rsi <= 65
+
+        if momentum_leader:
+            setup_type = "Momentum Breakout"
+        elif base_breakout:
+            setup_type = "Base Breakout"
+        elif turnaround_watch:
+            setup_type = "Turnaround Watch"
+        else:
+            setup_type = "Weak / Ignore"
+
+        base["Setup Type"] = setup_type
+
+        # Initial stop and target plan: relevant only when we have a buy trigger.
+        # Stop = the tighter of technical protection and max risk cap, but not above entry.
+        entry = breakout_trigger
+        technical_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
+        stop = min(technical_stop, entry * 0.995)
+        stop = round(stop, 2)
+        risk_pct = (entry - stop) / entry * 100
+        target8 = round(entry * 1.08, 2)
+        target12 = round(entry * 1.12, 2)
+        rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
+        rr12 = 12 / risk_pct if risk_pct > 0 else np.nan
+
+        score = calc_breakout_score(
+            last_p, trigger_dist, risk_pct, rr8, atr_pct, rsi, run20, range10, rs5, rs20, setup_type
+        )
+
+        base.update({
+            "Stop": stop,
+            "Risk %": round(risk_pct, 2),
+            "Target 8%": target8,
+            "Target 12%": target12,
+            "RR 8%": round(rr8, 2) if np.isfinite(rr8) else np.nan,
+            "RR 12%": round(rr12, 2) if np.isfinite(rr12) else np.nan,
+            "Breakout Score": score,
+        })
+
+        if setup_type == "Weak / Ignore":
+            base.update(State="IGNORE", **{"What We Need": "Stronger setup"}, Why="אין כרגע סימני פריצה/התאוששות מספיקים")
+            return base
+
+        # Far from trigger: watch, not action.
+        if trigger_dist > 6:
+            base.update(
+                State="TURNAROUND WATCH" if setup_type == "Turnaround Watch" else "WAIT FOR BREAKOUT",
+                **{"What We Need": "Move closer to breakout trigger"},
+                Why="יש כיוון מעניין אבל הטריגר עדיין רחוק מדי לפקודה"
+            )
+            return base
+
+        # Good watch candidate but not actionable yet.
+        if trigger_dist > 3:
+            base.update(
+                State="WAIT FOR BREAKOUT",
+                **{"What We Need": "Breakout closer than 3%"},
+                Why="מועמדת מעניינת, אבל הפריצה לא מספיק קרובה"
+            )
+            return base
+
+        # Too high risk for target 8%-12%.
+        if risk_pct > 8:
+            base.update(
+                State="WAIT FOR BREAKOUT",
+                **{"What We Need": "Tighter risk / closer base"},
+                Why=f"הטריגר קרוב, אבל הסטופ רחב מדי ({risk_pct:.1f}%)"
+            )
+            return base
+
+        # Score threshold for action.
+        if score < 60:
+            state = "TURNAROUND WATCH" if setup_type == "Turnaround Watch" else "WAIT FOR BREAKOUT"
+            base.update(
+                State=state,
+                **{"What We Need": "Higher readiness score"},
+                Why=f"קרובה לטריגר, אבל איכות הסטאפ עדיין לא מספקת ({score:.1f})"
+            )
+            return base
+
+        # Actionable.
+        base.update(
+            State="BUY SETUP READY",
+            **{"What We Need": "Place stop-limit order"},
+            Why="טריגר קרוב, סיכון סביר, יעד 8%-12% נותן יחס סביר"
+        )
+        return base
+
+    except Exception as e:
+        base.update(State="ERROR", Why=str(e)[:120])
+        return base
+
+
+def get_today_breakout_action_plan(params: StrategyParams):
+    qqq = download_single("QQQ", "370d")
+    if qqq.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    qqq_slice = qqq["Close"].dropna()
+    action_rows = []
+    watch_rows = []
+    ignore_rows = []
+
+    for ticker in WATCHLIST:
+        df = download_single(ticker, "370d")
+        if df.empty or len(df) < 220:
+            continue
+
+        try:
+            c, h, l = df["Close"].dropna(), df["High"].dropna(), df["Low"].dropna()
+            row = evaluate_breakout_action_plan(ticker, c, h, l, qqq_slice, params)
+
+            state = row.get("State", "IGNORE")
+            if state == "BUY SETUP READY":
+                action_rows.append(row)
+            elif state in ["WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH"]:
+                watch_rows.append(row)
+            else:
+                ignore_rows.append(row)
+        except Exception:
+            continue
+
+    df_action = pd.DataFrame(action_rows)
+    df_watch = pd.DataFrame(watch_rows)
+    df_ignore = pd.DataFrame(ignore_rows)
+
+    if not df_action.empty:
+        df_action = df_action.sort_values("Breakout Score", ascending=False)
+    if not df_watch.empty:
+        df_watch = df_watch.sort_values(["State", "Breakout Score"], ascending=[True, False], na_position="last")
+    if not df_ignore.empty:
+        df_ignore = df_ignore.sort_values(["State", "Ticker"], ascending=[True, True])
+
+    return df_action, df_watch, df_ignore
+
+
 def get_today_actions(params: StrategyParams):
     qqq = download_single("QQQ", "370d")
     if qqq.empty:
@@ -1169,6 +1536,20 @@ def get_column_config():
         "Initial Stop": st.column_config.NumberColumn("סטופ התחלתי", help="הסטופ המקורי מהיום שנכנסת לעסקה.", format="%.2f"),
         "Last Date": st.column_config.TextColumn("תאריך נתון אחרון", help="תאריך יום המסחר האחרון שהנתונים מתייחסים אליו."),
         "Action": st.column_config.TextColumn("פעולה", help="HOLD = להחזיק. SELL = יציאה לפי המודל."),
+        "State": st.column_config.TextColumn("מצב", help="BUY SETUP READY / WAIT FOR BREAKOUT / WAIT FOR PULLBACK / TURNAROUND WATCH / IGNORE."),
+        "Buy Trigger": st.column_config.NumberColumn("טריגר קנייה", help="השער שמעליו המודל מציע לשקול כניסה. בדרך כלל פריצה מעל שיא 20/50 יום.", format="%.2f"),
+        "Distance to Trigger %": st.column_config.NumberColumn("מרחק לטריגר %", help="כמה המחיר הנוכחי רחוק מטריגר הקנייה.", format="%.2f%%"),
+        "Next Action Price": st.column_config.NumberColumn("מחיר פעולה הבא", help="המחיר הבא שרלוונטי לפעולה: טריגר פריצה או מחיר פולבק.", format="%.2f"),
+        "Distance to Action %": st.column_config.NumberColumn("מרחק לפעולה %", help="כמה המחיר הנוכחי רחוק ממחיר הפעולה הבא.", format="%.2f%%"),
+        "Target 8%": st.column_config.NumberColumn("יעד 8%", help="יעד רווח ראשון לבדיקה — 8% מעל טריגר הקנייה.", format="%.2f"),
+        "Target 12%": st.column_config.NumberColumn("יעד 12%", help="יעד רווח שני לבדיקה — 12% מעל טריגר הקנייה.", format="%.2f"),
+        "RR 8%": st.column_config.NumberColumn("R/R ל-8%", help="יחס סיכון/סיכוי עד יעד 8%. מעל 1 עדיף.", format="%.2f"),
+        "RR 12%": st.column_config.NumberColumn("R/R ל-12%", help="יחס סיכון/סיכוי עד יעד 12%. מעל 1.5 עדיף.", format="%.2f"),
+        "Breakout Score": st.column_config.NumberColumn("ציון פריצה", help="ציון פרקטי שמעדיף טריגר קרוב, סיכון סביר, ATR מתאים, בסיס מתכווץ ושיפור כוח יחסי.", format="%.2f"),
+        "What We Need": st.column_config.TextColumn("מה חסר", help="הדבר הבא שצריך לקרות כדי שהמניה תהפוך לפעולה."),
+        "Why": st.column_config.TextColumn("למה", help="הסבר קצר למה המניה במצב הנוכחי."),
+        "10D Range %": st.column_config.NumberColumn("טווח 10 ימים", help="טווח תנודת המחיר ב-10 ימי המסחר האחרונים. נמוך יותר יכול להעיד על התבססות.", format="%.1f%%"),
+        "SMA200": st.column_config.NumberColumn("SMA200", help="ממוצע נע פשוט ל-200 ימי מסחר. משמש כסינון מגמה ראשי.", format="%.2f"),
         "Account": st.column_config.TextColumn("סוג תיק", help="אמת או וירטואלי. מאפשר לסכם בנפרד השקעות אמיתיות וסימולציות."),
         "Open PnL $": st.column_config.NumberColumn("רווח פתוח $", help="רווח/הפסד על פוזיציות שעדיין פתוחות.", format="$%.2f"),
         "Open PnL %": st.column_config.NumberColumn("רווח פתוח %", help="אחוז רווח/הפסד על הפוזיציה הפתוחה.", format="%.2f%%"),
@@ -1439,9 +1820,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V11.6 — Setup Routes + Clean Radar</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.0 — Breakout Action Engine</h1>", unsafe_allow_html=True)
     st.info(
-        "V11.6 מנקה את הרדאר: אין Action State ריק, Pullback Price מוצג רק כשבאמת מחכים לפולבק, ונוסף מסלול Base Breakout/Turnaround כדי לא לפסול מניות רק בגלל RS חלש מול QQQ. "
+        "V12.0 הופכת את המסך היומי מתחקיר אקדמי לתוכנית פעולה: פקודות מוכנות, מועמדות למעקב עם מחיר פעולה הבא, ו-Ignore מוסתר. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1469,51 +1850,81 @@ else:
     tab_daily, tab_portfolio, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "🔬 בדיקת בנק"])
 
     with tab_daily:
-        if st.button("⚡ הפק פקודות/מעקב להיום", use_container_width=True):
-            with st.spinner("סורק מניות ומחשב תכניות כניסה/יציאה..."):
-                df_orders, df_radar = get_today_actions(params)
+        st.markdown("## 🚀 V12 — תוכנית פעולה לפריצות קרובות")
+        st.caption(
+            "המטרה כאן היא לא להציג 80 מניות עם חורים, אלא תוכנית פעולה: "
+            "מה מוכן לקנייה, מה מחכה לפריצה, מה מחכה לפולבק ומה לא מעניין כרגע."
+        )
 
-                st.markdown("## 🧭 פקודות לביצוע היום")
+        if st.button("⚡ הפק תוכנית פעולה להיום", use_container_width=True):
+            with st.spinner("סורק מניות ומחשב תוכניות פעולה פרקטיות..."):
+                df_action, df_watch, df_ignore = get_today_breakout_action_plan(params)
 
-                if not df_orders.empty:
-                    cols = [
-                        "Ticker","Action State","Setup Type","Action Now","Order","Current","Entry","Distance to Entry %",
-                        "Stop","Current Protection Stop","Profit Checkpoint","EMA21","Exit Close Level","Exit Rule","Risk %","Setup","Score",
-                        "Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
-                    ]
-                    df_orders = dedupe_dataframe_columns(df_orders)
-                    cols = unique_existing_columns(cols, df_orders)
-                    st.dataframe(df_orders[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                total = len(df_action) + len(df_watch) + len(df_ignore)
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("פקודות מוכנות", len(df_action))
+                k2.metric("מועמדות למעקב", len(df_watch))
+                k3.metric("מוסתר / Ignore", len(df_ignore))
+                k4.metric("סה״כ נבדקו", total)
+
+                st.markdown("## ✅ פקודות לביצוע / כמעט לביצוע")
+                action_cols = [
+                    "Ticker", "State", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
+                    "Stop", "Risk %", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
+                    "Breakout Score", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "10D Range %"
+                ]
+
+                if not df_action.empty:
+                    df_action = dedupe_dataframe_columns(df_action)
+                    cols = unique_existing_columns(action_cols, df_action)
+                    st.dataframe(df_action[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                 else:
-                    st.warning("אין היום פקודות ביצוע. זה לא אומר שאין מידע — ראה רדאר למטה.")
+                    st.warning("אין כרגע פקודת קנייה מספיק נקייה. זה בסדר — לא חייבים לסחור כל יום.")
 
-                st.markdown("## 🔍 רדאר מלא — למה מניות לא נכנסו")
-                if not df_radar.empty:
-                    cols = [
-                        "Ticker","Status","Decision","Action State","Setup Type","Score","Reason","Current","Entry","Distance to Entry %",
-                        "Stop","Current Protection Stop","Profit Checkpoint","Pullback Watch Price","Pullback Deep Price","Breakout Watch Price","Target","Risk %","Setup","Regime","RS5","RS20","RSI","ATR%","20D Run","Run Zone"
-                    ]
-                    df_radar = dedupe_dataframe_columns(df_radar)
-                    cols = unique_existing_columns(cols, df_radar)
-                    st.dataframe(df_radar[cols].head(80), use_container_width=True, hide_index=True, column_config=get_column_config())
+                st.markdown("## 👀 מועמדות למעקב עם מחיר פעולה הבא")
+                watch_cols = [
+                    "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
+                    "What We Need", "Why", "Breakout Score", "Buy Trigger", "Pullback Watch Price",
+                    "Pullback Deep Price", "Stop", "Risk %", "Target 8%", "Target 12%",
+                    "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "Run Zone", "10D Range %"
+                ]
+
+                if not df_watch.empty:
+                    df_watch = dedupe_dataframe_columns(df_watch)
+                    cols = unique_existing_columns(watch_cols, df_watch)
+                    st.dataframe(df_watch[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                else:
+                    st.info("אין מועמדות מעקב כרגע.")
+
+                with st.expander("🧹 Ignore / מניות לא רלוונטיות כרגע"):
+                    if not df_ignore.empty:
+                        ignore_cols = [
+                            "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
+                            "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "Run Zone"
+                        ]
+                        df_ignore = dedupe_dataframe_columns(df_ignore)
+                        cols = unique_existing_columns(ignore_cols, df_ignore)
+                        st.dataframe(df_ignore[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                    else:
+                        st.write("אין מניות ב-Ignore.")
+
+                combined_radar = pd.concat([df_watch, df_ignore], ignore_index=True) if not df_watch.empty or not df_ignore.empty else pd.DataFrame()
 
                 zip_bytes = build_zip_report(
                     pd.DataFrame(),
                     pd.DataFrame(),
                     pd.DataFrame(),
                     {"App Version": APP_VERSION},
-                    df_orders,
-                    df_radar
+                    df_action,
+                    combined_radar
                 )
                 st.download_button(
-                    "⬇️ הורד ZIP יומי עם פקודות ורדאר",
+                    "⬇️ הורד ZIP יומי עם תוכנית פעולה",
                     zip_bytes,
-                    file_name=f"swinghunter_{APP_VERSION}_daily.zip",
+                    file_name=f"swinghunter_{APP_VERSION}_daily_action_plan.zip",
                     mime="application/zip",
                     use_container_width=True
                 )
-
-
 
     with tab_portfolio:
         st.markdown("## 💼 תיק השקעות — אמת + וירטואלי")
