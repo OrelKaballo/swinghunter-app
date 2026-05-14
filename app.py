@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.2 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.2"
+st.set_page_config(page_title="SwingHunter V13.3 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.3"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 ZLEMA Burst Hidden Gems
+# 7A. V12 AVWAP Purge Hidden Gems
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -940,6 +940,8 @@ def calc_breakout_score(
     var_15=1.0,
     absorption_ratio=0.0,
     is_void_above=False,
+    hugging_avwap=False,
+    is_liquidity_purge=False,
 ):
     """
     Practical score: not academic momentum score.
@@ -1027,9 +1029,19 @@ def calc_breakout_score(
     if is_void_above:
         score += 6
 
+    if hugging_avwap:
+        score += 5
+
+    if is_liquidity_purge:
+        score += 8
+
     # Route
     if setup_type == "Momentum Breakout":
         score += 6
+    elif setup_type == "Liquidity Purge":
+        score += 18
+    elif setup_type == "AVWAP Squeeze":
+        score += 15
     elif setup_type == "Void Squeeze":
         score += 18
     elif setup_type == "Squeeze Burst":
@@ -1176,7 +1188,7 @@ def evaluate_quick_burst_candidate(
         return False, np.nan, np.nan, np.nan, "טריגר רחוק מדי ל-Quick Burst"
 
     # Do not chase a stock that already moved hard today.
-    if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
+    if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and setup_type not in ["Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, f"המניה כבר עלתה היום {day_change_pct:.1f}% — לא רודפים"
 
     # Avoid obvious exhaustion.
@@ -1186,7 +1198,7 @@ def evaluate_quick_burst_candidate(
         return False, np.nan, np.nan, np.nan, "טווח 10 ימים רחב מדי / לא מספיק נקי"
 
     # Quick Burst is supposed to be before the burst, not after a big move.
-    if run20 > 15 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
+    if run20 > 15 and setup_type not in ["Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, "ריצה מעל 15% ב-20 יום — לא מתאים ל-Quick Burst רגיל"
 
     if run20 > 22:
@@ -1194,7 +1206,7 @@ def evaluate_quick_burst_candidate(
 
     # Require real fuel. VAR alone is not enough for slow/heavy names.
     fuel_signals = 0
-    if setup_type in ["Momentum Breakout", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
+    if setup_type in ["Momentum Breakout", "Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         fuel_signals += 1
     if rs5 >= 2.0:
         fuel_signals += 1
@@ -1216,7 +1228,7 @@ def evaluate_quick_burst_candidate(
     if setup_type != "Base Breakout" and fuel_signals < 2:
         return False, np.nan, np.nan, np.nan, "אין מספיק דלק ל-4.5% מהיר"
 
-    if atr_pct < 2.5 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
+    if atr_pct < 2.5 and setup_type not in ["Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, "ATR% נמוך מדי לטרייד קצר"
 
     if atr_pinch <= 0.85:
@@ -1238,7 +1250,7 @@ def evaluate_quick_burst_candidate(
     quick_risk_pct = (entry - quick_stop) / entry * 100
     quick_rr = 4.5 / quick_risk_pct if quick_risk_pct > 0 else np.nan
 
-    if quick_risk_pct > 3.2 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
+    if quick_risk_pct > 3.2 and setup_type not in ["Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ מהיר רחב מדי ({quick_risk_pct:.1f}%)"
     if quick_risk_pct > 3.6:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ קצר עדיין רחב מדי ({quick_risk_pct:.1f}%)"
@@ -1307,6 +1319,12 @@ def evaluate_breakout_action_plan(
         "Day Change %": np.nan,
         "Market Mood": "",
         "Hidden Gem Signal": "",
+        "AVWAP": np.nan,
+        "Distance to AVWAP %": np.nan,
+        "Hugging AVWAP": False,
+        "Liquidity Purge": False,
+        "Purge Low": np.nan,
+        "Purge High": np.nan,
         "TTM Squeeze": False,
         "Squeeze Momentum Rising": False,
         "Volume Dry-Up": False,
@@ -1454,6 +1472,43 @@ def evaluate_breakout_action_plan(
             void_top = np.nan
             void_bottom = np.nan
 
+        # V13.3: AVWAP from highest-volume day in last 60 days.
+        # This is a proxy for an institutional cost-basis line, not proof of institutional action.
+        try:
+            lookback = min(60, len(v))
+            hv_window = v.iloc[-lookback:]
+            hv_label = hv_window.idxmax()
+            hv_pos = c.index.get_loc(hv_label)
+            typ = (h.iloc[hv_pos:] + l.iloc[hv_pos:] + c.iloc[hv_pos:]) / 3
+            vol_slice = v.iloc[hv_pos:]
+            avwap_now = float((typ * vol_slice).cumsum().iloc[-1] / vol_slice.cumsum().iloc[-1])
+            dist_to_avwap = abs(last_p / avwap_now - 1) * 100 if avwap_now > 0 else np.nan
+            hugging_avwap = bool(np.isfinite(dist_to_avwap) and dist_to_avwap <= 1.5)
+        except Exception:
+            avwap_now = np.nan
+            dist_to_avwap = np.nan
+            hugging_avwap = False
+
+        # V13.3: Liquidity Purge / Turtle Soup style trap.
+        # Conservative: check last 3 CLOSED candles, not current intraday candle.
+        try:
+            past_20d_low = float(l.iloc[-24:-4].min())
+            is_liquidity_purge = False
+            purge_low = np.nan
+            purge_high = np.nan
+            for idx in [-4, -3, -2]:
+                if float(l.iloc[idx]) < past_20d_low:
+                    candle_mid = (float(h.iloc[idx]) + float(l.iloc[idx])) / 2
+                    if float(c.iloc[idx]) > float(o.iloc[idx]) and float(c.iloc[idx]) > candle_mid:
+                        is_liquidity_purge = True
+                        purge_low = float(l.iloc[idx])
+                        purge_high = float(h.iloc[idx])
+                        break
+        except Exception:
+            is_liquidity_purge = False
+            purge_low = np.nan
+            purge_high = np.nan
+
         run20 = (last_p / c.iloc[-21] - 1) * 100
         rs5, rs20 = relative_strength_vs(qqq_slice, c)
         regime = market_regime(qqq_slice)
@@ -1477,7 +1532,11 @@ def evaluate_breakout_action_plan(
         pullback_watch = round(ema8 * 1.003, 2)
         pullback_deep = round(ema21 * 1.005, 2)
 
-        if absorption_ratio >= 2.0 and is_void_above:
+        if is_liquidity_purge:
+            hidden_gem_signal = "ציד נזילות / מלכודת מוכרים"
+        elif hugging_avwap and atr_pinch < 0.80:
+            hidden_gem_signal = "דחיסה על AVWAP"
+        elif absorption_ratio >= 2.0 and is_void_above:
             hidden_gem_signal = "ספיגה מוסדית + חלל נזילות"
         elif absorption_ratio >= 2.0:
             hidden_gem_signal = "ספיגה מוסדית"
@@ -1492,6 +1551,10 @@ def evaluate_breakout_action_plan(
 
         if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and rsi >= 70:
             market_mood = "חמה היום — לא לרדוף"
+        elif is_liquidity_purge:
+            market_mood = "ציד נזילות"
+        elif hugging_avwap and atr_pinch < 0.80:
+            market_mood = "דחיסה על AVWAP"
         elif absorption_ratio >= 2.0 and is_void_above:
             market_mood = "ספיגה + ואקום מעל"
         elif is_squeeze_on and volume_dried_up and squeeze_momentum_rising:
@@ -1523,6 +1586,12 @@ def evaluate_breakout_action_plan(
             "Day Change %": round(day_change_pct, 2) if np.isfinite(day_change_pct) else np.nan,
             "Market Mood": market_mood,
             "Hidden Gem Signal": hidden_gem_signal,
+            "AVWAP": round(avwap_now, 2) if np.isfinite(avwap_now) else np.nan,
+            "Distance to AVWAP %": round(dist_to_avwap, 2) if np.isfinite(dist_to_avwap) else np.nan,
+            "Hugging AVWAP": hugging_avwap,
+            "Liquidity Purge": is_liquidity_purge,
+            "Purge Low": round(purge_low, 2) if np.isfinite(purge_low) else np.nan,
+            "Purge High": round(purge_high, 2) if np.isfinite(purge_high) else np.nan,
             "TTM Squeeze": is_squeeze_on,
             "Squeeze Momentum Rising": squeeze_momentum_rising,
             "Volume Dry-Up": volume_dried_up,
@@ -1573,6 +1642,26 @@ def evaluate_breakout_action_plan(
         # V13.0: true squeeze/burst route.
         # This is stricter than the older ATR Pinch route: squeeze + dry-up + rising momentum.
         daily_overheated = bool(np.isfinite(day_change_pct) and day_change_pct >= 3.0)
+
+        is_liquidity_purge_setup = (
+            is_liquidity_purge
+            and (rs20 > 0 or rs5 > 3 or rs_improving)
+            and last_p > sma200
+            and run20 <= 25
+            and trigger_dist <= 3.5
+            and not daily_overheated
+        )
+
+        is_avwap_squeeze = (
+            hugging_avwap
+            and (atr_pinch < 0.80 or is_squeeze_on)
+            and last_p > sma200
+            and last_p >= ema21 * 0.98
+            and run20 <= 25
+            and trigger_dist <= 2.5
+            and trigger_dist >= -0.25
+            and not daily_overheated
+        )
 
         is_void_squeeze = (
             absorption_ratio >= 2.0
@@ -1627,7 +1716,17 @@ def evaluate_breakout_action_plan(
             and not daily_overheated
         )
 
-        if is_void_squeeze:
+        if is_liquidity_purge_setup:
+            setup_type = "Liquidity Purge"
+            ref_high = purge_high if np.isfinite(purge_high) else float(h.iloc[-2])
+            ref_low = purge_low if np.isfinite(purge_low) else float(l.iloc[-2])
+            entry = round(ref_high * 1.002, 2)
+            raw_stop = ref_low * 0.99
+        elif is_avwap_squeeze:
+            setup_type = "AVWAP Squeeze"
+            entry = round(max(float(h.iloc[-2]), avwap_now) * 1.002, 2)
+            raw_stop = min(float(l.iloc[-2]) * 0.99, avwap_now * 0.985, ema8 * 0.995)
+        elif is_void_squeeze:
             setup_type = "Void Squeeze"
             entry = round(max(float(h.iloc[-2]), zlema8_now) * 1.002, 2)
             raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
@@ -1676,7 +1775,7 @@ def evaluate_breakout_action_plan(
 
         # V12.3: Strict R/R enforcement for Cheat Entry.
         # If the early entry is not actually tight, revert to standard trigger.
-        if setup_type in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"] and (risk_pct > 5.5 or rr8 < 1.5):
+        if setup_type in ["Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"] and (risk_pct > 5.5 or rr8 < 1.5):
             if momentum_leader:
                 setup_type = "Momentum Breakout"
             elif base_breakout:
@@ -1714,7 +1813,7 @@ def evaluate_breakout_action_plan(
 
         score = calc_breakout_score(
             last_p, trigger_dist, risk_pct, rr8, atr_pct, rsi, run20, range10,
-            rs5, rs20, setup_type, atr_pinch, var_15, absorption_ratio, is_void_above
+            rs5, rs20, setup_type, atr_pinch, var_15, absorption_ratio, is_void_above, hugging_avwap, is_liquidity_purge
         )
 
         base.update({
@@ -2143,6 +2242,8 @@ def localize_daily_display(df: pd.DataFrame) -> pd.DataFrame:
         "Setup Type": {
             "Momentum Breakout": "פריצת מומנטום",
             "Base Breakout": "פריצה מבסיס",
+            "Liquidity Purge": "ציד נזילות / מלכודת מוכרים",
+            "AVWAP Squeeze": "דחיסה על AVWAP",
             "Void Squeeze": "ספיגה מוסדית + חלל נזילות",
             "Squeeze Burst": "פריצת Squeeze / קפיץ אמיתי",
             "ZLEMA Burst": "פריצת ZLEMA מהירה",
@@ -2260,7 +2361,13 @@ def get_column_config():
         "10D Range %": st.column_config.NumberColumn("טווח 10 ימים", help="טווח תנודת המחיר ב-10 ימי המסחר האחרונים. נמוך יותר יכול להעיד על התבססות.", format="%.1f%%"),
         "Day Change %": st.column_config.NumberColumn("שינוי היום %", help="כמה המניה כבר זזה היום/ביום המסחר האחרון. מעל 3% בדרך כלל מפחית כניסה כדי לא לרדוף אחרי נר שכבר רץ.", format="%.2f%%"),
         "Market Mood": st.column_config.TextColumn("הלך רוח כמותי", help="סיכום מצב טכני-כמותי: חמה היום, קפיץ דרוך, דחיסה עם איסוף, ספיגה+ואקום, חיובית, חלשה או ניטרלית. זה לא סנטימנט רשת."),
-        "Hidden Gem Signal": st.column_config.TextColumn("איתות Hidden Gem", help="סימן לאנומליה מעניינת: ספיגה מוסדית, חלל נזילות מעל, או תגובת ZLEMA. זה מסנן מחקרי, לא המלצה בפני עצמו."),
+        "Hidden Gem Signal": st.column_config.TextColumn("איתות Hidden Gem", help="סימן לאנומליה מעניינת: ספיגה מוסדית, חלל נזילות, AVWAP, ציד נזילות או תגובת ZLEMA. זה מסנן מחקרי, לא המלצה בפני עצמו."),
+        "AVWAP": st.column_config.NumberColumn("AVWAP", help="מחיר ממוצע משוקלל ווליום מהיום בעל הווליום הגבוה ב-60 הימים האחרונים. משמש כקו עלות מוסדי משוער בלבד.", format="%.2f"),
+        "Distance to AVWAP %": st.column_config.NumberColumn("מרחק מ-AVWAP", help="כמה המחיר רחוק מ-AVWAP. קרוב מ-1.5% נחשב 'יושב על הקו'.", format="%.2f%%"),
+        "Hugging AVWAP": st.column_config.CheckboxColumn("יושב על AVWAP", help="המחיר נמצא עד 1.5% מ-AVWAP."),
+        "Liquidity Purge": st.column_config.CheckboxColumn("ציד נזילות", help="ב-3 הנרות הסגורים האחרונים הייתה שבירה מתחת לנמוך קודם וסגירה חזקה למעלה — מלכודת מוכרים אפשרית."),
+        "Purge Low": st.column_config.NumberColumn("נמוך הציד", help="הנמוך של נר ציד הנזילות, אם זוהה.", format="%.2f"),
+        "Purge High": st.column_config.NumberColumn("גבוה הציד", help="הגבוה של נר ציד הנזילות, משמש טריגר אפשרי.", format="%.2f"),
         "TTM Squeeze": st.column_config.CheckboxColumn("TTM Squeeze", help="רצועות בולינגר בתוך ערוצי קלטנר על הנר הסגור האחרון — דחיסת תנודתיות חזקה."),
         "Squeeze Momentum Rising": st.column_config.CheckboxColumn("מומנטום Squeeze עולה", help="מדד הכיוון של ה-Squeeze משתפר לעומת הנר הסגור הקודם."),
         "Volume Dry-Up": st.column_config.CheckboxColumn("יובש בווליום", help="ממוצע ווליום 3 ימים סגורים נמוך לפחות 25% מממוצע 50 יום — פחות מוכרים פעילים."),
@@ -2546,9 +2653,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.2 — ZLEMA Burst Hidden Gems</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.3 — AVWAP Purge Hidden Gems</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה ZLEMA Burst Hidden Gems: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה AVWAP Purge Hidden Gems: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2602,7 +2709,7 @@ else:
                 action_cols = [
                     "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
                     "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
-                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
+                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
                 ]
 
                 if not df_action_display.empty:
@@ -2617,7 +2724,7 @@ else:
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
                     "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
                     "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
-                    "Market Mood", "Hidden Gem Signal", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
+                    "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
                 ]
 
                 if not df_watch_display.empty:
@@ -2631,7 +2738,7 @@ else:
                     if not df_ignore_display.empty:
                         ignore_cols = [
                             "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
-                            "Market Mood", "Hidden Gem Signal", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
+                            "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
                         ]
                         df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
                         cols = unique_existing_columns(ignore_cols, df_ignore_display)
