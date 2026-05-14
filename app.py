@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V12.2 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V12.2"
+st.set_page_config(page_title="SwingHunter V12.3 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V12.3"
 
 # ==========================================================
 # 1. Security
@@ -267,6 +267,29 @@ def evaluate_ticker(
         atr = float(calc_atr_from_series(h, l, c, 14).iloc[-1])
         atr_pct = atr / last_p * 100 if last_p else np.nan
         rsi = float(calc_rsi(c, 14).iloc[-1])
+
+        # V12.3: energy / squeeze metrics.
+        atr_5 = float(calc_atr_from_series(h, l, c, 5).iloc[-1])
+        atr_20 = float(calc_atr_from_series(h, l, c, 20).iloc[-1])
+        atr_pinch = atr_5 / atr_20 if atr_20 > 0 else 1.0
+
+        try:
+            v_15 = v.iloc[-15:]
+            c_15 = c.iloc[-15:]
+            c_15_prev = c.iloc[-16:-1].values
+            up_vol = v_15[c_15 > c_15_prev].sum()
+            down_vol = v_15[c_15 < c_15_prev].sum()
+            var_15 = up_vol / down_vol if down_vol > 0 else 1.0
+        except Exception:
+            var_15 = 1.0
+
+        try:
+            inside_day = bool((h.iloc[-2] <= h.iloc[-3]) and (l.iloc[-2] >= l.iloc[-3]))
+            tight_day = bool(((h.iloc[-2] - l.iloc[-2]) / c.iloc[-2] * 100) < (atr_pct * 0.70))
+        except Exception:
+            inside_day = False
+            tight_day = False
+
         run20 = (last_p / c.iloc[-21] - 1) * 100
         rs5, rs20 = relative_strength_vs(qqq_slice, c)
         regime = market_regime(qqq_slice)
@@ -899,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 FOMO Exhaustion Filter
+# 7A. V12 Coiled Breakout Cheat Entry
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -913,6 +936,8 @@ def calc_breakout_score(
     rs5,
     rs20,
     setup_type,
+    atr_pinch=1.0,
+    var_15=1.0,
 ):
     """
     Practical score: not academic momentum score.
@@ -981,9 +1006,22 @@ def calc_breakout_score(
     if rs5 < -5 and rs20 < -5:
         score -= 10
 
+    # V12.3 Energy / squeeze additions
+    if atr_pinch < 0.65:
+        score += 10
+    elif atr_pinch < 0.75:
+        score += 5
+
+    if var_15 > 1.5:
+        score += 5
+    elif var_15 > 1.25:
+        score += 2
+
     # Route
     if setup_type == "Momentum Breakout":
         score += 6
+    elif setup_type == "Coiled Breakout":
+        score += 10
     elif setup_type == "Base Breakout":
         score += 4
     elif setup_type == "Turnaround Watch":
@@ -1043,7 +1081,7 @@ def classify_action_quality(setup_type, rs5, rs20, atr_pct, risk_pct, run20, rsi
         exhaustion_notes.append("סטופ רחב")
     if run20 >= 15:
         exhaustion_notes.append("כבר רצה מעל 15% ב-20 יום")
-    if trigger_dist < 0.30:
+    if trigger_dist < 0.30 and setup_type != "Coiled Breakout":
         exhaustion_notes.append("הטריגר צמוד מדי למחיר — חשש FOMO")
 
     high_exhaustion = (
@@ -1085,6 +1123,7 @@ def evaluate_breakout_action_plan(
     c: pd.Series,
     h: pd.Series,
     l: pd.Series,
+    v: pd.Series,
     qqq_slice: pd.Series,
     params: StrategyParams,
 ):
@@ -1125,6 +1164,10 @@ def evaluate_breakout_action_plan(
         "ATR%": np.nan,
         "20D Run": np.nan,
         "10D Range %": np.nan,
+        "ATR Pinch": np.nan,
+        "VAR 15d": np.nan,
+        "Inside Day": False,
+        "Tight Day": False,
         "Run Zone": "",
         "Pullback Watch Price": np.nan,
         "Pullback Deep Price": np.nan,
@@ -1188,6 +1231,10 @@ def evaluate_breakout_action_plan(
             "ATR%": round(atr_pct, 1) if np.isfinite(atr_pct) else np.nan,
             "20D Run": round(run20, 1),
             "10D Range %": round(range10, 1) if np.isfinite(range10) else np.nan,
+            "ATR Pinch": round(atr_pinch, 2),
+            "VAR 15d": round(var_15, 2),
+            "Inside Day": inside_day,
+            "Tight Day": tight_day,
             "Run Zone": run_zone,
             "Regime": regime,
         })
@@ -1221,22 +1268,46 @@ def evaluate_breakout_action_plan(
         base_breakout = price_recovered and run20 <= 25 and 40 <= rsi <= 72 and (rs5 > 0 or rs_improving)
         turnaround_watch = (rs20 < 0) and rs_improving and last_p >= ema21 * 0.97 and 32 <= rsi <= 65
 
-        if momentum_leader:
+        # V12.3: Coiled Breakout / Cheat Entry route.
+        # Uses last CLOSED candle only, not the still-forming intraday candle.
+        is_coiled = (
+            atr_pinch < 0.75
+            and np.isfinite(range10)
+            and range10 <= 12
+            and (inside_day or tight_day)
+            and last_p > sma200
+            and last_p >= ema21 * 0.98
+            and run20 <= 25
+            and trigger_dist <= 2.5
+            and trigger_dist >= -0.25
+        )
+
+        if is_coiled:
+            setup_type = "Coiled Breakout"
+            entry = round(float(h.iloc[-2]) * 1.002, 2)
+            raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
+        elif momentum_leader:
             setup_type = "Momentum Breakout"
+            entry = breakout_trigger
+            raw_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
         elif base_breakout:
             setup_type = "Base Breakout"
+            entry = breakout_trigger
+            raw_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
         elif turnaround_watch:
             setup_type = "Turnaround Watch"
+            entry = breakout_trigger
+            raw_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
         else:
             setup_type = "Weak / Ignore"
+            entry = breakout_trigger
+            raw_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
 
         base["Setup Type"] = setup_type
 
         # Initial stop and target plan: relevant only when we have a buy trigger.
         # Stop = the tighter of technical protection and max risk cap, but not above entry.
-        entry = breakout_trigger
-        technical_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
-        stop = min(technical_stop, entry * 0.995)
+        stop = min(raw_stop, entry * 0.995)
         stop = round(stop, 2)
         risk_pct = (entry - stop) / entry * 100
         target8 = round(entry * 1.08, 2)
@@ -1244,8 +1315,40 @@ def evaluate_breakout_action_plan(
         rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
         rr12 = 12 / risk_pct if risk_pct > 0 else np.nan
 
+        # V12.3: Strict R/R enforcement for Cheat Entry.
+        # If the early entry is not actually tight, revert to standard trigger.
+        if setup_type == "Coiled Breakout" and (risk_pct > 5.5 or rr8 < 1.5):
+            if momentum_leader:
+                setup_type = "Momentum Breakout"
+            elif base_breakout:
+                setup_type = "Base Breakout"
+            else:
+                setup_type = "Turnaround Watch"
+
+            entry = breakout_trigger
+            raw_stop = max(entry - 2.2 * atr, ema21 * 0.995, entry * (1 - 0.08))
+            stop = min(raw_stop, entry * 0.995)
+            stop = round(stop, 2)
+            risk_pct = (entry - stop) / entry * 100
+            target8 = round(entry * 1.08, 2)
+            target12 = round(entry * 1.12, 2)
+            rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
+            rr12 = 12 / risk_pct if risk_pct > 0 else np.nan
+
+        base["Setup Type"] = setup_type
+        trigger_dist = (entry / last_p - 1) * 100
+
+        base.update({
+            "Buy Trigger": round(entry, 2),
+            "Next Action Price": round(entry, 2),
+            "Distance to Trigger %": round(trigger_dist, 2),
+            "Distance to Action %": round(trigger_dist, 2),
+            "Breakout Watch Price": round(entry, 2),
+        })
+
         score = calc_breakout_score(
-            last_p, trigger_dist, risk_pct, rr8, atr_pct, rsi, run20, range10, rs5, rs20, setup_type
+            last_p, trigger_dist, risk_pct, rr8, atr_pct, rsi, run20, range10,
+            rs5, rs20, setup_type, atr_pinch, var_15
         )
 
         base.update({
@@ -1360,8 +1463,8 @@ def get_today_breakout_action_plan(params: StrategyParams):
             continue
 
         try:
-            c, h, l = df["Close"].dropna(), df["High"].dropna(), df["Low"].dropna()
-            row = evaluate_breakout_action_plan(ticker, c, h, l, qqq_slice, params)
+            c, h, l, v = df["Close"].dropna(), df["High"].dropna(), df["Low"].dropna(), df["Volume"].dropna()
+            row = evaluate_breakout_action_plan(ticker, c, h, l, v, qqq_slice, params)
 
             state = row.get("State", "IGNORE")
             if state == "BUY SETUP READY":
@@ -1683,6 +1786,10 @@ def get_column_config():
         "What We Need": st.column_config.TextColumn("מה חסר", help="הדבר הבא שצריך לקרות כדי שהמניה תהפוך לפעולה."),
         "Why": st.column_config.TextColumn("למה", help="הסבר קצר למה המניה במצב הנוכחי."),
         "10D Range %": st.column_config.NumberColumn("טווח 10 ימים", help="טווח תנודת המחיר ב-10 ימי המסחר האחרונים. נמוך יותר יכול להעיד על התבססות.", format="%.1f%%"),
+        "ATR Pinch": st.column_config.NumberColumn("ATR Pinch", help="ATR5 חלקי ATR20. נמוך מ-0.75 מצביע על התכווצות תנודתיות; נמוך מ-0.65 הוא קפיץ חזק.", format="%.2f"),
+        "VAR 15d": st.column_config.NumberColumn("VAR 15d", help="יחס ווליום בימי עלייה מול ימי ירידה ב-15 ימים. מעל 1.25/1.5 מרמז על איסוף יחסי.", format="%.2f"),
+        "Inside Day": st.column_config.CheckboxColumn("Inside Day", help="הנר היומי הסגור האחרון היה בתוך הטווח של היום שלפניו."),
+        "Tight Day": st.column_config.CheckboxColumn("Tight Day", help="הנר היומי הסגור האחרון היה צר ביחס לתנודתיות הרגילה."),
         "SMA200": st.column_config.NumberColumn("SMA200", help="ממוצע נע פשוט ל-200 ימי מסחר. משמש כסינון מגמה ראשי.", format="%.2f"),
         "Account": st.column_config.TextColumn("סוג תיק", help="אמת או וירטואלי. מאפשר לסכם בנפרד השקעות אמיתיות וסימולציות."),
         "Open PnL $": st.column_config.NumberColumn("רווח פתוח $", help="רווח/הפסד על פוזיציות שעדיין פתוחות.", format="$%.2f"),
@@ -1954,9 +2061,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.2 — FOMO Exhaustion Filter</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.3 — Coiled Breakout Cheat Entry</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה FOMO Exhaustion Filter: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה Coiled Breakout Cheat Entry: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2005,7 +2112,7 @@ else:
                 action_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
                     "Stop", "Risk %", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
-                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "10D Range %"
+                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
                 ]
 
                 if not df_action.empty:
@@ -2020,7 +2127,7 @@ else:
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
                     "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
                     "Pullback Deep Price", "Stop", "Risk %", "Target 8%", "Target 12%",
-                    "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "Run Zone", "10D Range %"
+                    "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
                 ]
 
                 if not df_watch.empty:
@@ -2034,7 +2141,7 @@ else:
                     if not df_ignore.empty:
                         ignore_cols = [
                             "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
-                            "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "Run Zone"
+                            "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
                         ]
                         df_ignore = dedupe_dataframe_columns(df_ignore)
                         cols = unique_existing_columns(ignore_cols, df_ignore)
