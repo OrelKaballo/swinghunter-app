@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V12.4 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V12.4"
+st.set_page_config(page_title="SwingHunter V12.5 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V12.5"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Quick Burst Mode
+# 7A. V12 Quick Burst Quality Gate
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -1139,10 +1139,16 @@ def evaluate_quick_burst_candidate(
     tight_day,
 ):
     """
-    V12.4: short-term burst setup.
+    V12.5: stricter short-term burst setup.
     Goal: +4.5% quick move, not a full 8%-12% swing.
-    Requires close trigger, short stop, acceptable exhaustion risk, and some fuel.
-    Returns: (is_ready, quick_stop, quick_risk_pct, quick_rr, notes)
+
+    The previous V12.4 was too permissive and let in slow/heavy names.
+    READY now requires:
+    - very close trigger
+    - real fuel, not only a weak VAR blip
+    - quick stop and Quick RR >= 1.50
+    - no obvious exhaustion
+    - not after a 15%+ run unless it is a true Coiled setup
     """
     notes = []
 
@@ -1153,28 +1159,48 @@ def evaluate_quick_burst_candidate(
         return False, np.nan, np.nan, np.nan, "טריגר רחוק מדי ל-Quick Burst"
 
     # Avoid obvious exhaustion.
-    if rsi >= 80:
-        return False, np.nan, np.nan, np.nan, "RSI מעל 80 — חם מדי לטרייד קצר"
-    if run20 > 20:
-        return False, np.nan, np.nan, np.nan, "ריצה 20 יום גבוהה מדי לטרייד קצר"
+    if rsi >= 78:
+        return False, np.nan, np.nan, np.nan, "RSI גבוה מדי לטרייד קצר"
     if range10 > 14:
         return False, np.nan, np.nan, np.nan, "טווח 10 ימים רחב מדי / לא מספיק נקי"
 
-    # Need movement potential.
-    has_fuel = (
-        setup_type in ["Momentum Breakout", "Coiled Breakout"]
-        or rs5 >= 2.0
-        or rs20 >= 1.0
-        or atr_pct >= 2.5
-        or var_15 >= 1.25
-    )
-    if not has_fuel:
+    # Quick Burst is supposed to be before the burst, not after a big move.
+    if run20 > 15 and setup_type != "Coiled Breakout":
+        return False, np.nan, np.nan, np.nan, "ריצה מעל 15% ב-20 יום — לא מתאים ל-Quick Burst רגיל"
+
+    if run20 > 22:
+        return False, np.nan, np.nan, np.nan, "ריצה 20 יום גבוהה מדי לטרייד קצר"
+
+    # Require real fuel. VAR alone is not enough for slow/heavy names.
+    fuel_signals = 0
+    if setup_type in ["Momentum Breakout", "Coiled Breakout"]:
+        fuel_signals += 1
+    if rs5 >= 2.0:
+        fuel_signals += 1
+    if rs20 >= 1.0:
+        fuel_signals += 1
+    if atr_pct >= 2.5:
+        fuel_signals += 1
+    if var_15 >= 1.35:
+        fuel_signals += 1
+    if atr_pinch <= 0.85:
+        fuel_signals += 1
+    if inside_day or tight_day:
+        fuel_signals += 1
+
+    # Base Breakout needs extra proof because many heavy names look technically close but don't move fast.
+    if setup_type == "Base Breakout" and fuel_signals < 3:
+        return False, np.nan, np.nan, np.nan, "Base Breakout בלי מספיק דלק ל-Quick Burst"
+
+    if setup_type != "Base Breakout" and fuel_signals < 2:
         return False, np.nan, np.nan, np.nan, "אין מספיק דלק ל-4.5% מהיר"
 
-    # Prefer contraction/clean base, but don't require perfect squeeze.
+    if atr_pct < 2.5 and setup_type != "Coiled Breakout":
+        return False, np.nan, np.nan, np.nan, "ATR% נמוך מדי לטרייד קצר"
+
     if atr_pinch <= 0.85:
         notes.append("ATR Pinch חיובי")
-    if var_15 >= 1.25:
+    if var_15 >= 1.35:
         notes.append("VAR חיובי")
     if inside_day or tight_day:
         notes.append("נר סגור דחוס")
@@ -1191,12 +1217,16 @@ def evaluate_quick_burst_candidate(
     quick_risk_pct = (entry - quick_stop) / entry * 100
     quick_rr = 4.5 / quick_risk_pct if quick_risk_pct > 0 else np.nan
 
+    if quick_risk_pct > 3.2 and setup_type != "Coiled Breakout":
+        return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ מהיר רחב מדי ({quick_risk_pct:.1f}%)"
     if quick_risk_pct > 3.6:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ קצר עדיין רחב מדי ({quick_risk_pct:.1f}%)"
-    if quick_rr < 1.25:
-        return False, quick_stop, quick_risk_pct, quick_rr, f"Quick RR נמוך מדי ({quick_rr:.2f})"
 
-    notes.append("Quick Burst מתאים: טריגר קרוב + סטופ קצר + יעד 4.5%")
+    # This is the key V12.5 tightening.
+    if quick_rr < 1.50:
+        return False, quick_stop, quick_risk_pct, quick_rr, f"Quick RR נמוך מדי ({quick_rr:.2f}); נדרש לפחות 1.50"
+
+    notes.append("Quick Burst איכותי: טריגר קרוב + סטופ קצר + יעד 4.5%")
     return True, quick_stop, quick_risk_pct, quick_rr, " | ".join(notes)
 
 
@@ -1917,7 +1947,7 @@ def get_column_config():
         "Quick Target 4.5%": st.column_config.NumberColumn("יעד מהיר 4.5%", help="יעד קצר ומהיר למסלול Quick Burst.", format="%.2f"),
         "Quick Stop": st.column_config.NumberColumn("סטופ מהיר", help="סטופ קצר למסלול Quick Burst.", format="%.2f"),
         "Quick Risk %": st.column_config.NumberColumn("סיכון מהיר %", help="מרחק באחוזים מהטריגר לסטופ המהיר.", format="%.2f%%"),
-        "Quick RR": st.column_config.NumberColumn("Quick R/R", help="יחס יעד 4.5% מול הסיכון המהיר. רצוי מעל 1.25-1.5.", format="%.2f"),
+        "Quick RR": st.column_config.NumberColumn("Quick R/R", help="יחס יעד 4.5% מול הסיכון המהיר. ב-V12.5 נדרש לפחות 1.50 כדי להיות QUICK BURST READY.", format="%.2f"),
         "Quick Holding Plan": st.column_config.TextColumn("תכנית החזקה מהירה", help="תיאור ניהול הפוזיציה למסלול Quick Burst."),
         "Target 8%": st.column_config.NumberColumn("יעד 8%", help="יעד רווח ראשון לבדיקה — 8% מעל טריגר הקנייה.", format="%.2f"),
         "Target 12%": st.column_config.NumberColumn("יעד 12%", help="יעד רווח שני לבדיקה — 12% מעל טריגר הקנייה.", format="%.2f"),
@@ -2205,9 +2235,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.4 — Quick Burst Mode</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.5 — Quick Burst Quality Gate</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה Quick Burst Mode: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה Quick Burst Quality Gate: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
