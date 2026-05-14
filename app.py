@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V12.0 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V12.0"
+st.set_page_config(page_title="SwingHunter V12.1 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V12.1"
 
 # ==========================================================
 # 1. Security
@@ -899,7 +899,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Breakout Action Engine
+# 7A. V12 Action Quality Gate
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -992,6 +992,58 @@ def calc_breakout_score(
     return round(score, 2)
 
 
+
+def classify_action_quality(setup_type, rs5, rs20, atr_pct, risk_pct, run20, rsi, rr8, score):
+    """
+    V12.1 gate:
+    BUY SETUP READY should mean: close breakout + enough fuel for 8%-12%.
+    Heavy/slow/weak-RS names move to NEAR READY / WATCH instead of action.
+    """
+    notes = []
+
+    has_fuel = (
+        setup_type == "Momentum Breakout"
+        or rs20 > 0
+        or rs5 >= 3
+        or atr_pct >= 2.5
+    )
+
+    if not has_fuel:
+        notes.append("חסר דלק: RS/ATR לא מספיקים ליעד 8%-12%")
+
+    if setup_type == "Base Breakout" and rs20 < -5 and rs5 < 3:
+        notes.append("Base Breakout עם RS20 שלילי מדי")
+
+    if atr_pct < 2.5:
+        notes.append("ATR% נמוך לפקודת ביצוע")
+
+    if risk_pct > 7.5:
+        notes.append("סיכון רחב יחסית")
+
+    if run20 > 25:
+        notes.append("ריצה קודמת גבוהה יחסית")
+
+    if rsi > 74:
+        notes.append("RSI גבוה / מעט מתוחה")
+
+    if rr8 < 1.0:
+        notes.append("R/R ל-8% נמוך מ-1")
+
+    # READY only if the setup has fuel and no major blocking notes.
+    major_block = any(
+        key in " ".join(notes)
+        for key in ["חסר דלק", "RS20 שלילי מדי", "ATR% נמוך", "R/R"]
+    )
+
+    if score >= 70 and has_fuel and not major_block and risk_pct <= 7.5:
+        return "READY", " | ".join(notes) or "סטאפ איכותי: טריגר קרוב + דלק מספיק"
+    if score >= 60 and has_fuel and not major_block:
+        return "READY", " | ".join(notes) or "סטאפ פעולה סביר"
+    if score >= 50:
+        return "NEAR READY", " | ".join(notes) or "קרוב, אבל חסרה איכות פעולה"
+    return "WATCH", " | ".join(notes) or "לא מספיק איכותי לפעולה"
+
+
 def evaluate_breakout_action_plan(
     ticker: str,
     c: pd.Series,
@@ -1024,6 +1076,8 @@ def evaluate_breakout_action_plan(
         "RR 8%": np.nan,
         "RR 12%": np.nan,
         "Breakout Score": np.nan,
+        "Action Quality": "",
+        "Quality Notes": "",
         "What We Need": "",
         "Why": "",
         "EMA21": np.nan,
@@ -1208,11 +1262,34 @@ def evaluate_breakout_action_plan(
             )
             return base
 
-        # Actionable.
+        # V12.1: Action quality gate.
+        quality, quality_notes = classify_action_quality(
+            setup_type, rs5, rs20, atr_pct, risk_pct, run20, rsi, rr8, score
+        )
+
+        base["Action Quality"] = quality
+        base["Quality Notes"] = quality_notes
+
+        if quality == "READY":
+            base.update(
+                State="BUY SETUP READY",
+                **{"What We Need": "Place stop-limit order"},
+                Why="טריגר קרוב + איכות פעולה מספקת ליעד 8%-12%"
+            )
+            return base
+
+        if quality == "NEAR READY":
+            base.update(
+                State="NEAR READY",
+                **{"What We Need": "עוד אישור מומנטום / RS / ATR לפני פקודה"},
+                Why=f"פריצה קרובה אבל לא מספיק חזקה לפקודת ביצוע: {quality_notes}"
+            )
+            return base
+
         base.update(
-            State="BUY SETUP READY",
-            **{"What We Need": "Place stop-limit order"},
-            Why="טריגר קרוב, סיכון סביר, יעד 8%-12% נותן יחס סביר"
+            State="WAIT FOR BREAKOUT",
+            **{"What We Need": "שיפור איכות לפני פעולה"},
+            Why=f"טריגר קרוב אך איכות פעולה נמוכה: {quality_notes}"
         )
         return base
 
@@ -1243,7 +1320,7 @@ def get_today_breakout_action_plan(params: StrategyParams):
             state = row.get("State", "IGNORE")
             if state == "BUY SETUP READY":
                 action_rows.append(row)
-            elif state in ["WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH"]:
+            elif state in ["NEAR READY", "WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH"]:
                 watch_rows.append(row)
             else:
                 ignore_rows.append(row)
@@ -1257,7 +1334,14 @@ def get_today_breakout_action_plan(params: StrategyParams):
     if not df_action.empty:
         df_action = df_action.sort_values("Breakout Score", ascending=False)
     if not df_watch.empty:
-        df_watch = df_watch.sort_values(["State", "Breakout Score"], ascending=[True, False], na_position="last")
+        state_rank = {
+            "NEAR READY": 0,
+            "WAIT FOR BREAKOUT": 1,
+            "WAIT FOR PULLBACK": 2,
+            "TURNAROUND WATCH": 3,
+        }
+        df_watch["_StateRank"] = df_watch["State"].map(state_rank).fillna(9)
+        df_watch = df_watch.sort_values(["_StateRank", "Breakout Score"], ascending=[True, False], na_position="last").drop(columns=["_StateRank"])
     if not df_ignore.empty:
         df_ignore = df_ignore.sort_values(["State", "Ticker"], ascending=[True, True])
 
@@ -1546,6 +1630,8 @@ def get_column_config():
         "RR 8%": st.column_config.NumberColumn("R/R ל-8%", help="יחס סיכון/סיכוי עד יעד 8%. מעל 1 עדיף.", format="%.2f"),
         "RR 12%": st.column_config.NumberColumn("R/R ל-12%", help="יחס סיכון/סיכוי עד יעד 12%. מעל 1.5 עדיף.", format="%.2f"),
         "Breakout Score": st.column_config.NumberColumn("ציון פריצה", help="ציון פרקטי שמעדיף טריגר קרוב, סיכון סביר, ATR מתאים, בסיס מתכווץ ושיפור כוח יחסי.", format="%.2f"),
+        "Action Quality": st.column_config.TextColumn("איכות פעולה", help="READY = פקודה אפשרית; NEAR READY = קרוב אבל חסר דלק/איכות; WATCH = מעקב בלבד."),
+        "Quality Notes": st.column_config.TextColumn("הערות איכות", help="מה מונע מהמניה להיות פקודת ביצוע איכותית: RS, ATR, סיכון, R/R וכו׳."),
         "What We Need": st.column_config.TextColumn("מה חסר", help="הדבר הבא שצריך לקרות כדי שהמניה תהפוך לפעולה."),
         "Why": st.column_config.TextColumn("למה", help="הסבר קצר למה המניה במצב הנוכחי."),
         "10D Range %": st.column_config.NumberColumn("טווח 10 ימים", help="טווח תנודת המחיר ב-10 ימי המסחר האחרונים. נמוך יותר יכול להעיד על התבססות.", format="%.1f%%"),
@@ -1820,9 +1906,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.0 — Breakout Action Engine</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.1 — Action Quality Gate</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.0 הופכת את המסך היומי מתחקיר אקדמי לתוכנית פעולה: פקודות מוכנות, מועמדות למעקב עם מחיר פעולה הבא, ו-Ignore מוסתר. "
+        "V12.1 מוסיפה Action Quality Gate: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -1863,7 +1949,7 @@ else:
                 total = len(df_action) + len(df_watch) + len(df_ignore)
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("פקודות מוכנות", len(df_action))
-                k2.metric("מועמדות למעקב", len(df_watch))
+                k2.metric("Near Ready / מעקב", len(df_watch))
                 k3.metric("מוסתר / Ignore", len(df_ignore))
                 k4.metric("סה״כ נבדקו", total)
 
@@ -1871,7 +1957,7 @@ else:
                 action_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
                     "Stop", "Risk %", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
-                    "Breakout Score", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "10D Range %"
+                    "Breakout Score", "Action Quality", "Quality Notes", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "10D Range %"
                 ]
 
                 if not df_action.empty:
@@ -1881,10 +1967,10 @@ else:
                 else:
                     st.warning("אין כרגע פקודת קנייה מספיק נקייה. זה בסדר — לא חייבים לסחור כל יום.")
 
-                st.markdown("## 👀 מועמדות למעקב עם מחיר פעולה הבא")
+                st.markdown("## 👀 Near Ready / מועמדות למעקב עם מחיר פעולה הבא")
                 watch_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
-                    "What We Need", "Why", "Breakout Score", "Buy Trigger", "Pullback Watch Price",
+                    "What We Need", "Why", "Breakout Score", "Action Quality", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
                     "Pullback Deep Price", "Stop", "Risk %", "Target 8%", "Target 12%",
                     "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "20D Run", "Run Zone", "10D Range %"
                 ]
