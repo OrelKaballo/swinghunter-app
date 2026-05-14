@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V12.3.1 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V12.3.1"
+st.set_page_config(page_title="SwingHunter V12.4 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V12.4"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Coiled Breakout Hotfix
+# 7A. V12 Quick Burst Mode
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -1118,6 +1118,88 @@ def classify_action_quality(setup_type, rs5, rs20, atr_pct, risk_pct, run20, rsi
     return "WATCH", " | ".join(notes + exhaustion_notes) or "לא מספיק איכותי לפעולה", "MEDIUM" if exhaustion_notes else "LOW"
 
 
+
+def evaluate_quick_burst_candidate(
+    setup_type,
+    last_p,
+    entry,
+    ema8,
+    ema21,
+    atr,
+    atr_pct,
+    rsi,
+    run20,
+    range10,
+    rs5,
+    rs20,
+    trigger_dist,
+    atr_pinch,
+    var_15,
+    inside_day,
+    tight_day,
+):
+    """
+    V12.4: short-term burst setup.
+    Goal: +4.5% quick move, not a full 8%-12% swing.
+    Requires close trigger, short stop, acceptable exhaustion risk, and some fuel.
+    Returns: (is_ready, quick_stop, quick_risk_pct, quick_rr, notes)
+    """
+    notes = []
+
+    # Must be very close to trigger, but not already missed.
+    if trigger_dist < -0.25:
+        return False, np.nan, np.nan, np.nan, "הטריגר כבר ברח"
+    if trigger_dist > 1.8:
+        return False, np.nan, np.nan, np.nan, "טריגר רחוק מדי ל-Quick Burst"
+
+    # Avoid obvious exhaustion.
+    if rsi >= 80:
+        return False, np.nan, np.nan, np.nan, "RSI מעל 80 — חם מדי לטרייד קצר"
+    if run20 > 20:
+        return False, np.nan, np.nan, np.nan, "ריצה 20 יום גבוהה מדי לטרייד קצר"
+    if range10 > 14:
+        return False, np.nan, np.nan, np.nan, "טווח 10 ימים רחב מדי / לא מספיק נקי"
+
+    # Need movement potential.
+    has_fuel = (
+        setup_type in ["Momentum Breakout", "Coiled Breakout"]
+        or rs5 >= 2.0
+        or rs20 >= 1.0
+        or atr_pct >= 2.5
+        or var_15 >= 1.25
+    )
+    if not has_fuel:
+        return False, np.nan, np.nan, np.nan, "אין מספיק דלק ל-4.5% מהיר"
+
+    # Prefer contraction/clean base, but don't require perfect squeeze.
+    if atr_pinch <= 0.85:
+        notes.append("ATR Pinch חיובי")
+    if var_15 >= 1.25:
+        notes.append("VAR חיובי")
+    if inside_day or tight_day:
+        notes.append("נר סגור דחוס")
+
+    # Tight stop for quick trade.
+    technical_stop = max(
+        entry - 1.15 * atr,
+        ema8 * 0.992,
+        ema21 * 0.995,
+        entry * 0.965,  # max ~3.5%
+    )
+    quick_stop = min(technical_stop, entry * 0.995)
+    quick_stop = round(float(quick_stop), 2)
+    quick_risk_pct = (entry - quick_stop) / entry * 100
+    quick_rr = 4.5 / quick_risk_pct if quick_risk_pct > 0 else np.nan
+
+    if quick_risk_pct > 3.6:
+        return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ קצר עדיין רחב מדי ({quick_risk_pct:.1f}%)"
+    if quick_rr < 1.25:
+        return False, quick_stop, quick_risk_pct, quick_rr, f"Quick RR נמוך מדי ({quick_rr:.2f})"
+
+    notes.append("Quick Burst מתאים: טריגר קרוב + סטופ קצר + יעד 4.5%")
+    return True, quick_stop, quick_risk_pct, quick_rr, " | ".join(notes)
+
+
 def evaluate_breakout_action_plan(
     ticker: str,
     c: pd.Series,
@@ -1146,7 +1228,12 @@ def evaluate_breakout_action_plan(
         "Distance to Action %": np.nan,
         "Stop": np.nan,
         "Risk %": np.nan,
+        "Trade Mode": "",
         "Quick Target 4.5%": np.nan,
+        "Quick Stop": np.nan,
+        "Quick Risk %": np.nan,
+        "Quick RR": np.nan,
+        "Quick Holding Plan": "",
         "Target 8%": np.nan,
         "Target 12%": np.nan,
         "RR 8%": np.nan,
@@ -1336,6 +1423,7 @@ def evaluate_breakout_action_plan(
         stop = round(stop, 2)
         risk_pct = (entry - stop) / entry * 100
         quick_target = round(entry * 1.045, 2)
+        quick_target = round(entry * 1.045, 2)
         target8 = round(entry * 1.08, 2)
         target12 = round(entry * 1.12, 2)
         rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
@@ -1357,6 +1445,7 @@ def evaluate_breakout_action_plan(
             stop = round(stop, 2)
             risk_pct = (entry - stop) / entry * 100
             quick_target = round(entry * 1.045, 2)
+            quick_target = round(entry * 1.045, 2)
             target8 = round(entry * 1.08, 2)
             target12 = round(entry * 1.12, 2)
             rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
@@ -1373,6 +1462,11 @@ def evaluate_breakout_action_plan(
             "Breakout Watch Price": round(entry, 2),
         })
 
+        quick_ready, quick_stop, quick_risk_pct, quick_rr, quick_notes = evaluate_quick_burst_candidate(
+            setup_type, last_p, entry, ema8, ema21, atr, atr_pct, rsi, run20, range10,
+            rs5, rs20, trigger_dist, atr_pinch, var_15, inside_day, tight_day
+        )
+
         score = calc_breakout_score(
             last_p, trigger_dist, risk_pct, rr8, atr_pct, rsi, run20, range10,
             rs5, rs20, setup_type, atr_pinch, var_15
@@ -1381,7 +1475,12 @@ def evaluate_breakout_action_plan(
         base.update({
             "Stop": stop,
             "Risk %": round(risk_pct, 2),
+            "Trade Mode": "SWING",
             "Quick Target 4.5%": quick_target,
+            "Quick Stop": round(quick_stop, 2) if np.isfinite(quick_stop) else np.nan,
+            "Quick Risk %": round(quick_risk_pct, 2) if np.isfinite(quick_risk_pct) else np.nan,
+            "Quick RR": round(quick_rr, 2) if np.isfinite(quick_rr) else np.nan,
+            "Quick Holding Plan": "1-5 trading days / take profit near +4.5%" if quick_ready else quick_notes,
             "Target 8%": target8,
             "Target 12%": target12,
             "RR 8%": round(rr8, 2) if np.isfinite(rr8) else np.nan,
@@ -1420,13 +1519,24 @@ def evaluate_breakout_action_plan(
             )
             return base
 
-        # Score threshold for action.
+        # V12.4: Quick Burst can be actionable with a different objective.
+        if quick_ready and score >= 52:
+            base.update(
+                State="QUICK BURST READY",
+                **{"What We Need": "Place quick stop-limit order"},
+                **{"Trade Mode": "QUICK BURST"},
+                Why=f"יעד קצר 4.5% עם סטופ קצר ו-R/R סביר: {quick_notes}",
+                **{"Action Quality": "READY", "Quality Notes": quick_notes, "Exhaustion Risk": "LOW"}
+            )
+            return base
+
+        # Score threshold for swing action.
         if score < 60:
             state = "TURNAROUND WATCH" if setup_type == "Turnaround Watch" else "WAIT FOR BREAKOUT"
             base.update(
                 State=state,
-                **{"What We Need": "Higher readiness score"},
-                Why=f"קרובה לטריגר, אבל איכות הסטאפ עדיין לא מספקת ({score:.1f})"
+                **{"What We Need": "Higher readiness score / or Quick Burst conditions"},
+                Why=f"קרובה לטריגר, אבל איכות הסטאפ עדיין לא מספקת ({score:.1f}); Quick: {quick_notes}"
             )
             return base
 
@@ -1495,7 +1605,7 @@ def get_today_breakout_action_plan(params: StrategyParams):
             row = evaluate_breakout_action_plan(ticker, c, h, l, v, qqq_slice, params)
 
             state = row.get("State", "IGNORE")
-            if state == "BUY SETUP READY":
+            if state in ["BUY SETUP READY", "QUICK BURST READY"]:
                 action_rows.append(row)
             elif state in ["NEAR READY", "MISSED / WAIT RESET", "WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH"]:
                 watch_rows.append(row)
@@ -1803,7 +1913,12 @@ def get_column_config():
         "Distance to Trigger %": st.column_config.NumberColumn("מרחק לטריגר %", help="כמה המחיר הנוכחי רחוק מטריגר הקנייה.", format="%.2f%%"),
         "Next Action Price": st.column_config.NumberColumn("מחיר פעולה הבא", help="המחיר הבא שרלוונטי לפעולה: טריגר פריצה או מחיר פולבק.", format="%.2f"),
         "Distance to Action %": st.column_config.NumberColumn("מרחק לפעולה %", help="כמה המחיר הנוכחי רחוק ממחיר הפעולה הבא.", format="%.2f%%"),
-        "Quick Target 4.5%": st.column_config.NumberColumn("יעד מהיר 4.5%", help="יעד קצר ומהיר לבדיקה בלבד. לא משנה עדיין את מנוע היציאה.", format="%.2f"),
+        "Trade Mode": st.column_config.TextColumn("מצב טרייד", help="SWING = יעד 8%-12%; QUICK BURST = יעד קצר 4.5% עם סטופ קצר."),
+        "Quick Target 4.5%": st.column_config.NumberColumn("יעד מהיר 4.5%", help="יעד קצר ומהיר למסלול Quick Burst.", format="%.2f"),
+        "Quick Stop": st.column_config.NumberColumn("סטופ מהיר", help="סטופ קצר למסלול Quick Burst.", format="%.2f"),
+        "Quick Risk %": st.column_config.NumberColumn("סיכון מהיר %", help="מרחק באחוזים מהטריגר לסטופ המהיר.", format="%.2f%%"),
+        "Quick RR": st.column_config.NumberColumn("Quick R/R", help="יחס יעד 4.5% מול הסיכון המהיר. רצוי מעל 1.25-1.5.", format="%.2f"),
+        "Quick Holding Plan": st.column_config.TextColumn("תכנית החזקה מהירה", help="תיאור ניהול הפוזיציה למסלול Quick Burst."),
         "Target 8%": st.column_config.NumberColumn("יעד 8%", help="יעד רווח ראשון לבדיקה — 8% מעל טריגר הקנייה.", format="%.2f"),
         "Target 12%": st.column_config.NumberColumn("יעד 12%", help="יעד רווח שני לבדיקה — 12% מעל טריגר הקנייה.", format="%.2f"),
         "RR 8%": st.column_config.NumberColumn("R/R ל-8%", help="יחס סיכון/סיכוי עד יעד 8%. מעל 1 עדיף.", format="%.2f"),
@@ -2090,9 +2205,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.3.1 — Coiled Breakout Hotfix</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.4 — Quick Burst Mode</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה Coiled Breakout Hotfix: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה Quick Burst Mode: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2139,8 +2254,8 @@ else:
 
                 st.markdown("## ✅ פקודות לביצוע / כמעט לביצוע")
                 action_cols = [
-                    "Ticker", "State", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
-                    "Stop", "Risk %", "Quick Target 4.5%", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
+                    "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
+                    "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
                     "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
                 ]
 
@@ -2155,7 +2270,7 @@ else:
                 watch_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
                     "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
-                    "Pullback Deep Price", "Stop", "Risk %", "Quick Target 4.5%", "Target 8%", "Target 12%",
+                    "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
                     "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
                 ]
 
