@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.3 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.3"
+st.set_page_config(page_title="SwingHunter V13.4 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.4"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 AVWAP Purge Hidden Gems
+# 7A. V12 Modern Mobile Dashboard
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -2636,6 +2636,243 @@ def reset_profile_ledger(profile: str):
 
 
 
+
+# ==========================================================
+# 8C. Modern mobile-friendly UI helpers
+# ==========================================================
+def _fmt_value(value, suffix="", digits=2, empty="—"):
+    try:
+        if pd.isna(value):
+            return empty
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return f"{float(value):,.{digits}f}{suffix}"
+        return str(value) if str(value).strip() else empty
+    except Exception:
+        return empty
+
+
+def _row_get(row, key, default="—"):
+    try:
+        val = row.get(key, default)
+        if pd.isna(val):
+            return default
+        return val
+    except Exception:
+        return default
+
+
+def inject_modern_css():
+    st.markdown(
+        """
+        <style>
+        .main .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+            max-width: 1320px;
+        }
+
+        div[data-testid="stMetric"] {
+            background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(250,250,250,0.68));
+            border: 1px solid rgba(49, 51, 63, 0.12);
+            padding: 12px 14px;
+            border-radius: 18px;
+            box-shadow: 0 6px 22px rgba(0,0,0,0.04);
+        }
+
+        .sh-card {
+            border: 1px solid rgba(49, 51, 63, 0.13);
+            border-radius: 22px;
+            padding: 16px 16px 14px 16px;
+            margin: 10px 0 16px 0;
+            background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(248,249,252,0.86));
+            box-shadow: 0 8px 26px rgba(0,0,0,0.055);
+        }
+
+        .sh-card-action {
+            border-right: 7px solid #1f7a4d;
+        }
+
+        .sh-card-watch {
+            border-right: 7px solid #b7791f;
+        }
+
+        .sh-card-missed {
+            border-right: 7px solid #6b7280;
+        }
+
+        .sh-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+
+        .sh-ticker {
+            font-weight: 800;
+            font-size: 1.35rem;
+            letter-spacing: 0.3px;
+        }
+
+        .sh-pill {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 999px;
+            background: rgba(31, 122, 77, 0.10);
+            color: #1f7a4d;
+            border: 1px solid rgba(31, 122, 77, 0.18);
+            font-size: 0.82rem;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .sh-pill-watch {
+            background: rgba(183, 121, 31, 0.10);
+            color: #8a5a12;
+            border-color: rgba(183, 121, 31, 0.18);
+        }
+
+        .sh-pill-danger {
+            background: rgba(180, 35, 24, 0.09);
+            color: #9f1d14;
+            border-color: rgba(180, 35, 24, 0.18);
+        }
+
+        .sh-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 9px;
+            margin: 8px 0 12px 0;
+        }
+
+        .sh-box {
+            background: rgba(255,255,255,0.72);
+            border: 1px solid rgba(49, 51, 63, 0.10);
+            border-radius: 14px;
+            padding: 9px 10px;
+            min-height: 58px;
+        }
+
+        .sh-label {
+            font-size: 0.74rem;
+            opacity: 0.68;
+            margin-bottom: 3px;
+        }
+
+        .sh-value {
+            font-size: 1.00rem;
+            font-weight: 750;
+            white-space: nowrap;
+        }
+
+        .sh-reason {
+            font-size: 0.92rem;
+            line-height: 1.45;
+            opacity: 0.88;
+            background: rgba(244,245,247,0.85);
+            border-radius: 14px;
+            padding: 9px 11px;
+            margin-top: 8px;
+        }
+
+        @media (max-width: 820px) {
+            .main .block-container {
+                padding-left: 0.85rem;
+                padding-right: 0.85rem;
+            }
+            .sh-card {
+                padding: 14px;
+                border-radius: 18px;
+            }
+            .sh-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .sh-ticker {
+                font-size: 1.22rem;
+            }
+            .sh-value {
+                font-size: 0.95rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_signal_card(row, mode="action"):
+    ticker = _row_get(row, "Ticker")
+    state = _row_get(row, "State")
+    setup = _row_get(row, "Setup Type")
+    trade_mode = _row_get(row, "Trade Mode")
+    current = _fmt_value(_row_get(row, "Current"), digits=2)
+    trigger = _fmt_value(_row_get(row, "Buy Trigger"), digits=2)
+    distance = _fmt_value(_row_get(row, "Distance to Trigger %"), suffix="%", digits=2)
+    stop = _fmt_value(_row_get(row, "Stop"), digits=2)
+    risk = _fmt_value(_row_get(row, "Risk %"), suffix="%", digits=2)
+    quick_target = _fmt_value(_row_get(row, "Quick Target 4.5%"), digits=2)
+    target8 = _fmt_value(_row_get(row, "Target 8%"), digits=2)
+    target12 = _fmt_value(_row_get(row, "Target 12%"), digits=2)
+    rr8 = _fmt_value(_row_get(row, "RR 8%"), digits=2)
+    score = _fmt_value(_row_get(row, "Breakout Score"), digits=1)
+    mood = _row_get(row, "Market Mood")
+    gem = _row_get(row, "Hidden Gem Signal")
+    why = _row_get(row, "Why")
+    need = _row_get(row, "What We Need")
+
+    card_class = "sh-card-action" if mode == "action" else ("sh-card-missed" if "ברח" in str(state) else "sh-card-watch")
+    pill_class = "sh-pill" if mode == "action" else ("sh-pill-danger" if "ברח" in str(state) else "sh-pill-watch")
+
+    main_target_label = "יעד מהיר" if "מהיר" in str(state) or "4.5" in str(trade_mode) else "יעד 8%"
+    main_target = quick_target if main_target_label == "יעד מהיר" else target8
+
+    html = f"""
+    <div class="sh-card {card_class}">
+        <div class="sh-header">
+            <div>
+                <div class="sh-ticker">{ticker}</div>
+                <div style="opacity:0.72;font-size:0.88rem;">{setup} · {trade_mode}</div>
+            </div>
+            <div class="{pill_class}">{state}</div>
+        </div>
+
+        <div class="sh-grid">
+            <div class="sh-box"><div class="sh-label">מחיר עכשיו</div><div class="sh-value">{current}</div></div>
+            <div class="sh-box"><div class="sh-label">טריגר כניסה</div><div class="sh-value">{trigger}</div></div>
+            <div class="sh-box"><div class="sh-label">מרחק לכניסה</div><div class="sh-value">{distance}</div></div>
+            <div class="sh-box"><div class="sh-label">{main_target_label}</div><div class="sh-value">{main_target}</div></div>
+            <div class="sh-box"><div class="sh-label">סטופ</div><div class="sh-value">{stop}</div></div>
+            <div class="sh-box"><div class="sh-label">סיכון</div><div class="sh-value">{risk}</div></div>
+            <div class="sh-box"><div class="sh-label">R/R ל-8%</div><div class="sh-value">{rr8}</div></div>
+            <div class="sh-box"><div class="sh-label">ציון</div><div class="sh-value">{score}</div></div>
+        </div>
+
+        <div class="sh-reason">
+            <b>למה:</b> {why}<br>
+            <b>מה חסר/מה עושים:</b> {need}<br>
+            <b>הלך רוח:</b> {mood} · <b>Hidden Gem:</b> {gem}
+        </div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_cards_section(df: pd.DataFrame, title: str, mode="watch", max_cards=12):
+    st.markdown(title)
+    if df is None or df.empty:
+        st.info("אין נתונים להצגה.")
+        return
+
+    shown = df.head(max_cards).copy()
+    for _, row in shown.iterrows():
+        render_signal_card(row, mode=mode)
+
+    if len(df) > max_cards:
+        st.caption(f"מציג {max_cards} מתוך {len(df)}. פתח את הטבלה המלאה למטה.")
+
+
+
 # ==========================================================
 # 9. UI
 # ==========================================================
@@ -2653,9 +2890,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.3 — AVWAP Purge Hidden Gems</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.4 — Modern Mobile Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה AVWAP Purge Hidden Gems: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה Modern Mobile Dashboard: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2683,68 +2920,116 @@ else:
     tab_daily, tab_portfolio, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "🔬 בדיקת בנק"])
 
     with tab_daily:
-        st.markdown("## 🚀 V12 — תוכנית פעולה לפריצות קרובות")
+        inject_modern_css()
+
+        st.markdown("## 🚀 דשבורד יומי — תוכנית פעולה")
         st.caption(
-            "המטרה כאן היא לא להציג 80 מניות עם חורים, אלא תוכנית פעולה: "
-            "מה מוכן לקנייה, מה מחכה לפריצה, מה מחכה לפולבק ומה לא מעניין כרגע."
+            "מסך ראשי נקי: קודם כרטיסי פעולה ברורים, ורק אחר כך טבלאות מלאות למי שרוצה לחפור. "
+            "במובייל הכרטיסים נשברים לשתי עמודות ונוחים יותר מטבלה רחבה."
         )
 
-        if st.button("⚡ הפק תוכנית פעולה להיום", use_container_width=True):
+        ctop1, ctop2 = st.columns([2, 1])
+        with ctop1:
+            run_btn = st.button("⚡ הפק תוכנית פעולה להיום", use_container_width=True)
+        with ctop2:
+            show_tables_first = st.toggle("מצב טבלאות בלבד", value=False, help="מיועד לעבודה בדסקטופ כשרוצים לראות את כל העמודות בבת אחת.")
+
+        if run_btn:
             with st.spinner("סורק מניות ומחשב תוכניות פעולה פרקטיות..."):
                 df_action, df_watch, df_ignore = get_today_breakout_action_plan(params)
 
-                # V12.6: Hebrew display/export labels.
+                # Hebrew display/export labels.
                 df_action_display = localize_daily_display(df_action)
                 df_watch_display = localize_daily_display(df_watch)
                 df_ignore_display = localize_daily_display(df_ignore)
 
                 total = len(df_action) + len(df_watch) + len(df_ignore)
+                near_ready_count = 0
+                pullback_count = 0
+                missed_count = 0
+                if not df_watch_display.empty and "State" in df_watch_display.columns:
+                    near_ready_count = int(df_watch_display["State"].astype(str).str.contains("כמעט מוכן", na=False).sum())
+                    pullback_count = int(df_watch_display["State"].astype(str).str.contains("תיקון", na=False).sum())
+                    missed_count = int(df_watch_display["State"].astype(str).str.contains("ברח", na=False).sum())
+
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("פקודות מוכנות", len(df_action))
-                k2.metric("Near Ready / מעקב", len(df_watch))
-                k3.metric("מוסתר / Ignore", len(df_ignore))
+                k2.metric("כמעט מוכן", near_ready_count)
+                k3.metric("להמתין לתיקון", pullback_count)
                 k4.metric("סה״כ נבדקו", total)
 
-                st.markdown("## ✅ פקודות לביצוע / כמעט לביצוע")
+                if not df_action_display.empty:
+                    tickers = ", ".join(df_action_display["Ticker"].astype(str).head(8).tolist())
+                    st.success(f"יש {len(df_action_display)} פקודות פעולה: {tickers}")
+                else:
+                    st.warning("אין כרגע פקודת קנייה נקייה. זה לא כישלון — המודל פשוט לא מצא כניסה מספיק איכותית.")
+
                 action_cols = [
                     "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
                     "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
-                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
+                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal",
+                    "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
+                    "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
+                    "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
                 ]
 
-                if not df_action_display.empty:
-                    df_action_display = dedupe_dataframe_columns(df_action_display)
-                    cols = unique_existing_columns(action_cols, df_action_display)
-                    st.dataframe(df_action_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
-                else:
-                    st.warning("אין כרגע פקודת קנייה מספיק נקייה. זה בסדר — לא חייבים לסחור כל יום.")
-
-                st.markdown("## 👀 Near Ready / מועמדות למעקב עם מחיר פעולה הבא")
                 watch_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
-                    "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
-                    "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
-                    "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
+                    "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger",
+                    "Pullback Watch Price", "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %",
+                    "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
+                    "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
+                    "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
+                    "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
                 ]
 
-                if not df_watch_display.empty:
-                    df_watch_display = dedupe_dataframe_columns(df_watch_display)
-                    cols = unique_existing_columns(watch_cols, df_watch_display)
-                    st.dataframe(df_watch_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
-                else:
-                    st.info("אין מועמדות מעקב כרגע.")
+                ignore_cols = [
+                    "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
+                    "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
+                    "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
+                    "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
+                ]
 
-                with st.expander("🧹 Ignore / מניות לא רלוונטיות כרגע"):
+                if not show_tables_first:
+                    render_cards_section(df_action_display, "## ✅ פקודות פעולה", mode="action", max_cards=8)
+
+                    # Show the most useful watch items first: near ready / missed / breakout, not all ignore noise.
+                    if not df_watch_display.empty:
+                        st.markdown("## 👀 מועמדות למעקב")
+                        watch_focus = df_watch_display.copy()
+                        for _, row in watch_focus.head(12).iterrows():
+                            mode = "missed" if "ברח" in str(row.get("State", "")) else "watch"
+                            render_signal_card(row, mode=mode)
+                        if len(watch_focus) > 12:
+                            st.caption(f"מציג 12 מתוך {len(watch_focus)} מועמדות. הטבלה המלאה למטה.")
+                    else:
+                        st.info("אין מועמדות מעקב כרגע.")
+
+                st.markdown("## 📊 טבלאות מלאות")
+
+                with st.expander("✅ פקודות פעולה — טבלה מלאה", expanded=show_tables_first):
+                    if not df_action_display.empty:
+                        df_action_display = dedupe_dataframe_columns(df_action_display)
+                        cols = unique_existing_columns(action_cols, df_action_display)
+                        st.dataframe(df_action_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                    else:
+                        st.write("אין פקודות פעולה.")
+
+                with st.expander("👀 מועמדות למעקב — טבלה מלאה", expanded=show_tables_first):
+                    if not df_watch_display.empty:
+                        df_watch_display = dedupe_dataframe_columns(df_watch_display)
+                        cols = unique_existing_columns(watch_cols, df_watch_display)
+                        st.dataframe(df_watch_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                    else:
+                        st.write("אין מועמדות מעקב.")
+
+                with st.expander("🧹 לא רלוונטי כרגע / Ignore"):
                     if not df_ignore_display.empty:
-                        ignore_cols = [
-                            "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
-                            "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
-                        ]
                         df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
                         cols = unique_existing_columns(ignore_cols, df_ignore_display)
                         st.dataframe(df_ignore_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                     else:
-                        st.write("אין מניות ב-Ignore.")
+                        st.write("אין מניות לא רלוונטיות.")
 
                 combined_radar = pd.concat([df_watch_display, df_ignore_display], ignore_index=True) if not df_watch_display.empty or not df_ignore_display.empty else pd.DataFrame()
 
