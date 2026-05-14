@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V12.5 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V12.5"
+st.set_page_config(page_title="SwingHunter V13.1 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.1"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Quick Burst Quality Gate
+# 7A. V12 Hidden Gems Liquidity Engine
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -938,6 +938,8 @@ def calc_breakout_score(
     setup_type,
     atr_pinch=1.0,
     var_15=1.0,
+    absorption_ratio=0.0,
+    is_void_above=False,
 ):
     """
     Practical score: not academic momentum score.
@@ -1017,9 +1019,21 @@ def calc_breakout_score(
     elif var_15 > 1.25:
         score += 2
 
+    if absorption_ratio >= 2.0:
+        score += 8
+    elif absorption_ratio >= 1.5:
+        score += 3
+
+    if is_void_above:
+        score += 6
+
     # Route
     if setup_type == "Momentum Breakout":
         score += 6
+    elif setup_type == "Void Squeeze":
+        score += 18
+    elif setup_type == "Squeeze Burst":
+        score += 14
     elif setup_type == "Coiled Breakout":
         score += 10
     elif setup_type == "Base Breakout":
@@ -1137,6 +1151,7 @@ def evaluate_quick_burst_candidate(
     var_15,
     inside_day,
     tight_day,
+    day_change_pct,
 ):
     """
     V12.5: stricter short-term burst setup.
@@ -1158,6 +1173,10 @@ def evaluate_quick_burst_candidate(
     if trigger_dist > 1.8:
         return False, np.nan, np.nan, np.nan, "טריגר רחוק מדי ל-Quick Burst"
 
+    # Do not chase a stock that already moved hard today.
+    if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+        return False, np.nan, np.nan, np.nan, f"המניה כבר עלתה היום {day_change_pct:.1f}% — לא רודפים"
+
     # Avoid obvious exhaustion.
     if rsi >= 78:
         return False, np.nan, np.nan, np.nan, "RSI גבוה מדי לטרייד קצר"
@@ -1165,7 +1184,7 @@ def evaluate_quick_burst_candidate(
         return False, np.nan, np.nan, np.nan, "טווח 10 ימים רחב מדי / לא מספיק נקי"
 
     # Quick Burst is supposed to be before the burst, not after a big move.
-    if run20 > 15 and setup_type != "Coiled Breakout":
+    if run20 > 15 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, "ריצה מעל 15% ב-20 יום — לא מתאים ל-Quick Burst רגיל"
 
     if run20 > 22:
@@ -1173,7 +1192,7 @@ def evaluate_quick_burst_candidate(
 
     # Require real fuel. VAR alone is not enough for slow/heavy names.
     fuel_signals = 0
-    if setup_type in ["Momentum Breakout", "Coiled Breakout"]:
+    if setup_type in ["Momentum Breakout", "Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
         fuel_signals += 1
     if rs5 >= 2.0:
         fuel_signals += 1
@@ -1195,7 +1214,7 @@ def evaluate_quick_burst_candidate(
     if setup_type != "Base Breakout" and fuel_signals < 2:
         return False, np.nan, np.nan, np.nan, "אין מספיק דלק ל-4.5% מהיר"
 
-    if atr_pct < 2.5 and setup_type != "Coiled Breakout":
+    if atr_pct < 2.5 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, "ATR% נמוך מדי לטרייד קצר"
 
     if atr_pinch <= 0.85:
@@ -1217,7 +1236,7 @@ def evaluate_quick_burst_candidate(
     quick_risk_pct = (entry - quick_stop) / entry * 100
     quick_rr = 4.5 / quick_risk_pct if quick_risk_pct > 0 else np.nan
 
-    if quick_risk_pct > 3.2 and setup_type != "Coiled Breakout":
+    if quick_risk_pct > 3.2 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ מהיר רחב מדי ({quick_risk_pct:.1f}%)"
     if quick_risk_pct > 3.6:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ קצר עדיין רחב מדי ({quick_risk_pct:.1f}%)"
@@ -1236,6 +1255,7 @@ def evaluate_breakout_action_plan(
     h: pd.Series,
     l: pd.Series,
     v: pd.Series,
+    o: pd.Series,
     qqq_slice: pd.Series,
     params: StrategyParams,
 ):
@@ -1282,6 +1302,19 @@ def evaluate_breakout_action_plan(
         "ATR%": np.nan,
         "20D Run": np.nan,
         "10D Range %": np.nan,
+        "Day Change %": np.nan,
+        "Market Mood": "",
+        "Hidden Gem Signal": "",
+        "TTM Squeeze": False,
+        "Squeeze Momentum Rising": False,
+        "Volume Dry-Up": False,
+        "Institutional Absorption": np.nan,
+        "Volume Ratio": np.nan,
+        "Range Ratio": np.nan,
+        "Liquidity Void Above": False,
+        "Void Top": np.nan,
+        "Void Bottom": np.nan,
+        "ZLEMA8": np.nan,
         "ATR Pinch": np.nan,
         "VAR 15d": np.nan,
         "Inside Day": False,
@@ -1335,6 +1368,90 @@ def evaluate_breakout_action_plan(
             inside_day = False
             tight_day = False
 
+        # V13.0: TTM-style squeeze + volume dry-up + intraday heat.
+        # Conservative: squeeze/dry-up use last CLOSED candle (-2), while current price is still used for trigger distance.
+        try:
+            sma20_series = c.rolling(20).mean()
+            std20_series = c.rolling(20).std()
+            atr20_series = calc_atr_from_series(h, l, c, 20)
+
+            bb_upper = sma20_series + (2 * std20_series)
+            bb_lower = sma20_series - (2 * std20_series)
+            kc_upper = sma20_series + (1.5 * atr20_series)
+            kc_lower = sma20_series - (1.5 * atr20_series)
+
+            squeeze_idx = -2 if len(c) > 25 else -1
+            is_squeeze_on = bool(
+                (bb_upper.iloc[squeeze_idx] < kc_upper.iloc[squeeze_idx])
+                and (bb_lower.iloc[squeeze_idx] > kc_lower.iloc[squeeze_idx])
+            )
+
+            highest20 = h.rolling(20).max()
+            lowest20 = l.rolling(20).min()
+            donchian_mid = (highest20 + lowest20) / 2
+            momentum_series = c - ((donchian_mid + sma20_series) / 2)
+            squeeze_momentum_rising = bool(momentum_series.iloc[squeeze_idx] > momentum_series.iloc[squeeze_idx - 1])
+        except Exception:
+            is_squeeze_on = False
+            squeeze_momentum_rising = False
+
+        try:
+            vol_sma50 = float(v.rolling(50).mean().iloc[-2])
+            vol_last3_avg = float(v.iloc[-4:-1].mean())  # last 3 CLOSED days
+            volume_dried_up = bool(vol_last3_avg < vol_sma50 * 0.75) if vol_sma50 > 0 else False
+        except Exception:
+            volume_dried_up = False
+
+        try:
+            day_change_pct = (last_p / float(c.iloc[-2]) - 1) * 100
+        except Exception:
+            day_change_pct = np.nan
+
+        # V13.1: Hidden Gem metrics — use last CLOSED candle to avoid intraday noise.
+        try:
+            absorption_idx = -2 if len(c) > 25 else -1
+            range_bar = float(h.iloc[absorption_idx] - l.iloc[absorption_idx])
+            avg_range20 = float(calc_atr_from_series(h, l, c, 20).iloc[absorption_idx])
+            vol_bar = float(v.iloc[absorption_idx])
+            avg_vol20 = float(v.rolling(20).mean().iloc[absorption_idx])
+            volume_ratio = vol_bar / avg_vol20 if avg_vol20 > 0 else 1.0
+            range_ratio = range_bar / avg_range20 if avg_range20 > 0 else 1.0
+            absorption_ratio = volume_ratio / range_ratio if range_ratio > 0 else 0.0
+        except Exception:
+            volume_ratio = 1.0
+            range_ratio = 1.0
+            absorption_ratio = 0.0
+
+        try:
+            period = 8
+            lag = int((period - 1) / 2)
+            compensated_close = c + (c - c.shift(lag))
+            zlema_8 = compensated_close.ewm(span=period, adjust=False).mean()
+            zlema8_now = float(zlema_8.iloc[-1])
+        except Exception:
+            zlema8_now = ema8
+
+        try:
+            past_atrs = calc_atr_from_series(h, l, c, 14)
+            is_void_above = False
+            void_top = np.nan
+            void_bottom = np.nan
+            # Search last 40 closed candles for a violent down candle above current area.
+            for j in range(max(0, len(c) - 42), len(c) - 1):
+                body = float(o.iloc[j] - c.iloc[j])
+                if body > (2.3 * float(past_atrs.iloc[j])) and float(o.iloc[j]) > last_p:
+                    bottom = float(c.iloc[j])
+                    top = float(o.iloc[j])
+                    if breakout_trigger >= bottom and breakout_trigger < top:
+                        is_void_above = True
+                        void_top = top
+                        void_bottom = bottom
+                        break
+        except Exception:
+            is_void_above = False
+            void_top = np.nan
+            void_bottom = np.nan
+
         run20 = (last_p / c.iloc[-21] - 1) * 100
         rs5, rs20 = relative_strength_vs(qqq_slice, c)
         regime = market_regime(qqq_slice)
@@ -1358,6 +1475,32 @@ def evaluate_breakout_action_plan(
         pullback_watch = round(ema8 * 1.003, 2)
         pullback_deep = round(ema21 * 1.005, 2)
 
+        if absorption_ratio >= 2.0 and is_void_above:
+            hidden_gem_signal = "ספיגה מוסדית + חלל נזילות"
+        elif absorption_ratio >= 2.0:
+            hidden_gem_signal = "ספיגה מוסדית"
+        elif is_void_above:
+            hidden_gem_signal = "חלל נזילות מעל"
+        elif zlema8_now > ema8 and last_p >= zlema8_now * 0.995:
+            hidden_gem_signal = "מעל ZLEMA8 / תגובה מהירה"
+        else:
+            hidden_gem_signal = ""
+
+        if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and rsi >= 70:
+            market_mood = "חמה היום — לא לרדוף"
+        elif absorption_ratio >= 2.0 and is_void_above:
+            market_mood = "ספיגה + ואקום מעל"
+        elif is_squeeze_on and volume_dried_up and squeeze_momentum_rising:
+            market_mood = "קפיץ דרוך"
+        elif atr_pinch < 0.75 and var_15 >= 1.25:
+            market_mood = "דחיסה עם איסוף"
+        elif rs20 > 0 and last_p > ema21:
+            market_mood = "חיובית"
+        elif rs5 < 0 and rs20 < 0:
+            market_mood = "חלשה"
+        else:
+            market_mood = "ניטרלית / מעקב"
+
         base.update({
             "Current": round(last_p, 2),
             "Buy Trigger": breakout_trigger,
@@ -1373,6 +1516,19 @@ def evaluate_breakout_action_plan(
             "ATR%": round(atr_pct, 1) if np.isfinite(atr_pct) else np.nan,
             "20D Run": round(run20, 1),
             "10D Range %": round(range10, 1) if np.isfinite(range10) else np.nan,
+            "Day Change %": round(day_change_pct, 2) if np.isfinite(day_change_pct) else np.nan,
+            "Market Mood": market_mood,
+            "Hidden Gem Signal": hidden_gem_signal,
+            "TTM Squeeze": is_squeeze_on,
+            "Squeeze Momentum Rising": squeeze_momentum_rising,
+            "Volume Dry-Up": volume_dried_up,
+            "Institutional Absorption": round(absorption_ratio, 2),
+            "Volume Ratio": round(volume_ratio, 2),
+            "Range Ratio": round(range_ratio, 2),
+            "Liquidity Void Above": is_void_above,
+            "Void Top": round(void_top, 2) if np.isfinite(void_top) else np.nan,
+            "Void Bottom": round(void_bottom, 2) if np.isfinite(void_bottom) else np.nan,
+            "ZLEMA8": round(zlema8_now, 2) if np.isfinite(zlema8_now) else np.nan,
             "ATR Pinch": round(atr_pinch, 2),
             "VAR 15d": round(var_15, 2),
             "Inside Day": inside_day,
@@ -1410,6 +1566,33 @@ def evaluate_breakout_action_plan(
         base_breakout = price_recovered and run20 <= 25 and 40 <= rsi <= 72 and (rs5 > 0 or rs_improving)
         turnaround_watch = (rs20 < 0) and rs_improving and last_p >= ema21 * 0.97 and 32 <= rsi <= 65
 
+        # V13.0: true squeeze/burst route.
+        # This is stricter than the older ATR Pinch route: squeeze + dry-up + rising momentum.
+        daily_overheated = bool(np.isfinite(day_change_pct) and day_change_pct >= 3.0)
+
+        is_void_squeeze = (
+            absorption_ratio >= 2.0
+            and is_void_above
+            and last_p > sma200
+            and last_p >= ema21 * 0.98
+            and run20 <= 25
+            and trigger_dist <= 2.5
+            and trigger_dist >= -0.25
+            and not daily_overheated
+        )
+
+        is_squeeze_burst = (
+            is_squeeze_on
+            and volume_dried_up
+            and squeeze_momentum_rising
+            and last_p > sma200
+            and last_p >= ema21 * 0.98
+            and run20 <= 25
+            and trigger_dist <= 2.5
+            and trigger_dist >= -0.25
+            and not daily_overheated
+        )
+
         # V12.3: Coiled Breakout / Cheat Entry route.
         # Uses last CLOSED candle only, not the still-forming intraday candle.
         is_coiled = (
@@ -1422,9 +1605,18 @@ def evaluate_breakout_action_plan(
             and run20 <= 25
             and trigger_dist <= 2.5
             and trigger_dist >= -0.25
+            and not daily_overheated
         )
 
-        if is_coiled:
+        if is_void_squeeze:
+            setup_type = "Void Squeeze"
+            entry = round(max(float(h.iloc[-2]), zlema8_now) * 1.002, 2)
+            raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
+        elif is_squeeze_burst:
+            setup_type = "Squeeze Burst"
+            entry = round(float(h.iloc[-2]) * 1.002, 2)
+            raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
+        elif is_coiled:
             setup_type = "Coiled Breakout"
             entry = round(float(h.iloc[-2]) * 1.002, 2)
             raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
@@ -1461,7 +1653,7 @@ def evaluate_breakout_action_plan(
 
         # V12.3: Strict R/R enforcement for Cheat Entry.
         # If the early entry is not actually tight, revert to standard trigger.
-        if setup_type == "Coiled Breakout" and (risk_pct > 5.5 or rr8 < 1.5):
+        if setup_type in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"] and (risk_pct > 5.5 or rr8 < 1.5):
             if momentum_leader:
                 setup_type = "Momentum Breakout"
             elif base_breakout:
@@ -1494,12 +1686,12 @@ def evaluate_breakout_action_plan(
 
         quick_ready, quick_stop, quick_risk_pct, quick_rr, quick_notes = evaluate_quick_burst_candidate(
             setup_type, last_p, entry, ema8, ema21, atr, atr_pct, rsi, run20, range10,
-            rs5, rs20, trigger_dist, atr_pinch, var_15, inside_day, tight_day
+            rs5, rs20, trigger_dist, atr_pinch, var_15, inside_day, tight_day, day_change_pct
         )
 
         score = calc_breakout_score(
             last_p, trigger_dist, risk_pct, rr8, atr_pct, rsi, run20, range10,
-            rs5, rs20, setup_type, atr_pinch, var_15
+            rs5, rs20, setup_type, atr_pinch, var_15, absorption_ratio, is_void_above
         )
 
         base.update({
@@ -1546,6 +1738,16 @@ def evaluate_breakout_action_plan(
                 State="WAIT FOR BREAKOUT",
                 **{"What We Need": "Tighter risk / closer base"},
                 Why=f"הטריגר קרוב, אבל הסטופ רחב מדי ({risk_pct:.1f}%)"
+            )
+            return base
+
+        # V13.0: If it already ran hard today, downgrade to watch unless it is a true squeeze burst.
+        if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and setup_type not in ["Squeeze Burst", "Void Squeeze"]:
+            base.update(
+                State="NEAR READY",
+                **{"What We Need": "Wait for pullback / fresh intraday base"},
+                Why=f"המניה כבר עלתה היום {day_change_pct:.1f}% — לא קונים באמצע נר חזק; מחכים לאיפוס/בסיס חדש",
+                **{"Action Quality": "NEAR READY", "Quality Notes": "חמה היום — לא לרדוף", "Exhaustion Risk": "HIGH"}
             )
             return base
 
@@ -1631,8 +1833,8 @@ def get_today_breakout_action_plan(params: StrategyParams):
             continue
 
         try:
-            c, h, l, v = df["Close"].dropna(), df["High"].dropna(), df["Low"].dropna(), df["Volume"].dropna()
-            row = evaluate_breakout_action_plan(ticker, c, h, l, v, qqq_slice, params)
+            c, h, l, v, o = df["Close"].dropna(), df["High"].dropna(), df["Low"].dropna(), df["Volume"].dropna(), df["Open"].dropna()
+            row = evaluate_breakout_action_plan(ticker, c, h, l, v, o, qqq_slice, params)
 
             state = row.get("State", "IGNORE")
             if state in ["BUY SETUP READY", "QUICK BURST READY"]:
@@ -1892,6 +2094,78 @@ def build_zip_report(df_equity, df_trades, ticker_summary, metrics, daily_orders
 
 
 
+
+def localize_daily_display(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    V12.6: Convert internal English strategy labels to Hebrew for display/export.
+    Numeric columns stay unchanged.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    mappings = {
+        "State": {
+            "BUY SETUP READY": "מוכן לקנייה — מהלך 8%-12%",
+            "QUICK BURST READY": "מוכן לקנייה — מהלך מהיר 4.5%",
+            "NEAR READY": "כמעט מוכן — עוד לא פקודה",
+            "MISSED / WAIT RESET": "ברח — להמתין לאיפוס",
+            "WAIT FOR BREAKOUT": "להמתין לפריצה",
+            "WAIT FOR PULLBACK": "להמתין לתיקון",
+            "TURNAROUND WATCH": "מעקב התאוששות",
+            "IGNORE": "לא רלוונטי כרגע",
+            "ERROR": "שגיאה",
+        },
+        "Setup Type": {
+            "Momentum Breakout": "פריצת מומנטום",
+            "Base Breakout": "פריצה מבסיס",
+            "Void Squeeze": "ספיגה מוסדית + חלל נזילות",
+            "Squeeze Burst": "פריצת Squeeze / קפיץ אמיתי",
+            "Coiled Breakout": "קפיץ דרוך / כניסה מוקדמת",
+            "Turnaround Watch": "מעקב התאוששות",
+            "Extended Leader": "חזקה מדי — לחכות לתיקון",
+            "Weak / Ignore": "חלשה / לא רלוונטית",
+        },
+        "Trade Mode": {
+            "SWING": "מהלך בינוני 8%-12%",
+            "QUICK BURST": "מהלך מהיר 4.5%",
+        },
+        "Action Quality": {
+            "READY": "מוכן",
+            "NEAR READY": "כמעט מוכן",
+            "WATCH": "מעקב",
+            "MISSED / WAIT RESET": "ברח — להמתין לאיפוס",
+        },
+        "Exhaustion Risk": {
+            "LOW": "נמוך",
+            "MEDIUM": "בינוני",
+            "HIGH": "גבוה",
+            "MISSED": "הטריגר ברח",
+        },
+        "Run Zone": {
+            "NORMAL": "רגיל",
+            "WARM": "חם קלות",
+            "HOT": "חם",
+            "EXTENDED": "מתוח",
+            "TOO_EXTENDED": "מתוח מדי",
+        },
+        "Regime": {
+            "BULL_STRONG": "שוק חזק",
+            "BULL_WEAK": "שוק חיובי חלש",
+            "PULLBACK": "שוק בתיקון",
+            "BEAR": "שוק שלילי",
+        },
+    }
+
+    for col, mapping in mappings.items():
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
+
+    return out
+
+
+
 def get_column_config():
     return {
         "Ticker": st.column_config.TextColumn("Ticker", help="סימול המניה בבורסה, למשל AMD או TSLA."),
@@ -1920,7 +2194,7 @@ def get_column_config():
         "ATR%": st.column_config.NumberColumn("ATR%", help="תנודתיות יומית ממוצעת כאחוז מהמחיר. עוזר להבין אם המניה זזה מספיק לסווינג.", format="%.1f%%"),
         "20D Run": st.column_config.NumberColumn("ריצה 20 יום", help="כמה המניה עלתה/ירדה ב-20 ימי המסחר האחרונים.", format="%.1f%%"),
         "Run Zone": st.column_config.TextColumn("אזור ריצה", help="NORMAL עד 15%, HOT עד 30%, EXTENDED עד 45%, TOO_EXTENDED מעל 45%. מעל 30% לא קונים פריצה אלא מחכים לפולבק."),
-        "Setup Type": st.column_config.TextColumn("סוג מסלול", help="Momentum Leader = מניה מובילה; Base Breakout = בסיס לפני פריצה; Turnaround Watch = התחלת שיפור; Weak/Ignore = כרגע לא מעניין."),
+        "Setup Type": st.column_config.TextColumn("סוג סטאפ", help="פריצת מומנטום = מניה חזקה; פריצה מבסיס = דשדוש לפני פריצה; קפיץ דרוך = דחיסה לפני שחרור; מעקב התאוששות = התחלת שיפור; חלשה/לא רלוונטית = אין פעולה."),
         "Action State": st.column_config.TextColumn("מצב פעולה", help="PLACE ORDER / WAIT FOR PULLBACK / WAIT FOR BREAKOUT / TURNAROUND WATCH / WAIT / NO TRADE."),
         "Pullback Watch Price": st.column_config.NumberColumn("מחיר מעקב לפולבק", help="אזור כניסה מעניין אם מניה חזקה מדי תתקן לכיוון EMA8. לא פקודת קנייה אוטומטית.", format="%.2f"),
         "Pullback Deep Price": st.column_config.NumberColumn("מחיר פולבק עמוק", help="אזור כניסה עמוק יותר סביב EMA21. מתאים למניות שרצו חזק מדי וצריך לחכות להן.", format="%.2f"),
@@ -1938,12 +2212,12 @@ def get_column_config():
         "Initial Stop": st.column_config.NumberColumn("סטופ התחלתי", help="הסטופ המקורי מהיום שנכנסת לעסקה.", format="%.2f"),
         "Last Date": st.column_config.TextColumn("תאריך נתון אחרון", help="תאריך יום המסחר האחרון שהנתונים מתייחסים אליו."),
         "Action": st.column_config.TextColumn("פעולה", help="HOLD = להחזיק. SELL = יציאה לפי המודל."),
-        "State": st.column_config.TextColumn("מצב", help="BUY SETUP READY / WAIT FOR BREAKOUT / WAIT FOR PULLBACK / TURNAROUND WATCH / IGNORE."),
+        "State": st.column_config.TextColumn("מצב", help="מוכן לקנייה / כמעט מוכן / להמתין לפריצה / להמתין לתיקון / לא רלוונטי. זה סיכום הפעולה המומלצת."),
         "Buy Trigger": st.column_config.NumberColumn("טריגר קנייה", help="השער שמעליו המודל מציע לשקול כניסה. בדרך כלל פריצה מעל שיא 20/50 יום.", format="%.2f"),
         "Distance to Trigger %": st.column_config.NumberColumn("מרחק לטריגר %", help="כמה המחיר הנוכחי רחוק מטריגר הקנייה.", format="%.2f%%"),
         "Next Action Price": st.column_config.NumberColumn("מחיר פעולה הבא", help="המחיר הבא שרלוונטי לפעולה: טריגר פריצה או מחיר פולבק.", format="%.2f"),
         "Distance to Action %": st.column_config.NumberColumn("מרחק לפעולה %", help="כמה המחיר הנוכחי רחוק ממחיר הפעולה הבא.", format="%.2f%%"),
-        "Trade Mode": st.column_config.TextColumn("מצב טרייד", help="SWING = יעד 8%-12%; QUICK BURST = יעד קצר 4.5% עם סטופ קצר."),
+        "Trade Mode": st.column_config.TextColumn("סוג מהלך", help="מהלך בינוני 8%-12% או מהלך מהיר 4.5%. המילה Swing הוסרה מהתצוגה כדי לא לבלבל."),
         "Quick Target 4.5%": st.column_config.NumberColumn("יעד מהיר 4.5%", help="יעד קצר ומהיר למסלול Quick Burst.", format="%.2f"),
         "Quick Stop": st.column_config.NumberColumn("סטופ מהיר", help="סטופ קצר למסלול Quick Burst.", format="%.2f"),
         "Quick Risk %": st.column_config.NumberColumn("סיכון מהיר %", help="מרחק באחוזים מהטריגר לסטופ המהיר.", format="%.2f%%"),
@@ -1954,12 +2228,25 @@ def get_column_config():
         "RR 8%": st.column_config.NumberColumn("R/R ל-8%", help="יחס סיכון/סיכוי עד יעד 8%. מעל 1 עדיף.", format="%.2f"),
         "RR 12%": st.column_config.NumberColumn("R/R ל-12%", help="יחס סיכון/סיכוי עד יעד 12%. מעל 1.5 עדיף.", format="%.2f"),
         "Breakout Score": st.column_config.NumberColumn("ציון פריצה", help="ציון פרקטי שמעדיף טריגר קרוב, סיכון סביר, ATR מתאים, בסיס מתכווץ ושיפור כוח יחסי.", format="%.2f"),
-        "Action Quality": st.column_config.TextColumn("איכות פעולה", help="READY = פקודה אפשרית; NEAR READY = קרוב אבל חסר דלק/איכות; WATCH = מעקב בלבד."),
+        "Action Quality": st.column_config.TextColumn("איכות פעולה", help="מוכן = אפשר לשקול פקודה; כמעט מוכן = קרוב אבל חסרה איכות/דלק; מעקב = לא פקודה."),
         "Quality Notes": st.column_config.TextColumn("הערות איכות", help="מה מונע מהמניה להיות פקודת ביצוע איכותית: RS, ATR, סיכון, R/R, FOMO וכו׳."),
-        "Exhaustion Risk": st.column_config.TextColumn("סיכון מימוש/FOMO", help="LOW/MEDIUM/HIGH/MISSED. מזהה מצב שבו המניה חמה מדי או שהטריגר כבר ברח."),
+        "Exhaustion Risk": st.column_config.TextColumn("סיכון מימוש/FOMO", help="נמוך/בינוני/גבוה/הטריגר ברח. מזהה מצב שבו המניה חמה מדי או שהכניסה כבר ברחה."),
         "What We Need": st.column_config.TextColumn("מה חסר", help="הדבר הבא שצריך לקרות כדי שהמניה תהפוך לפעולה."),
         "Why": st.column_config.TextColumn("למה", help="הסבר קצר למה המניה במצב הנוכחי."),
         "10D Range %": st.column_config.NumberColumn("טווח 10 ימים", help="טווח תנודת המחיר ב-10 ימי המסחר האחרונים. נמוך יותר יכול להעיד על התבססות.", format="%.1f%%"),
+        "Day Change %": st.column_config.NumberColumn("שינוי היום %", help="כמה המניה כבר זזה היום/ביום המסחר האחרון. מעל 3% בדרך כלל מפחית כניסה כדי לא לרדוף אחרי נר שכבר רץ.", format="%.2f%%"),
+        "Market Mood": st.column_config.TextColumn("הלך רוח כמותי", help="סיכום מצב טכני-כמותי: חמה היום, קפיץ דרוך, דחיסה עם איסוף, ספיגה+ואקום, חיובית, חלשה או ניטרלית. זה לא סנטימנט רשת."),
+        "Hidden Gem Signal": st.column_config.TextColumn("איתות Hidden Gem", help="סימן לאנומליה מעניינת: ספיגה מוסדית, חלל נזילות מעל, או תגובת ZLEMA. זה מסנן מחקרי, לא המלצה בפני עצמו."),
+        "TTM Squeeze": st.column_config.CheckboxColumn("TTM Squeeze", help="רצועות בולינגר בתוך ערוצי קלטנר על הנר הסגור האחרון — דחיסת תנודתיות חזקה."),
+        "Squeeze Momentum Rising": st.column_config.CheckboxColumn("מומנטום Squeeze עולה", help="מדד הכיוון של ה-Squeeze משתפר לעומת הנר הסגור הקודם."),
+        "Volume Dry-Up": st.column_config.CheckboxColumn("יובש בווליום", help="ממוצע ווליום 3 ימים סגורים נמוך לפחות 25% מממוצע 50 יום — פחות מוכרים פעילים."),
+        "Institutional Absorption": st.column_config.NumberColumn("ספיגה מוסדית", help="יחס בין ווליום חריג לבין טווח מחיר צר בנר הסגור האחרון. מעל 2 מרמז על ווליום גבוה בתוך נר צר — ספיגה אפשרית.", format="%.2f"),
+        "Volume Ratio": st.column_config.NumberColumn("יחס ווליום", help="ווליום הנר הסגור האחרון מול ממוצע 20 יום.", format="%.2f"),
+        "Range Ratio": st.column_config.NumberColumn("יחס טווח", help="טווח הנר הסגור האחרון מול ATR20. נמוך = נר צר יחסית.", format="%.2f"),
+        "Liquidity Void Above": st.column_config.CheckboxColumn("חלל נזילות מעל", help="נמצא נר אדום אלים בעבר מעל המחיר הנוכחי, שהטריגר נכנס לתוכו. מסמן פוטנציאל נתיב מהיר, אבל זה מסנן ניסיוני."),
+        "Void Top": st.column_config.NumberColumn("גבול עליון חלל", help="החלק העליון של חלל הנזילות ההיסטורי, אם זוהה.", format="%.2f"),
+        "Void Bottom": st.column_config.NumberColumn("גבול תחתון חלל", help="החלק התחתון של חלל הנזילות ההיסטורי, אם זוהה.", format="%.2f"),
+        "ZLEMA8": st.column_config.NumberColumn("ZLEMA8", help="ממוצע נע מהיר עם הפחתת שיהוי. משמש כאיתות תגובה מוקדם, לא כתחליף לסטופ.", format="%.2f"),
         "ATR Pinch": st.column_config.NumberColumn("ATR Pinch", help="ATR5 חלקי ATR20. נמוך מ-0.75 מצביע על התכווצות תנודתיות; נמוך מ-0.65 הוא קפיץ חזק.", format="%.2f"),
         "VAR 15d": st.column_config.NumberColumn("VAR 15d", help="יחס ווליום בימי עלייה מול ימי ירידה ב-15 ימים. מעל 1.25/1.5 מרמז על איסוף יחסי.", format="%.2f"),
         "Inside Day": st.column_config.CheckboxColumn("Inside Day", help="הנר היומי הסגור האחרון היה בתוך הטווח של היום שלפניו."),
@@ -2235,9 +2522,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.5 — Quick Burst Quality Gate</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.1 — Hidden Gems Liquidity Engine</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה Quick Burst Quality Gate: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה Hidden Gems Liquidity Engine: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2275,6 +2562,11 @@ else:
             with st.spinner("סורק מניות ומחשב תוכניות פעולה פרקטיות..."):
                 df_action, df_watch, df_ignore = get_today_breakout_action_plan(params)
 
+                # V12.6: Hebrew display/export labels.
+                df_action_display = localize_daily_display(df_action)
+                df_watch_display = localize_daily_display(df_watch)
+                df_ignore_display = localize_daily_display(df_ignore)
+
                 total = len(df_action) + len(df_watch) + len(df_ignore)
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("פקודות מוכנות", len(df_action))
@@ -2286,13 +2578,13 @@ else:
                 action_cols = [
                     "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
                     "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
-                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
+                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
                 ]
 
-                if not df_action.empty:
-                    df_action = dedupe_dataframe_columns(df_action)
-                    cols = unique_existing_columns(action_cols, df_action)
-                    st.dataframe(df_action[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                if not df_action_display.empty:
+                    df_action_display = dedupe_dataframe_columns(df_action_display)
+                    cols = unique_existing_columns(action_cols, df_action_display)
+                    st.dataframe(df_action_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                 else:
                     st.warning("אין כרגע פקודת קנייה מספיק נקייה. זה בסדר — לא חייבים לסחור כל יום.")
 
@@ -2301,36 +2593,36 @@ else:
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
                     "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
                     "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
-                    "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
+                    "Market Mood", "Hidden Gem Signal", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
                 ]
 
-                if not df_watch.empty:
-                    df_watch = dedupe_dataframe_columns(df_watch)
-                    cols = unique_existing_columns(watch_cols, df_watch)
-                    st.dataframe(df_watch[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                if not df_watch_display.empty:
+                    df_watch_display = dedupe_dataframe_columns(df_watch_display)
+                    cols = unique_existing_columns(watch_cols, df_watch_display)
+                    st.dataframe(df_watch_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                 else:
                     st.info("אין מועמדות מעקב כרגע.")
 
                 with st.expander("🧹 Ignore / מניות לא רלוונטיות כרגע"):
-                    if not df_ignore.empty:
+                    if not df_ignore_display.empty:
                         ignore_cols = [
                             "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
-                            "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
+                            "Market Mood", "Hidden Gem Signal", "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
                         ]
-                        df_ignore = dedupe_dataframe_columns(df_ignore)
-                        cols = unique_existing_columns(ignore_cols, df_ignore)
-                        st.dataframe(df_ignore[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                        df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
+                        cols = unique_existing_columns(ignore_cols, df_ignore_display)
+                        st.dataframe(df_ignore_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
                     else:
                         st.write("אין מניות ב-Ignore.")
 
-                combined_radar = pd.concat([df_watch, df_ignore], ignore_index=True) if not df_watch.empty or not df_ignore.empty else pd.DataFrame()
+                combined_radar = pd.concat([df_watch_display, df_ignore_display], ignore_index=True) if not df_watch_display.empty or not df_ignore_display.empty else pd.DataFrame()
 
                 zip_bytes = build_zip_report(
                     pd.DataFrame(),
                     pd.DataFrame(),
                     pd.DataFrame(),
                     {"App Version": APP_VERSION},
-                    df_action,
+                    df_action_display,
                     combined_radar
                 )
                 st.download_button(
