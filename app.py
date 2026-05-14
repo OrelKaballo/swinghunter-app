@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V12.3 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V12.3"
+st.set_page_config(page_title="SwingHunter V12.3.1 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V12.3.1"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Coiled Breakout Cheat Entry
+# 7A. V12 Coiled Breakout Hotfix
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -1146,6 +1146,7 @@ def evaluate_breakout_action_plan(
         "Distance to Action %": np.nan,
         "Stop": np.nan,
         "Risk %": np.nan,
+        "Quick Target 4.5%": np.nan,
         "Target 8%": np.nan,
         "Target 12%": np.nan,
         "RR 8%": np.nan,
@@ -1193,6 +1194,30 @@ def evaluate_breakout_action_plan(
         atr = float(calc_atr_from_series(h, l, c, 14).iloc[-1])
         atr_pct = atr / last_p * 100 if last_p else np.nan
         rsi = float(calc_rsi(c, 14).iloc[-1])
+
+        # V12.3.1 HOTFIX: these variables are required by the Coiled Breakout logic.
+        atr_5 = float(calc_atr_from_series(h, l, c, 5).iloc[-1])
+        atr_20 = float(calc_atr_from_series(h, l, c, 20).iloc[-1])
+        atr_pinch = atr_5 / atr_20 if atr_20 > 0 else 1.0
+
+        try:
+            v_15 = v.iloc[-15:]
+            c_15 = c.iloc[-15:]
+            c_15_prev = c.iloc[-16:-1].values
+            up_vol = v_15[c_15 > c_15_prev].sum()
+            down_vol = v_15[c_15 < c_15_prev].sum()
+            var_15 = up_vol / down_vol if down_vol > 0 else 1.0
+        except Exception:
+            var_15 = 1.0
+
+        try:
+            # Use the last CLOSED daily candle, not the still-forming current candle.
+            inside_day = bool((h.iloc[-2] <= h.iloc[-3]) and (l.iloc[-2] >= l.iloc[-3]))
+            tight_day = bool(((h.iloc[-2] - l.iloc[-2]) / c.iloc[-2] * 100) < (atr_pct * 0.70))
+        except Exception:
+            inside_day = False
+            tight_day = False
+
         run20 = (last_p / c.iloc[-21] - 1) * 100
         rs5, rs20 = relative_strength_vs(qqq_slice, c)
         regime = market_regime(qqq_slice)
@@ -1310,6 +1335,7 @@ def evaluate_breakout_action_plan(
         stop = min(raw_stop, entry * 0.995)
         stop = round(stop, 2)
         risk_pct = (entry - stop) / entry * 100
+        quick_target = round(entry * 1.045, 2)
         target8 = round(entry * 1.08, 2)
         target12 = round(entry * 1.12, 2)
         rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
@@ -1330,6 +1356,7 @@ def evaluate_breakout_action_plan(
             stop = min(raw_stop, entry * 0.995)
             stop = round(stop, 2)
             risk_pct = (entry - stop) / entry * 100
+            quick_target = round(entry * 1.045, 2)
             target8 = round(entry * 1.08, 2)
             target12 = round(entry * 1.12, 2)
             rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
@@ -1354,6 +1381,7 @@ def evaluate_breakout_action_plan(
         base.update({
             "Stop": stop,
             "Risk %": round(risk_pct, 2),
+            "Quick Target 4.5%": quick_target,
             "Target 8%": target8,
             "Target 12%": target12,
             "RR 8%": round(rr8, 2) if np.isfinite(rr8) else np.nan,
@@ -1775,6 +1803,7 @@ def get_column_config():
         "Distance to Trigger %": st.column_config.NumberColumn("מרחק לטריגר %", help="כמה המחיר הנוכחי רחוק מטריגר הקנייה.", format="%.2f%%"),
         "Next Action Price": st.column_config.NumberColumn("מחיר פעולה הבא", help="המחיר הבא שרלוונטי לפעולה: טריגר פריצה או מחיר פולבק.", format="%.2f"),
         "Distance to Action %": st.column_config.NumberColumn("מרחק לפעולה %", help="כמה המחיר הנוכחי רחוק ממחיר הפעולה הבא.", format="%.2f%%"),
+        "Quick Target 4.5%": st.column_config.NumberColumn("יעד מהיר 4.5%", help="יעד קצר ומהיר לבדיקה בלבד. לא משנה עדיין את מנוע היציאה.", format="%.2f"),
         "Target 8%": st.column_config.NumberColumn("יעד 8%", help="יעד רווח ראשון לבדיקה — 8% מעל טריגר הקנייה.", format="%.2f"),
         "Target 12%": st.column_config.NumberColumn("יעד 12%", help="יעד רווח שני לבדיקה — 12% מעל טריגר הקנייה.", format="%.2f"),
         "RR 8%": st.column_config.NumberColumn("R/R ל-8%", help="יחס סיכון/סיכוי עד יעד 8%. מעל 1 עדיף.", format="%.2f"),
@@ -2061,9 +2090,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.3 — Coiled Breakout Cheat Entry</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V12.3.1 — Coiled Breakout Hotfix</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה Coiled Breakout Cheat Entry: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה Coiled Breakout Hotfix: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2111,7 +2140,7 @@ else:
                 st.markdown("## ✅ פקודות לביצוע / כמעט לביצוע")
                 action_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
-                    "Stop", "Risk %", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
+                    "Stop", "Risk %", "Quick Target 4.5%", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
                     "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
                 ]
 
@@ -2126,7 +2155,7 @@ else:
                 watch_cols = [
                     "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
                     "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger", "Pullback Watch Price",
-                    "Pullback Deep Price", "Stop", "Risk %", "Target 8%", "Target 12%",
+                    "Pullback Deep Price", "Stop", "Risk %", "Quick Target 4.5%", "Target 8%", "Target 12%",
                     "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
                 ]
 
