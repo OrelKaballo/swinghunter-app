@@ -13,8 +13,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.1 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.1"
+st.set_page_config(page_title="SwingHunter V13.2 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.2"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +922,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Hidden Gems Liquidity Engine
+# 7A. V12 ZLEMA Burst Hidden Gems
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -1034,6 +1034,8 @@ def calc_breakout_score(
         score += 18
     elif setup_type == "Squeeze Burst":
         score += 14
+    elif setup_type == "ZLEMA Burst":
+        score += 12
     elif setup_type == "Coiled Breakout":
         score += 10
     elif setup_type == "Base Breakout":
@@ -1174,7 +1176,7 @@ def evaluate_quick_burst_candidate(
         return False, np.nan, np.nan, np.nan, "טריגר רחוק מדי ל-Quick Burst"
 
     # Do not chase a stock that already moved hard today.
-    if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+    if np.isfinite(day_change_pct) and day_change_pct >= 3.0 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, f"המניה כבר עלתה היום {day_change_pct:.1f}% — לא רודפים"
 
     # Avoid obvious exhaustion.
@@ -1184,7 +1186,7 @@ def evaluate_quick_burst_candidate(
         return False, np.nan, np.nan, np.nan, "טווח 10 ימים רחב מדי / לא מספיק נקי"
 
     # Quick Burst is supposed to be before the burst, not after a big move.
-    if run20 > 15 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+    if run20 > 15 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, "ריצה מעל 15% ב-20 יום — לא מתאים ל-Quick Burst רגיל"
 
     if run20 > 22:
@@ -1192,7 +1194,7 @@ def evaluate_quick_burst_candidate(
 
     # Require real fuel. VAR alone is not enough for slow/heavy names.
     fuel_signals = 0
-    if setup_type in ["Momentum Breakout", "Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+    if setup_type in ["Momentum Breakout", "Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         fuel_signals += 1
     if rs5 >= 2.0:
         fuel_signals += 1
@@ -1214,7 +1216,7 @@ def evaluate_quick_burst_candidate(
     if setup_type != "Base Breakout" and fuel_signals < 2:
         return False, np.nan, np.nan, np.nan, "אין מספיק דלק ל-4.5% מהיר"
 
-    if atr_pct < 2.5 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+    if atr_pct < 2.5 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, np.nan, np.nan, np.nan, "ATR% נמוך מדי לטרייד קצר"
 
     if atr_pinch <= 0.85:
@@ -1236,7 +1238,7 @@ def evaluate_quick_burst_candidate(
     quick_risk_pct = (entry - quick_stop) / entry * 100
     quick_rr = 4.5 / quick_risk_pct if quick_risk_pct > 0 else np.nan
 
-    if quick_risk_pct > 3.2 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+    if quick_risk_pct > 3.2 and setup_type not in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"]:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ מהיר רחב מדי ({quick_risk_pct:.1f}%)"
     if quick_risk_pct > 3.6:
         return False, quick_stop, quick_risk_pct, quick_rr, f"סטופ קצר עדיין רחב מדי ({quick_risk_pct:.1f}%)"
@@ -1481,6 +1483,8 @@ def evaluate_breakout_action_plan(
             hidden_gem_signal = "ספיגה מוסדית"
         elif is_void_above:
             hidden_gem_signal = "חלל נזילות מעל"
+        elif atr_pinch < 0.75 and zlema8_now > ema8 and last_p >= zlema8_now * 0.995:
+            hidden_gem_signal = "ZLEMA Burst"
         elif zlema8_now > ema8 and last_p >= zlema8_now * 0.995:
             hidden_gem_signal = "מעל ZLEMA8 / תגובה מהירה"
         else:
@@ -1593,6 +1597,21 @@ def evaluate_breakout_action_plan(
             and not daily_overheated
         )
 
+        # V13.2: ZLEMA Burst.
+        # A lower-priority Hidden Gem than Void/Squeeze, but useful when price hugs ZLEMA8 after compression.
+        is_zlema_burst = (
+            atr_pinch < 0.75
+            and (inside_day or tight_day)
+            and zlema8_now > ema8
+            and last_p >= zlema8_now * 0.995
+            and last_p > sma200
+            and last_p >= ema21 * 0.98
+            and run20 <= 25
+            and trigger_dist <= 2.5
+            and trigger_dist >= -0.25
+            and not daily_overheated
+        )
+
         # V12.3: Coiled Breakout / Cheat Entry route.
         # Uses last CLOSED candle only, not the still-forming intraday candle.
         is_coiled = (
@@ -1615,6 +1634,10 @@ def evaluate_breakout_action_plan(
         elif is_squeeze_burst:
             setup_type = "Squeeze Burst"
             entry = round(float(h.iloc[-2]) * 1.002, 2)
+            raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
+        elif is_zlema_burst:
+            setup_type = "ZLEMA Burst"
+            entry = round(max(float(h.iloc[-2]), zlema8_now) * 1.002, 2)
             raw_stop = min(float(l.iloc[-2]) * 0.99, ema8 * 0.995)
         elif is_coiled:
             setup_type = "Coiled Breakout"
@@ -1653,7 +1676,7 @@ def evaluate_breakout_action_plan(
 
         # V12.3: Strict R/R enforcement for Cheat Entry.
         # If the early entry is not actually tight, revert to standard trigger.
-        if setup_type in ["Coiled Breakout", "Squeeze Burst", "Void Squeeze"] and (risk_pct > 5.5 or rr8 < 1.5):
+        if setup_type in ["Coiled Breakout", "Squeeze Burst", "ZLEMA Burst", "Void Squeeze"] and (risk_pct > 5.5 or rr8 < 1.5):
             if momentum_leader:
                 setup_type = "Momentum Breakout"
             elif base_breakout:
@@ -2122,6 +2145,7 @@ def localize_daily_display(df: pd.DataFrame) -> pd.DataFrame:
             "Base Breakout": "פריצה מבסיס",
             "Void Squeeze": "ספיגה מוסדית + חלל נזילות",
             "Squeeze Burst": "פריצת Squeeze / קפיץ אמיתי",
+            "ZLEMA Burst": "פריצת ZLEMA מהירה",
             "Coiled Breakout": "קפיץ דרוך / כניסה מוקדמת",
             "Turnaround Watch": "מעקב התאוששות",
             "Extended Leader": "חזקה מדי — לחכות לתיקון",
@@ -2522,9 +2546,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.1 — Hidden Gems Liquidity Engine</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.2 — ZLEMA Burst Hidden Gems</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה Hidden Gems Liquidity Engine: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה ZLEMA Burst Hidden Gems: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
