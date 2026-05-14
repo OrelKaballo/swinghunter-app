@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import BytesIO
 import zipfile
+import html
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.4 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.4"
+st.set_page_config(page_title="SwingHunter V13.4.1 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.4.1"
 
 # ==========================================================
 # 1. Security
@@ -922,7 +923,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Modern Mobile Dashboard
+# 7A. V12 HTML Card Rendering Hotfix
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -2802,60 +2803,60 @@ def inject_modern_css():
 
 
 def render_signal_card(row, mode="action"):
-    ticker = _row_get(row, "Ticker")
-    state = _row_get(row, "State")
-    setup = _row_get(row, "Setup Type")
-    trade_mode = _row_get(row, "Trade Mode")
-    current = _fmt_value(_row_get(row, "Current"), digits=2)
-    trigger = _fmt_value(_row_get(row, "Buy Trigger"), digits=2)
-    distance = _fmt_value(_row_get(row, "Distance to Trigger %"), suffix="%", digits=2)
-    stop = _fmt_value(_row_get(row, "Stop"), digits=2)
-    risk = _fmt_value(_row_get(row, "Risk %"), suffix="%", digits=2)
-    quick_target = _fmt_value(_row_get(row, "Quick Target 4.5%"), digits=2)
-    target8 = _fmt_value(_row_get(row, "Target 8%"), digits=2)
-    target12 = _fmt_value(_row_get(row, "Target 12%"), digits=2)
-    rr8 = _fmt_value(_row_get(row, "RR 8%"), digits=2)
-    score = _fmt_value(_row_get(row, "Breakout Score"), digits=1)
-    mood = _row_get(row, "Market Mood")
-    gem = _row_get(row, "Hidden Gem Signal")
-    why = _row_get(row, "Why")
-    need = _row_get(row, "What We Need")
+    """
+    V13.4.1: render cards as pure non-indented HTML.
+    Previous version had indented nested HTML, which Streamlit markdown sometimes rendered as a code block.
+    """
+    ticker = html.escape(str(_row_get(row, "Ticker")))
+    state = html.escape(str(_row_get(row, "State")))
+    setup = html.escape(str(_row_get(row, "Setup Type")))
+    trade_mode = html.escape(str(_row_get(row, "Trade Mode")))
+    current = html.escape(_fmt_value(_row_get(row, "Current"), digits=2))
+    trigger = html.escape(_fmt_value(_row_get(row, "Buy Trigger"), digits=2))
+    distance = html.escape(_fmt_value(_row_get(row, "Distance to Trigger %"), suffix="%", digits=2))
+    stop = html.escape(_fmt_value(_row_get(row, "Stop"), digits=2))
+    risk = html.escape(_fmt_value(_row_get(row, "Risk %"), suffix="%", digits=2))
+    quick_target = html.escape(_fmt_value(_row_get(row, "Quick Target 4.5%"), digits=2))
+    target8 = html.escape(_fmt_value(_row_get(row, "Target 8%"), digits=2))
+    rr8 = html.escape(_fmt_value(_row_get(row, "RR 8%"), digits=2))
+    score = html.escape(_fmt_value(_row_get(row, "Breakout Score"), digits=1))
+    mood = html.escape(str(_row_get(row, "Market Mood")))
+    gem = html.escape(str(_row_get(row, "Hidden Gem Signal")))
+    why = html.escape(str(_row_get(row, "Why")))
+    need = html.escape(str(_row_get(row, "What We Need")))
 
-    card_class = "sh-card-action" if mode == "action" else ("sh-card-missed" if "ברח" in str(state) else "sh-card-watch")
-    pill_class = "sh-pill" if mode == "action" else ("sh-pill-danger" if "ברח" in str(state) else "sh-pill-watch")
+    card_class = "sh-card-action" if mode == "action" else ("sh-card-missed" if "ברח" in state else "sh-card-watch")
+    pill_class = "sh-pill" if mode == "action" else ("sh-pill-danger" if "ברח" in state else "sh-pill-watch")
 
-    main_target_label = "יעד מהיר" if "מהיר" in str(state) or "4.5" in str(trade_mode) else "יעד 8%"
+    main_target_label = "יעד מהיר" if ("מהיר" in state or "4.5" in trade_mode) else "יעד 8%"
     main_target = quick_target if main_target_label == "יעד מהיר" else target8
 
-    html = f"""
-    <div class="sh-card {card_class}">
-        <div class="sh-header">
-            <div>
-                <div class="sh-ticker">{ticker}</div>
-                <div style="opacity:0.72;font-size:0.88rem;">{setup} · {trade_mode}</div>
-            </div>
-            <div class="{pill_class}">{state}</div>
-        </div>
+    html_card = (
+        f'<div class="sh-card {card_class}">'
+        f'<div class="sh-header">'
+        f'<div><div class="sh-ticker">{ticker}</div>'
+        f'<div style="opacity:0.72;font-size:0.88rem;">{setup} · {trade_mode}</div></div>'
+        f'<div class="{pill_class}">{state}</div>'
+        f'</div>'
+        f'<div class="sh-grid">'
+        f'<div class="sh-box"><div class="sh-label">מחיר עכשיו</div><div class="sh-value">{current}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">טריגר כניסה</div><div class="sh-value">{trigger}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">מרחק לכניסה</div><div class="sh-value">{distance}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">{main_target_label}</div><div class="sh-value">{main_target}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">סטופ</div><div class="sh-value">{stop}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">סיכון</div><div class="sh-value">{risk}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">R/R ל-8%</div><div class="sh-value">{rr8}</div></div>'
+        f'<div class="sh-box"><div class="sh-label">ציון</div><div class="sh-value">{score}</div></div>'
+        f'</div>'
+        f'<div class="sh-reason">'
+        f'<b>למה:</b> {why}<br>'
+        f'<b>מה חסר/מה עושים:</b> {need}<br>'
+        f'<b>הלך רוח:</b> {mood} · <b>Hidden Gem:</b> {gem}'
+        f'</div>'
+        f'</div>'
+    )
 
-        <div class="sh-grid">
-            <div class="sh-box"><div class="sh-label">מחיר עכשיו</div><div class="sh-value">{current}</div></div>
-            <div class="sh-box"><div class="sh-label">טריגר כניסה</div><div class="sh-value">{trigger}</div></div>
-            <div class="sh-box"><div class="sh-label">מרחק לכניסה</div><div class="sh-value">{distance}</div></div>
-            <div class="sh-box"><div class="sh-label">{main_target_label}</div><div class="sh-value">{main_target}</div></div>
-            <div class="sh-box"><div class="sh-label">סטופ</div><div class="sh-value">{stop}</div></div>
-            <div class="sh-box"><div class="sh-label">סיכון</div><div class="sh-value">{risk}</div></div>
-            <div class="sh-box"><div class="sh-label">R/R ל-8%</div><div class="sh-value">{rr8}</div></div>
-            <div class="sh-box"><div class="sh-label">ציון</div><div class="sh-value">{score}</div></div>
-        </div>
-
-        <div class="sh-reason">
-            <b>למה:</b> {why}<br>
-            <b>מה חסר/מה עושים:</b> {need}<br>
-            <b>הלך רוח:</b> {mood} · <b>Hidden Gem:</b> {gem}
-        </div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
+    st.markdown(html_card, unsafe_allow_html=True)
 
 
 def render_cards_section(df: pd.DataFrame, title: str, mode="watch", max_cards=12):
@@ -2890,9 +2891,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.4 — Modern Mobile Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.4.1 — HTML Card Rendering Hotfix</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה Modern Mobile Dashboard: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V12.1 מוסיפה HTML Card Rendering Hotfix: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
