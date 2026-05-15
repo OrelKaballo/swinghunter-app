@@ -14,8 +14,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.7 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.7"
+st.set_page_config(page_title="SwingHunter V13.8 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.8"
 
 # ==========================================================
 # 1. Security
@@ -53,6 +53,36 @@ MOMENTUM_TICKERS = {
     # V11.0 additions: semiconductor / chip-equipment momentum candidates
     'LRCX','AMAT','KLAC','TXN'
 }
+
+HEAVY_SLOW_TICKERS = {
+    # Stocks that can trend, but usually need a stricter gate for an 8%-12% move.
+    # They should not be treated like NVDA/AMD/AVGO style burst candidates.
+    'CAT','WMT','COST','MCD','HD','TGT','JNJ','UNH','LLY','NVO','PFE',
+    'JPM','BAC','GS','MS','V','MA','AXP',
+    'XOM','CVX','GE','BA','LIN','PEP',
+    'DAL','UAL','BKNG','EXPE','ABNB'
+}
+
+
+def ticker_class(ticker: str) -> str:
+    t = str(ticker).upper().strip()
+    if t in MOMENTUM_TICKERS:
+        return "מומנטום מהיר"
+    if t in HEAVY_SLOW_TICKERS:
+        return "כבד / איטי"
+    return "רגיל"
+
+
+def is_hidden_gem_setup(setup_type: str) -> bool:
+    return str(setup_type) in [
+        "Liquidity Purge",
+        "AVWAP Squeeze",
+        "Void Squeeze",
+        "Squeeze Burst",
+        "ZLEMA Burst",
+        "Coiled Breakout",
+    ]
+
 
 NOTIONAL_PER_TRADE = 1000.0
 DEFAULT_STARTING_BANK = 50000.0
@@ -305,6 +335,7 @@ def evaluate_ticker(
             run_zone = "TOO_EXTENDED"
 
         base.update({
+            "Ticker Class": ticker_class(ticker),
             "Current": round(last_p, 2),
             "Regime": regime,
             "EMA21": round(ema21, 2),
@@ -923,7 +954,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Stable View Toggle
+# 7A. V12 Heavy Stock Quality Gate
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -1895,10 +1926,30 @@ def evaluate_breakout_action_plan(
             )
             return base
 
-        # V12.1: Action quality gate.
+        # V13.8: Heavy/slow stock gate.
+        # CAT/WMT/COST/financials/energy/etc. are allowed in the radar,
+        # but they should not receive a full 8%-12% READY label after an already-large run
+        # unless there is a real Hidden Gem setup and clean risk/reward.
         quality, quality_notes, exhaustion_risk = classify_action_quality(
             setup_type, rs5, rs20, atr_pct, risk_pct, run20, rsi, rr8, score, trigger_dist, range10
         )
+
+        t_class = ticker_class(ticker)
+        if quality == "READY" and t_class == "כבד / איטי" and not is_hidden_gem_setup(setup_type):
+            heavy_reasons = []
+            if run20 >= 15:
+                heavy_reasons.append("מניה כבדה אחרי ריצה של מעל 15% ב-20 יום")
+            if risk_pct >= 6.0:
+                heavy_reasons.append("סטופ רחב מדי למניה כבדה")
+            if rr8 < 1.40:
+                heavy_reasons.append("יחס סיכון/יעד ל-8% לא מספיק מעניין")
+            if atr_pct < 2.8:
+                heavy_reasons.append("ATR% נמוך יחסית למהלך מהיר")
+
+            if heavy_reasons:
+                quality = "NEAR READY"
+                quality_notes = (quality_notes + " | " if quality_notes else "") + " | ".join(heavy_reasons)
+                exhaustion_risk = "MEDIUM"
 
         base["Action Quality"] = quality
         base["Quality Notes"] = quality_notes
@@ -2321,6 +2372,7 @@ def get_column_config():
         "20D Run": st.column_config.NumberColumn("ריצה 20 יום", help="כמה המניה עלתה/ירדה ב-20 ימי המסחר האחרונים.", format="%.1f%%"),
         "Run Zone": st.column_config.TextColumn("אזור ריצה", help="NORMAL עד 15%, HOT עד 30%, EXTENDED עד 45%, TOO_EXTENDED מעל 45%. מעל 30% לא קונים פריצה אלא מחכים לפולבק."),
         "Setup Type": st.column_config.TextColumn("סוג סטאפ", help="פריצת מומנטום = מניה חזקה; פריצה מבסיס = דשדוש לפני פריצה; קפיץ דרוך = דחיסה לפני שחרור; מעקב התאוששות = התחלת שיפור; חלשה/לא רלוונטית = אין פעולה."),
+        "Ticker Class": st.column_config.TextColumn("סוג מניה", help="מומנטום מהיר / כבד-איטי / רגיל. מניות כבדות מקבלות סינון קשוח יותר ליעד 8%-12%."),
         "Action State": st.column_config.TextColumn("מצב פעולה", help="PLACE ORDER / WAIT FOR PULLBACK / WAIT FOR BREAKOUT / TURNAROUND WATCH / WAIT / NO TRADE."),
         "Pullback Watch Price": st.column_config.NumberColumn("מחיר מעקב לפולבק", help="אזור כניסה מעניין אם מניה חזקה מדי תתקן לכיוון EMA8. לא פקודת קנייה אוטומטית.", format="%.2f"),
         "Pullback Deep Price": st.column_config.NumberColumn("מחיר פולבק עמוק", help="אזור כניסה עמוק יותר סביב EMA21. מתאים למניות שרצו חזק מדי וצריך לחכות להן.", format="%.2f"),
@@ -3142,9 +3194,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.7 — דשבורד פעולה חכם</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.8 — דשבורד פעולה חכם</h1>", unsafe_allow_html=True)
     st.info(
-        "V13.7 מתקנת את מצב הטבלאות כך שלא יאפס את התוצאות, ומצמצמת את מסך הפתיחה כדי להשאיר יותר מקום לפעולה. "
+        "V13.8 מוסיפה סינון איכות למניות כבדות: מניות כמו CAT לא יקבלו יעד 8%-12% כפקודת פעולה אם הן כבר אחרי ריצה עם סטופ רחב או יחס סיכון/יעד חלש. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -3202,7 +3254,7 @@ else:
             )
 
         action_cols = [
-            "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
+            "Ticker", "State", "Trade Mode", "Setup Type", "Ticker Class", "Current", "Buy Trigger", "Distance to Trigger %",
             "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
             "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal",
             "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
@@ -3211,7 +3263,7 @@ else:
         ]
 
         watch_cols = [
-            "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
+            "Ticker", "State", "Setup Type", "Ticker Class", "Current", "Next Action Price", "Distance to Action %",
             "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger",
             "Pullback Watch Price", "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %",
             "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
@@ -3221,7 +3273,7 @@ else:
         ]
 
         ignore_cols = [
-            "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
+            "Ticker", "State", "Setup Type", "Ticker Class", "Current", "Why", "What We Need",
             "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
             "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
             "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
