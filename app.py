@@ -14,8 +14,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.6 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.6"
+st.set_page_config(page_title="SwingHunter V13.7 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.7"
 
 # ==========================================================
 # 1. Security
@@ -923,7 +923,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 Illustrated Pro Dashboard
+# 7A. V12 Stable View Toggle
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -2905,6 +2905,25 @@ def inject_modern_css():
             margin-top: 8px;
         }
 
+
+        .sh-compact-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: rgba(255,255,255,0.88);
+            border: 1px solid rgba(49,51,63,0.10);
+            border-radius: 16px;
+            padding: 12px 14px;
+            margin: 8px 0 16px 0;
+            box-shadow: 0 6px 20px rgba(16,24,40,0.045);
+            color: #0B1748;
+        }
+
+        .sh-compact-note {
+            opacity: 0.68;
+            font-size: 0.92rem;
+        }
+
         @media (max-width: 820px) {
             .sh-hero-modern { grid-template-columns: 1fr; padding: 18px; }
             .sh-hero-copy h2 { font-size: 1.65rem; }
@@ -3123,9 +3142,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.6 — דשבורד פעולה חכם</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.7 — דשבורד פעולה חכם</h1>", unsafe_allow_html=True)
     st.info(
-        "V13.6 מוסיפה איור דשבורד פנימי ב-SVG, משפרת את כרטיסי הפעולה, ומתקנת את יציבות עריכת תיק ההשקעות. "
+        "V13.7 מתקנת את מצב הטבלאות כך שלא יאפס את התוצאות, ומצמצמת את מסך הפתיחה כדי להשאיר יותר מקום לפעולה. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -3162,22 +3181,11 @@ else:
         )
 
         st.markdown(
-            f"""
-            <div class="sh-hero-modern">
-                <div class="sh-hero-copy">
-                    <h2>🚀 דשבורד פעולה — לא עוד טבלת אקסל</h2>
-                    <p>
-                        קודם רואים פקודות נקיות, אחר כך מועמדות למעקב, ורק בסוף פותחים את כל המדדים.
-                        הגרפיקה פה לא ליופי בלבד — היא נועדה לעזור לזהות מהר אם יש טריגר, סטופ, יעד וסיבה אמיתית לפעולה.
-                    </p>
-                    <div class="sh-status-strip">
-                        <span class="sh-status-chip">🎯 טריגר ברור</span>
-                        <span class="sh-status-chip">🛑 סטופ מוגדר</span>
-                        <span class="sh-status-chip">💎 Hidden Gems</span>
-                        <span class="sh-status-chip">📱 מותאם מובייל</span>
-                    </div>
-                </div>
-                <div>{hero_market_svg()}</div>
+            """
+            <div class="sh-compact-head">
+                <span>🚀</span>
+                <b>תוכנית פעולה יומית</b>
+                <span class="sh-compact-note">פקודות נקיות, מועמדות למעקב וטבלאות מלאות לפי הצורך.</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -3185,124 +3193,144 @@ else:
 
         ctop1, ctop2 = st.columns([2, 1])
         with ctop1:
-            run_btn = st.button("⚡ הפק תוכנית פעולה להיום", use_container_width=True)
+            run_btn = st.button("⚡ הפק / רענן תוכנית פעולה להיום", use_container_width=True)
         with ctop2:
-            show_tables_first = st.toggle("מצב טבלאות בלבד", value=False, help="מיועד לעבודה בדסקטופ כשרוצים לראות את כל העמודות בבת אחת.")
+            show_tables_first = st.toggle(
+                "מצב טבלאות בלבד",
+                value=False,
+                help="מחליף רק את צורת התצוגה. לא מריץ את הסריקה מחדש ולא מוחק תוצאות."
+            )
+
+        action_cols = [
+            "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
+            "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
+            "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal",
+            "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
+            "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
+            "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
+        ]
+
+        watch_cols = [
+            "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
+            "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger",
+            "Pullback Watch Price", "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %",
+            "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
+            "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
+            "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
+            "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
+        ]
+
+        ignore_cols = [
+            "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
+            "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
+            "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
+            "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
+        ]
 
         if run_btn:
-            with st.spinner("סורק מניות ומחשב תוכניות פעולה פרקטיות..."):
+            with st.spinner("סורק מניות ומחשב תוכנית פעולה..."):
                 df_action, df_watch, df_ignore = get_today_breakout_action_plan(params)
 
-                # Hebrew display/export labels.
-                df_action_display = localize_daily_display(df_action)
-                df_watch_display = localize_daily_display(df_watch)
-                df_ignore_display = localize_daily_display(df_ignore)
+                st.session_state["daily_action_raw"] = df_action
+                st.session_state["daily_watch_raw"] = df_watch
+                st.session_state["daily_ignore_raw"] = df_ignore
+                st.session_state["daily_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                total = len(df_action) + len(df_watch) + len(df_ignore)
-                near_ready_count = 0
-                pullback_count = 0
-                missed_count = 0
-                if not df_watch_display.empty and "State" in df_watch_display.columns:
-                    near_ready_count = int(df_watch_display["State"].astype(str).str.contains("כמעט מוכן", na=False).sum())
-                    pullback_count = int(df_watch_display["State"].astype(str).str.contains("תיקון", na=False).sum())
-                    missed_count = int(df_watch_display["State"].astype(str).str.contains("ברח", na=False).sum())
+        has_daily_results = all(k in st.session_state for k in ["daily_action_raw", "daily_watch_raw", "daily_ignore_raw"])
 
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("פקודות מוכנות", len(df_action))
-                k2.metric("כמעט מוכן", near_ready_count)
-                k3.metric("להמתין לתיקון", pullback_count)
-                k4.metric("סה״כ נבדקו", total)
+        if not has_daily_results:
+            st.info("עדיין אין תוצאות בהרצה הנוכחית. לחץ על הכפתור כדי להפיק תוכנית פעולה.")
+        else:
+            df_action = st.session_state["daily_action_raw"]
+            df_watch = st.session_state["daily_watch_raw"]
+            df_ignore = st.session_state["daily_ignore_raw"]
 
-                if not df_action_display.empty:
-                    tickers = ", ".join(df_action_display["Ticker"].astype(str).head(8).tolist())
-                    st.success(f"יש {len(df_action_display)} פקודות פעולה: {tickers}")
+            # Hebrew display/export labels are calculated from saved results on every rerender.
+            # This means toggling table/card mode only changes the UI, not the scan results.
+            df_action_display = localize_daily_display(df_action)
+            df_watch_display = localize_daily_display(df_watch)
+            df_ignore_display = localize_daily_display(df_ignore)
+
+            total = len(df_action) + len(df_watch) + len(df_ignore)
+            near_ready_count = 0
+            pullback_count = 0
+            if not df_watch_display.empty and "State" in df_watch_display.columns:
+                near_ready_count = int(df_watch_display["State"].astype(str).str.contains("כמעט מוכן", na=False).sum())
+                pullback_count = int(df_watch_display["State"].astype(str).str.contains("תיקון", na=False).sum())
+
+            last_run = st.session_state.get("daily_last_run", "—")
+            st.caption(f"תוצאות אחרונות: {last_run}. שינוי מצב הטבלאות לא מריץ סריקה מחדש.")
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("פקודות מוכנות", len(df_action))
+            k2.metric("כמעט מוכן", near_ready_count)
+            k3.metric("להמתין לתיקון", pullback_count)
+            k4.metric("סה״כ נבדקו", total)
+
+            if not df_action_display.empty:
+                tickers = ", ".join(df_action_display["Ticker"].astype(str).head(8).tolist())
+                st.success(f"יש {len(df_action_display)} פקודות פעולה: {tickers}")
+            else:
+                st.warning("אין כרגע פקודת קנייה נקייה. זה לא כישלון — המודל פשוט לא מצא כניסה מספיק איכותית.")
+
+            if not show_tables_first:
+                render_cards_section(df_action_display, "## ✅ פקודות פעולה", mode="action", max_cards=8)
+
+                if not df_watch_display.empty:
+                    st.markdown("## 👀 מועמדות למעקב")
+                    watch_focus = df_watch_display.copy()
+                    for _, row in watch_focus.head(12).iterrows():
+                        mode = "missed" if "ברח" in str(row.get("State", "")) else "watch"
+                        render_signal_card(row, mode=mode)
+                    if len(watch_focus) > 12:
+                        st.caption(f"מציג 12 מתוך {len(watch_focus)} מועמדות. הטבלה המלאה למטה.")
                 else:
-                    st.warning("אין כרגע פקודת קנייה נקייה. זה לא כישלון — המודל פשוט לא מצא כניסה מספיק איכותית.")
+                    st.info("אין מועמדות מעקב כרגע.")
 
-                action_cols = [
-                    "Ticker", "State", "Trade Mode", "Setup Type", "Current", "Buy Trigger", "Distance to Trigger %",
-                    "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
-                    "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal",
-                    "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
-                    "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
-                    "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "10D Range %"
-                ]
+            st.markdown("## 📊 טבלאות מלאות")
 
-                watch_cols = [
-                    "Ticker", "State", "Setup Type", "Current", "Next Action Price", "Distance to Action %",
-                    "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger",
-                    "Pullback Watch Price", "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %",
-                    "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
-                    "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
-                    "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
-                    "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone", "10D Range %"
-                ]
+            with st.expander("✅ פקודות פעולה — טבלה מלאה", expanded=show_tables_first):
+                if not df_action_display.empty:
+                    df_action_display = dedupe_dataframe_columns(df_action_display)
+                    cols = unique_existing_columns(action_cols, df_action_display)
+                    st.dataframe(df_action_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                else:
+                    st.write("אין פקודות פעולה.")
 
-                ignore_cols = [
-                    "Ticker", "State", "Setup Type", "Current", "Why", "What We Need",
-                    "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
-                    "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
-                    "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
-                ]
+            with st.expander("👀 מועמדות למעקב — טבלה מלאה", expanded=show_tables_first):
+                if not df_watch_display.empty:
+                    df_watch_display = dedupe_dataframe_columns(df_watch_display)
+                    cols = unique_existing_columns(watch_cols, df_watch_display)
+                    st.dataframe(df_watch_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                else:
+                    st.write("אין מועמדות מעקב.")
 
-                if not show_tables_first:
-                    render_cards_section(df_action_display, "## ✅ פקודות פעולה", mode="action", max_cards=8)
+            with st.expander("🧹 לא רלוונטי כרגע / Ignore"):
+                if not df_ignore_display.empty:
+                    df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
+                    cols = unique_existing_columns(ignore_cols, df_ignore_display)
+                    st.dataframe(df_ignore_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                else:
+                    st.write("אין מניות לא רלוונטיות.")
 
-                    # Show the most useful watch items first: near ready / missed / breakout, not all ignore noise.
-                    if not df_watch_display.empty:
-                        st.markdown("## 👀 מועמדות למעקב")
-                        watch_focus = df_watch_display.copy()
-                        for _, row in watch_focus.head(12).iterrows():
-                            mode = "missed" if "ברח" in str(row.get("State", "")) else "watch"
-                            render_signal_card(row, mode=mode)
-                        if len(watch_focus) > 12:
-                            st.caption(f"מציג 12 מתוך {len(watch_focus)} מועמדות. הטבלה המלאה למטה.")
-                    else:
-                        st.info("אין מועמדות מעקב כרגע.")
+            combined_radar = pd.concat([df_watch_display, df_ignore_display], ignore_index=True) if not df_watch_display.empty or not df_ignore_display.empty else pd.DataFrame()
 
-                st.markdown("## 📊 טבלאות מלאות")
+            zip_bytes = build_zip_report(
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                {"App Version": APP_VERSION},
+                df_action_display,
+                combined_radar
+            )
+            st.download_button(
+                "⬇️ הורד ZIP יומי עם תוכנית פעולה",
+                zip_bytes,
+                file_name=f"swinghunter_{APP_VERSION}_daily_action_plan.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
 
-                with st.expander("✅ פקודות פעולה — טבלה מלאה", expanded=show_tables_first):
-                    if not df_action_display.empty:
-                        df_action_display = dedupe_dataframe_columns(df_action_display)
-                        cols = unique_existing_columns(action_cols, df_action_display)
-                        st.dataframe(df_action_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
-                    else:
-                        st.write("אין פקודות פעולה.")
-
-                with st.expander("👀 מועמדות למעקב — טבלה מלאה", expanded=show_tables_first):
-                    if not df_watch_display.empty:
-                        df_watch_display = dedupe_dataframe_columns(df_watch_display)
-                        cols = unique_existing_columns(watch_cols, df_watch_display)
-                        st.dataframe(df_watch_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
-                    else:
-                        st.write("אין מועמדות מעקב.")
-
-                with st.expander("🧹 לא רלוונטי כרגע / Ignore"):
-                    if not df_ignore_display.empty:
-                        df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
-                        cols = unique_existing_columns(ignore_cols, df_ignore_display)
-                        st.dataframe(df_ignore_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
-                    else:
-                        st.write("אין מניות לא רלוונטיות.")
-
-                combined_radar = pd.concat([df_watch_display, df_ignore_display], ignore_index=True) if not df_watch_display.empty or not df_ignore_display.empty else pd.DataFrame()
-
-                zip_bytes = build_zip_report(
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    {"App Version": APP_VERSION},
-                    df_action_display,
-                    combined_radar
-                )
-                st.download_button(
-                    "⬇️ הורד ZIP יומי עם תוכנית פעולה",
-                    zip_bytes,
-                    file_name=f"swinghunter_{APP_VERSION}_daily_action_plan.zip",
-                    mime="application/zip",
-                    use_container_width=True
-                )
 
     with tab_portfolio:
         inject_modern_css()
