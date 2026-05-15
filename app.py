@@ -14,8 +14,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.4.1 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.4.1"
+st.set_page_config(page_title="SwingHunter V13.6 - Unified Portfolio Ledger", layout="wide")
+APP_VERSION = "V13.6"
 
 # ==========================================================
 # 1. Security
@@ -923,7 +923,7 @@ def run_banked_backtest(data, months, params, starting_bank=DEFAULT_STARTING_BAN
 # ==========================================================
 
 # ==========================================================
-# 7A. V12 HTML Card Rendering Hotfix
+# 7A. V12 Illustrated Pro Dashboard
 # ==========================================================
 def calc_breakout_score(
     current,
@@ -2393,14 +2393,21 @@ def get_column_config():
 
 
 def empty_ledger():
-    return pd.DataFrame(columns=[
-        "Date", "Account", "Action", "Ticker", "Quantity", "Price", "Initial Stop", "Note"
-    ])
+    return pd.DataFrame({
+        "Date": pd.Series(dtype="string"),
+        "Account": pd.Series(dtype="string"),
+        "Action": pd.Series(dtype="string"),
+        "Ticker": pd.Series(dtype="string"),
+        "Quantity": pd.Series(dtype="float64"),
+        "Price": pd.Series(dtype="float64"),
+        "Initial Stop": pd.Series(dtype="float64"),
+        "Note": pd.Series(dtype="string"),
+    })
 
 
 def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
     required = ["Date", "Account", "Action", "Ticker", "Quantity", "Price", "Initial Stop", "Note"]
-    if df is None or df.empty:
+    if df is None or len(df) == 0:
         return empty_ledger()
 
     out = df.copy()
@@ -2408,15 +2415,20 @@ def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = "" if col in ["Date", "Account", "Action", "Ticker", "Note"] else 0.0
 
-    out = out[required]
-    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
-    out["Account"] = out["Account"].astype(str).replace({"real": "אמת", "virtual": "וירטואלי", "REAL": "אמת", "VIRTUAL": "וירטואלי"})
-    out["Action"] = out["Action"].astype(str).replace({"buy": "BUY", "sell": "SELL", "קניה": "BUY", "מכירה": "SELL"})
-    out["Action"] = out["Action"].str.upper().str.strip()
-    out["Quantity"] = pd.to_numeric(out["Quantity"], errors="coerce").fillna(0.0)
-    out["Price"] = pd.to_numeric(out["Price"], errors="coerce").fillna(0.0)
-    out["Initial Stop"] = pd.to_numeric(out["Initial Stop"], errors="coerce").fillna(0.0)
-    return out
+    out = out[required].copy()
+
+    # Force stable dtypes so Streamlit data_editor will not crash on reruns/toggles.
+    out["Date"] = out["Date"].fillna("").astype(str).str.strip()
+    out["Account"] = out["Account"].fillna("").astype(str).replace({"real": "אמת", "virtual": "וירטואלי", "REAL": "אמת", "VIRTUAL": "וירטואלי"}).str.strip()
+    out["Action"] = out["Action"].fillna("").astype(str).replace({"buy": "BUY", "sell": "SELL", "קניה": "BUY", "מכירה": "SELL"}).str.upper().str.strip()
+    out["Ticker"] = out["Ticker"].fillna("").astype(str).str.upper().str.strip()
+    out["Note"] = out["Note"].fillna("").astype(str)
+
+    out["Quantity"] = pd.to_numeric(out["Quantity"], errors="coerce").fillna(0.0).astype(float)
+    out["Price"] = pd.to_numeric(out["Price"], errors="coerce").fillna(0.0).astype(float)
+    out["Initial Stop"] = pd.to_numeric(out["Initial Stop"], errors="coerce").fillna(0.0).astype(float)
+
+    return out.reset_index(drop=True)
 
 
 def ledger_to_holdings(ledger: pd.DataFrame):
@@ -2629,6 +2641,19 @@ def save_profile_ledger(profile: str, ledger: pd.DataFrame):
     return path
 
 
+def get_ledger_column_config():
+    return {
+        "Date": st.column_config.TextColumn("Date", help="תאריך הפעולה. אם מזינים דרך הטופס הוא נרשם אוטומטית."),
+        "Account": st.column_config.SelectboxColumn("Account", options=["", "אמת", "וירטואלי"], help="אמת = פוזיציה אמיתית, וירטואלי = סימולציה."),
+        "Action": st.column_config.SelectboxColumn("Action", options=["", "BUY", "SELL"], help="BUY לקנייה, SELL למכירה."),
+        "Ticker": st.column_config.TextColumn("Ticker", help="סימול המניה, למשל NVDA או GOOGL."),
+        "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=0.01, help="כמות מניות בפעולה."),
+        "Price": st.column_config.NumberColumn("Price", min_value=0.0, step=0.01, help="מחיר הביצוע בפועל."),
+        "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01, help="סטופ התחלתי להגנה. אפשר להשאיר 0 אם לא הוגדר."),
+        "Note": st.column_config.TextColumn("Note", help="הערה חופשית — למשל סיבה לכניסה או יציאה."),
+    }
+
+
 def reset_profile_ledger(profile: str):
     path = ledger_file_path(profile)
     if path.exists():
@@ -2662,15 +2687,118 @@ def _row_get(row, key, default="—"):
         return default
 
 
+
+def hero_market_svg():
+    """Inline SVG illustration: no external image files needed."""
+    return """
+    <svg class="sh-hero-svg" viewBox="0 0 560 260" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <linearGradient id="screen" x1="120" y1="20" x2="440" y2="220" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#0B1B5E"/>
+          <stop offset="1" stop-color="#123A8C"/>
+        </linearGradient>
+        <linearGradient id="pink" x1="0" y1="0" x2="1" y2="1">
+          <stop stop-color="#FF2E63"/>
+          <stop offset="1" stop-color="#FF7A59"/>
+        </linearGradient>
+        <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+          <stop stop-color="#77A7FF"/>
+          <stop offset="1" stop-color="#B8C8FF"/>
+        </linearGradient>
+      </defs>
+      <path d="M448 47c50 20 84 78 63 126-21 47-99 62-166 60-68-2-126-21-151-64-25-43-17-110 27-139 44-29 143-3 227 17Z" fill="#ECF2FF"/>
+      <path d="M60 202h420" stroke="#DFE7F7" stroke-width="4" stroke-linecap="round"/>
+      <rect x="128" y="42" width="242" height="145" rx="18" fill="url(#screen)"/>
+      <rect x="143" y="58" width="212" height="108" rx="10" fill="#F7FAFF"/>
+      <path d="M160 140L195 114L230 126L268 86L312 104L340 70" stroke="#FF2E63" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M160 148L195 122L230 134L268 94L312 112L340 78" stroke="#9CB7FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity=".85"/>
+      <rect x="157" y="72" width="10" height="62" rx="4" fill="#D8E3FF"/>
+      <rect x="184" y="92" width="10" height="43" rx="4" fill="#D8E3FF"/>
+      <rect x="211" y="80" width="10" height="55" rx="4" fill="#D8E3FF"/>
+      <rect x="238" y="104" width="10" height="31" rx="4" fill="#D8E3FF"/>
+      <rect x="265" y="64" width="10" height="71" rx="4" fill="#D8E3FF"/>
+      <rect x="292" y="88" width="10" height="47" rx="4" fill="#D8E3FF"/>
+      <rect x="319" y="61" width="10" height="74" rx="4" fill="#D8E3FF"/>
+      <path d="M214 187h70l12 31h-94l12-31Z" fill="#AFC2F5"/>
+      <rect x="184" y="214" width="134" height="12" rx="6" fill="#102F78"/>
+      <circle cx="401" cy="173" r="49" fill="url(#pink)"/>
+      <path d="M401 124a49 49 0 0 1 49 49h-49v-49Z" fill="#0E2B75" opacity=".9"/>
+      <path d="M402 173l42 25" stroke="#fff" stroke-width="5" stroke-linecap="round" opacity=".75"/>
+      <rect x="394" y="84" width="92" height="132" rx="14" fill="#FFFFFF" stroke="#C9D7F4" stroke-width="4"/>
+      <rect x="416" y="72" width="48" height="24" rx="9" fill="#102F78"/>
+      <path d="M415 126h48M415 156h48M415 186h34" stroke="#B7C6EA" stroke-width="7" stroke-linecap="round"/>
+      <path d="M405 123l8 8 16-20M405 153l8 8 16-20M405 183l8 8 16-20" stroke="#FF2E63" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M83 180h22v22H83zM115 152h22v50h-22zM147 124h22v78h-22z" fill="url(#blue)"/>
+      <path d="M69 100c25-26 63-29 91-8" stroke="#CAD7F5" stroke-width="8" stroke-linecap="round"/>
+      <path d="M78 81l-4 26 26-5" stroke="#FF2E63" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    """
+
+
+def small_icon_svg(kind="target"):
+    if kind == "action":
+        return "✅"
+    if kind == "watch":
+        return "👀"
+    if kind == "risk":
+        return "🛡️"
+    if kind == "gem":
+        return "💎"
+    return "🎯"
+
+
 def inject_modern_css():
     st.markdown(
         """
         <style>
         .main .block-container {
-            padding-top: 1.2rem;
+            padding-top: 1.0rem;
             padding-bottom: 2rem;
             max-width: 1320px;
         }
+
+        [data-testid="stAppViewContainer"] {
+            background: radial-gradient(circle at top left, rgba(255,111,97,0.05), transparent 28%),
+                        radial-gradient(circle at top right, rgba(255,214,102,0.08), transparent 24%),
+                        linear-gradient(180deg, #f7f9fc 0%, #ffffff 100%);
+        }
+
+        .sh-hero {
+            background: linear-gradient(135deg, rgba(255,255,255,0.95), rgba(244,247,255,0.92));
+            border: 1px solid rgba(49,51,63,0.10);
+            border-radius: 24px;
+            box-shadow: 0 10px 30px rgba(16,24,40,0.06);
+            padding: 18px 18px 14px 18px;
+            margin: 8px 0 18px 0;
+        }
+
+        .sh-hero-title {
+            font-size: 1.55rem;
+            font-weight: 800;
+            margin-bottom: 6px;
+        }
+
+        .sh-hero-sub {
+            opacity: 0.78;
+            line-height: 1.55;
+            font-size: 0.98rem;
+        }
+
+        .sh-mini-row {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .sh-mini {
+            background: rgba(255,255,255,0.82);
+            border: 1px solid rgba(49,51,63,0.08);
+            border-radius: 16px;
+            padding: 10px 12px;
+        }
+
+        .sh-mini strong { display:block; margin-bottom:4px; }
 
         div[data-testid="stMetric"] {
             background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(250,250,250,0.68));
@@ -2778,6 +2906,9 @@ def inject_modern_css():
         }
 
         @media (max-width: 820px) {
+            .sh-hero-modern { grid-template-columns: 1fr; padding: 18px; }
+            .sh-hero-copy h2 { font-size: 1.65rem; }
+            .sh-hero-svg { max-height: 190px; }
             .main .block-container {
                 padding-left: 0.85rem;
                 padding-right: 0.85rem;
@@ -2789,13 +2920,114 @@ def inject_modern_css():
             .sh-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
+            .sh-mini-row {
+                grid-template-columns: 1fr;
+            }
             .sh-ticker {
                 font-size: 1.22rem;
             }
             .sh-value {
                 font-size: 0.95rem;
             }
+            div[data-testid="stMetric"] {
+                padding: 10px 12px;
+            }
         }
+        
+        .sh-hero-modern {
+            position: relative;
+            overflow: hidden;
+            display: grid;
+            grid-template-columns: minmax(0, 1.25fr) minmax(260px, 0.75fr);
+            gap: 22px;
+            align-items: center;
+            background:
+              radial-gradient(circle at 18% 20%, rgba(255,46,99,0.08), transparent 32%),
+              linear-gradient(135deg, rgba(255,255,255,0.96), rgba(244,247,255,0.94));
+            border: 1px solid rgba(49,51,63,0.10);
+            border-radius: 28px;
+            box-shadow: 0 14px 38px rgba(16,24,40,0.07);
+            padding: 22px 24px;
+            margin: 8px 0 20px 0;
+        }
+
+        .sh-hero-copy h2 {
+            margin: 0 0 8px 0;
+            font-size: 2.15rem;
+            line-height: 1.1;
+            font-weight: 900;
+            color: #0B1748;
+        }
+
+        .sh-hero-copy p {
+            margin: 0;
+            color: rgba(11,23,72,0.72);
+            line-height: 1.7;
+            font-size: 1.02rem;
+        }
+
+        .sh-hero-svg {
+            width: 100%;
+            max-height: 250px;
+            filter: drop-shadow(0 14px 20px rgba(16,24,40,0.10));
+        }
+
+        .sh-status-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 9px;
+            margin-top: 16px;
+        }
+
+        .sh-status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            border-radius: 999px;
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.74);
+            border: 1px solid rgba(49,51,63,0.10);
+            font-weight: 750;
+            font-size: 0.88rem;
+            color: #0B1748;
+        }
+
+        .sh-card {
+            transition: transform 140ms ease, box-shadow 140ms ease;
+        }
+
+        .sh-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 14px 34px rgba(16,24,40,0.09);
+        }
+
+        .sh-ticker::before {
+            content: "📌 ";
+            font-size: 1.05rem;
+        }
+
+        .sh-box:nth-child(1)::before,
+        .sh-box:nth-child(2)::before,
+        .sh-box:nth-child(4)::before,
+        .sh-box:nth-child(5)::before {
+            opacity: .75;
+            margin-left: 4px;
+        }
+
+        .sh-box:nth-child(1)::before { content: "💵"; }
+        .sh-box:nth-child(2)::before { content: "🎯"; }
+        .sh-box:nth-child(4)::before { content: "🏁"; }
+        .sh-box:nth-child(5)::before { content: "🛑"; }
+
+        .sh-section-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 900;
+            color: #0B1748;
+            margin-top: 22px;
+        }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -2891,9 +3123,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.4.1 — HTML Card Rendering Hotfix</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.6 — דשבורד פעולה חכם</h1>", unsafe_allow_html=True)
     st.info(
-        "V12.1 מוסיפה HTML Card Rendering Hotfix: רק סטאפ עם דלק אמיתי ל-8%-12% נשאר BUY SETUP READY; פריצות כבדות/חלשות עוברות ל-NEAR READY או Watch. "
+        "V13.6 מוסיפה איור דשבורד פנימי ב-SVG, משפרת את כרטיסי הפעולה, ומתקנת את יציבות עריכת תיק ההשקעות. "
         "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
     )
 
@@ -2927,6 +3159,28 @@ else:
         st.caption(
             "מסך ראשי נקי: קודם כרטיסי פעולה ברורים, ורק אחר כך טבלאות מלאות למי שרוצה לחפור. "
             "במובייל הכרטיסים נשברים לשתי עמודות ונוחים יותר מטבלה רחבה."
+        )
+
+        st.markdown(
+            f"""
+            <div class="sh-hero-modern">
+                <div class="sh-hero-copy">
+                    <h2>🚀 דשבורד פעולה — לא עוד טבלת אקסל</h2>
+                    <p>
+                        קודם רואים פקודות נקיות, אחר כך מועמדות למעקב, ורק בסוף פותחים את כל המדדים.
+                        הגרפיקה פה לא ליופי בלבד — היא נועדה לעזור לזהות מהר אם יש טריגר, סטופ, יעד וסיבה אמיתית לפעולה.
+                    </p>
+                    <div class="sh-status-strip">
+                        <span class="sh-status-chip">🎯 טריגר ברור</span>
+                        <span class="sh-status-chip">🛑 סטופ מוגדר</span>
+                        <span class="sh-status-chip">💎 Hidden Gems</span>
+                        <span class="sh-status-chip">📱 מותאם מובייל</span>
+                    </div>
+                </div>
+                <div>{hero_market_svg()}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         ctop1, ctop2 = st.columns([2, 1])
@@ -3051,6 +3305,7 @@ else:
                 )
 
     with tab_portfolio:
+        inject_modern_css()
         st.markdown("## 💼 תיק השקעות — אמת + וירטואלי")
         st.caption(
             "זה המקום היחיד לניהול פוזיציות. קנית/מכרת בפועל או וירטואלית — מזינים פעולה. "
@@ -3137,22 +3392,14 @@ else:
                 st.success("הפעולה נוספה ונשמרה.")
 
         st.markdown("### יומן פעולות")
+        ledger_df_for_editor = normalize_ledger(st.session_state["ledger"]).copy()
         ledger_edit = st.data_editor(
-            st.session_state["ledger"],
+            ledger_df_for_editor,
             num_rows="dynamic",
             use_container_width=True,
             hide_index=True,
             key=f"ledger_editor_{profile}",
-            column_config={
-                "Date": st.column_config.TextColumn("Date"),
-                "Account": st.column_config.SelectboxColumn("Account", options=["אמת", "וירטואלי"]),
-                "Action": st.column_config.SelectboxColumn("Action", options=["BUY", "SELL"]),
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=0.01),
-                "Price": st.column_config.NumberColumn("Price", min_value=0.0, step=0.01),
-                "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01),
-                "Note": st.column_config.TextColumn("Note"),
-            }
+            column_config=get_ledger_column_config()
         )
 
         edited_ledger = normalize_ledger(ledger_edit)
