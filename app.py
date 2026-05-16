@@ -15,8 +15,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V14.1 - Table Mode Fix", layout="wide")
-APP_VERSION = "V14.1-table-mode-fix"
+st.set_page_config(page_title="SwingHunter V14.2 - RTL Wrapped Explanations", layout="wide")
+APP_VERSION = "V14.2-rtl-wrapped-explanations"
 
 # ==========================================================
 # 1. Security
@@ -2779,14 +2779,15 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
         min-width: 1400px;
         width: max-content;
         font-size: 13px;
-        direction: ltr;
+        direction: rtl;
       }}
       #{table_id} th, #{table_id} td {{
         padding: 7px 10px;
         border-bottom: 1px solid rgba(49, 51, 63, 0.10);
         white-space: nowrap;
-        text-align: left;
+        text-align: right;
         vertical-align: top;
+        direction: rtl;
       }}
       #{table_id} th {{
         position: sticky;
@@ -2797,10 +2798,10 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
       }}
       #{table_id} th:first-child, #{table_id} td:first-child {{
         position: sticky;
-        left: 0;
+        right: 0;
         z-index: 4;
         background: #ffffff;
-        box-shadow: 2px 0 4px rgba(0,0,0,0.06);
+        box-shadow: -2px 0 4px rgba(0,0,0,0.06);
         font-weight: 700;
       }}
       #{table_id} th:first-child {{
@@ -2808,11 +2809,24 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
         background: #eef2f7;
       }}
       #{table_id} td.sh-action-cell {{
-        max-width: 260px;
+        max-width: 220px;
         overflow: hidden;
         text-overflow: ellipsis;
         cursor: help;
         border-bottom: 1px dotted #6b7280;
+        white-space: normal;
+        line-height: 1.45;
+      }}
+      #{table_id} td.sh-explanation-cell {{
+        min-width: 420px;
+        max-width: 620px;
+        white-space: normal;
+        line-height: 1.55;
+        text-align: right;
+        direction: rtl;
+      }}
+      #{table_id} td.sh-explanation-cell div {{
+        margin-bottom: 4px;
       }}
       #{table_id} td.sh-action-cell::after {{
         content: "  ⓘ";
@@ -2839,6 +2853,15 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
             val_html = html.escape(str(val))
             if col == "Action":
                 cells.append(f'<td class="sh-action-cell" title="{explanation_title}">{val_html}</td>')
+            elif col == "Action Explanation":
+                # Keep the explanation readable inside the wide table: one reason per visual line.
+                parts = [html.escape(part.strip()) for part in str(val).split("\n") if part.strip()]
+                if len(parts) <= 1:
+                    # Fallback for older generated explanations that came as one long sentence.
+                    raw = str(val)
+                    parts = [html.escape(part.strip()) for part in raw.replace(". ", ".\n").split("\n") if part.strip()]
+                val_html_multiline = "".join(f"<div>{part}</div>" for part in parts)
+                cells.append(f'<td class="sh-explanation-cell">{val_html_multiline}</td>')
             else:
                 cells.append(f"<td>{val_html}</td>")
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -3729,9 +3752,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.1 — Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.2 — RTL Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V14.1 מוסיפה שכבת Explainable Actions מעל ה-Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, ובנוסף מקבלת הסבר מילולי ברור לפעולה/הימנעות. "
+        "V14.2 מוסיפה תצוגת RTL קריאה לטבלאות המוסברות: עמודת Ticker קפואה, הסברים נשברים לשורות, ו-Hover/בחירת טיקר להצגת הסבר מלא. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
