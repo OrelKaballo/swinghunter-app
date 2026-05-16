@@ -15,7 +15,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V14.3 - Table Mode Fix", layout="wide")
+st.set_page_config(page_title="SwingHunter V14.3 - State Hover Tooltip", layout="wide")
 APP_VERSION = "V14.3-state-hover-tooltip"
 
 # ==========================================================
@@ -3756,9 +3756,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.3 — Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.3 — State Hover Tooltip Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V14.3 מוסיפה שכבת Explainable Actions מעל ה-Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, ובנוסף מקבלת הסבר מילולי ברור לפעולה/הימנעות. "
+        "V14.3 מוסיפה הסברי פעולה ב-Hover על עמודת State מעל שכבת Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
