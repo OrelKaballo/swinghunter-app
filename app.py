@@ -15,8 +15,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V14.3 - State Hover Tooltip", layout="wide")
-APP_VERSION = "V14.3-state-hover-tooltip"
+st.set_page_config(page_title="SwingHunter V15.0 - Trader UX", layout="wide")
+APP_VERSION = "V15.0-trader-ux"
 
 # ==========================================================
 # 1. Security
@@ -3739,6 +3739,237 @@ def render_cards_section(df: pd.DataFrame, title: str, mode="watch", max_cards=1
 
 
 
+
+
+# ==========================================================
+# 8B. V15 Trader UX — human-first presentation
+# ==========================================================
+def _fmt_price_for_ui(x):
+    try:
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{float(x):,.2f}"
+    except Exception:
+        return "—"
+
+
+def _fmt_pct_for_ui(x):
+    try:
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{float(x):.2f}%"
+    except Exception:
+        return "—"
+
+
+def _compact_line(row, action_like=False):
+    ticker = str(row.get("Ticker", "")).upper()
+    state = str(row.get("State", ""))
+    action = str(row.get("Action", ""))
+    category = str(row.get("Category", ""))
+    driver = str(row.get("Primary Driver", ""))
+    align = str(row.get("Driver Alignment", ""))
+    priced = str(row.get("Priced-In Risk", ""))
+    why = str(row.get("Why", "")).strip()
+    need = str(row.get("What We Need", "")).strip()
+    quality = str(row.get("Quality Notes", "")).strip()
+    setup = str(row.get("Setup Type", ""))
+
+    if action_like:
+        return (
+            f"{ticker}: {action or state}. "
+            f"סטאפ {setup}; דרייבר {driver or category}; אישור: {align}. "
+            f"סיכון תמחור: {priced}. {quality or why or need}"
+        )
+    return (
+        f"{ticker}: {state or action}. "
+        f"דרייבר {driver or category}; אישור: {align}. "
+        f"{need or why or priced or 'אין כרגע טריגר נקי לפי חוקי המודל.'}"
+    )
+
+
+def render_trader_card(row, mode="action"):
+    ticker = html.escape(str(row.get("Ticker", "")).upper())
+    state = html.escape(str(row.get("State", "")))
+    action = html.escape(str(row.get("Action", "")))
+    setup = html.escape(str(row.get("Setup Type", "")))
+    category = html.escape(str(row.get("Category", "")))
+    driver = html.escape(str(row.get("Primary Driver", "")))
+    alignment = html.escape(str(row.get("Driver Alignment", "")))
+    priced = html.escape(str(row.get("Priced-In Risk", "")))
+    current = html.escape(_fmt_price_for_ui(row.get("Current")))
+    trigger = html.escape(_fmt_price_for_ui(row.get("Buy Trigger", row.get("Next Action Price"))))
+    next_action = html.escape(_fmt_price_for_ui(row.get("Next Action Price", row.get("Buy Trigger"))))
+    dist = html.escape(_fmt_pct_for_ui(row.get("Distance to Trigger %", row.get("Distance to Action %"))))
+    stop = html.escape(_fmt_price_for_ui(row.get("Stop")))
+    risk = html.escape(_fmt_pct_for_ui(row.get("Risk %")))
+    target8 = html.escape(_fmt_price_for_ui(row.get("Target 8%")))
+    target12 = html.escape(_fmt_price_for_ui(row.get("Target 12%")))
+    q_target = html.escape(_fmt_price_for_ui(row.get("Quick Target 4.5%")))
+    rr8 = html.escape(_fmt_price_for_ui(row.get("RR 8%")))
+    score = html.escape(_fmt_price_for_ui(row.get("Breakout Score")))
+    reason = html.escape(_compact_line(row, action_like=(mode == "action")))
+
+    if mode == "action":
+        border = "#16a34a"
+        bg = "#f0fdf4"
+        target_label = "יעד"
+        target_value = f"{target8} / {target12}"
+    elif mode == "missed":
+        border = "#f97316"
+        bg = "#fff7ed"
+        target_label = "יעד"
+        target_value = f"{target8} / {target12}"
+    else:
+        border = "#2563eb"
+        bg = "#eff6ff"
+        target_label = "לבדוק מעל"
+        target_value = next_action
+
+    html_card = f"""
+    <div style="direction:rtl;text-align:right;border:1px solid {border};border-right:7px solid {border};background:{bg};
+                border-radius:16px;padding:16px 18px;margin:12px 0;box-shadow:0 4px 14px rgba(15,23,42,0.06);">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
+        <div>
+          <div style="font-size:1.45rem;font-weight:900;color:#0f172a;">{ticker}</div>
+          <div style="font-size:0.9rem;color:#475569;">{category} · {driver}</div>
+        </div>
+        <div style="background:white;border:1px solid rgba(15,23,42,0.12);border-radius:999px;padding:6px 12px;font-weight:700;color:#0f172a;">
+          {action or state}
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:10px;margin-top:14px;direction:ltr;text-align:left;">
+        <div style="background:white;border-radius:12px;padding:10px;"><div style="font-size:0.75rem;color:#64748b;">Current</div><b>{current}</b></div>
+        <div style="background:white;border-radius:12px;padding:10px;"><div style="font-size:0.75rem;color:#64748b;">Entry / Trigger</div><b>{trigger}</b></div>
+        <div style="background:white;border-radius:12px;padding:10px;"><div style="font-size:0.75rem;color:#64748b;">Distance</div><b>{dist}</b></div>
+        <div style="background:white;border-radius:12px;padding:10px;"><div style="font-size:0.75rem;color:#64748b;">{target_label}</div><b>{target_value}</b></div>
+        <div style="background:white;border-radius:12px;padding:10px;"><div style="font-size:0.75rem;color:#64748b;">Stop / Risk</div><b>{stop} · {risk}</b></div>
+        <div style="background:white;border-radius:12px;padding:10px;"><div style="font-size:0.75rem;color:#64748b;">R/R · Score</div><b>{rr8} · {score}</b></div>
+      </div>
+
+      <div style="margin-top:12px;color:#1e293b;line-height:1.55;">
+        <b>היגיון:</b> {reason}<br>
+        <b>דרייבר:</b> {alignment} · <b>תמחור:</b> {priced}
+      </div>
+    </div>
+    """
+    st.markdown(html_card, unsafe_allow_html=True)
+
+
+def render_trader_cards_section(df: pd.DataFrame, title: str, mode="watch", max_cards=8):
+    st.markdown(title)
+    if df is None or df.empty:
+        st.info("אין נתונים להצגה.")
+        return
+    for _, row in df.head(max_cards).iterrows():
+        render_trader_card(row, mode=("missed" if "ברח" in str(row.get("State", "")) else mode))
+    if len(df) > max_cards:
+        st.caption(f"מציג {max_cards} מתוך {len(df)}. יתר הנתונים בטבלה המקוצרת ובהרחבה הטכנית.")
+
+
+def _make_short_reason(row):
+    state = str(row.get("State", ""))
+    action = str(row.get("Action", ""))
+    need = str(row.get("What We Need", "")).strip()
+    why = str(row.get("Why", "")).strip()
+    align = str(row.get("Driver Alignment", "")).strip()
+    priced = str(row.get("Priced-In Risk", "")).strip()
+    parts = []
+    if action:
+        parts.append(action)
+    if state and state not in action:
+        parts.append(state)
+    if align:
+        parts.append(align)
+    if priced and "לא" not in priced:
+        parts.append(priced)
+    if need or why:
+        parts.append((need or why)[:110])
+    return " | ".join(parts[:4])
+
+
+def prepare_human_table(df: pd.DataFrame, mode="watch") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["Reason"] = out.apply(_make_short_reason, axis=1)
+
+    if mode == "action":
+        cols = [
+            "Ticker", "Action", "State", "Current", "Buy Trigger", "Distance to Trigger %",
+            "Target 8%", "Target 12%", "Stop", "Risk %", "RR 8%",
+            "Category", "Primary Driver", "Driver Alignment", "Priced-In Risk", "Reason"
+        ]
+    elif mode == "watch":
+        cols = [
+            "Ticker", "Action", "State", "Current", "Next Action Price", "Distance to Action %",
+            "Stop", "Risk %", "Category", "Primary Driver", "Driver Alignment", "Priced-In Risk", "Reason"
+        ]
+    else:
+        cols = [
+            "Ticker", "Action", "State", "Current", "Category", "Primary Driver",
+            "Driver Alignment", "Priced-In Risk", "Why", "What We Need"
+        ]
+
+    cols = unique_existing_columns(cols, out)
+    return out[cols]
+
+
+def render_human_table(df: pd.DataFrame, mode="watch", key_prefix="human_table", height=360):
+    compact = prepare_human_table(df, mode=mode)
+    if compact.empty:
+        st.write("אין נתונים להצגה.")
+        return
+
+    st.dataframe(
+        compact,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=get_column_config()
+    )
+
+    tickers = compact["Ticker"].astype(str).tolist() if "Ticker" in compact.columns else []
+    if tickers:
+        selected = st.selectbox(
+            "בחר מניה לפירוט מלא",
+            options=tickers,
+            key=f"{key_prefix}_detail_select",
+            help="הטבלה נשארת נקייה. כאן רואים את ההסבר המלא והאינדיקטורים למניה אחת."
+        )
+        source = df.loc[df["Ticker"].astype(str) == selected].iloc[0]
+        explanation = build_action_explanation(source)
+        with st.expander(f"פירוט מלא — {selected}", expanded=True):
+            st.markdown(
+                f"<div style='direction:rtl;text-align:right;background:#eef2ff;border-radius:14px;padding:16px;line-height:1.7;color:#1e1b4b;white-space:pre-line;'>{html.escape(explanation)}</div>",
+                unsafe_allow_html=True
+            )
+
+            key_metrics = [
+                "Ticker", "State", "Action", "Setup Type", "Trade Mode", "Current", "Buy Trigger", "Next Action Price",
+                "Distance to Trigger %", "Distance to Action %", "Target 8%", "Target 12%", "Stop", "Risk %", "RR 8%",
+                "Category", "Primary Driver", "Driver Alignment", "Driver 1D %", "Driver 5D %", "Stock vs Driver 5D %",
+                "Priced-In Risk", "Breakout Score", "RSI", "ATR%", "20D Run", "Market Mood", "Hidden Gem Signal"
+            ]
+            detail_df = pd.DataFrame([source[unique_existing_columns(key_metrics, pd.DataFrame([source]))].to_dict()])
+            st.dataframe(detail_df, use_container_width=True, hide_index=True, column_config=get_column_config())
+
+
+def render_advanced_table(df: pd.DataFrame, cols, label: str, key_prefix: str):
+    with st.expander(label, expanded=False):
+        if df is None or df.empty:
+            st.write("אין נתונים.")
+            return
+        cols = unique_existing_columns(cols, df)
+        st.dataframe(
+            df[cols],
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+            column_config=get_column_config()
+        )
+
 # ==========================================================
 # 9. UI
 # ==========================================================
@@ -3756,7 +3987,7 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.3 — State Hover Tooltip Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.0 — Trader UX Dashboard</h1>", unsafe_allow_html=True)
     st.info(
         "V14.3 מוסיפה הסברי פעולה ב-Hover על עמודת State מעל שכבת Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
@@ -3788,7 +4019,7 @@ else:
     with tab_daily:
         inject_modern_css()
 
-        st.markdown("## 🚀 דשבורד יומי — תוכנית פעולה")
+        st.markdown("## 🚀 דשבורד יומי — החלטות לפני מספרים")
         st.caption(
             "מסך ראשי נקי: קודם כרטיסי פעולה ברורים, ורק אחר כך טבלאות מלאות למי שרוצה לחפור. "
             "במובייל הכרטיסים נשברים לשתי עמודות ונוחים יותר מטבלה רחבה."
@@ -3810,9 +4041,9 @@ else:
             run_btn = st.button("⚡ הפק / רענן תוכנית פעולה להיום", use_container_width=True)
         with ctop2:
             show_tables_first = st.toggle(
-                "מצב טבלאות בלבד",
+                "מצב טבלה מקוצרת בלבד",
                 value=False,
-                help="מחליף רק את צורת התצוגה. לא מריץ את הסריקה מחדש ולא מוחק תוצאות."
+                help="מציג טבלאות מקוצרות במקום כרטיסים. לא מריץ את הסריקה מחדש ולא מוחק תוצאות."
             )
 
         action_cols = [
@@ -3888,44 +4119,42 @@ else:
                 st.warning("אין כרגע פקודת קנייה נקייה. זה לא כישלון — המודל פשוט לא מצא כניסה מספיק איכותית.")
 
             if not show_tables_first:
-                render_cards_section(df_action_display, "## ✅ פקודות פעולה", mode="action", max_cards=8)
+                render_trader_cards_section(df_action_display, "## ✅ פקודות פעולה", mode="action", max_cards=6)
 
                 if not df_watch_display.empty:
-                    st.markdown("## 👀 מועמדות למעקב")
-                    watch_focus = df_watch_display.copy()
-                    for _, row in watch_focus.head(12).iterrows():
-                        mode = "missed" if "ברח" in str(row.get("State", "")) else "watch"
-                        render_signal_card(row, mode=mode)
-                    if len(watch_focus) > 12:
-                        st.caption(f"מציג 12 מתוך {len(watch_focus)} מועמדות. הטבלה המלאה למטה.")
+                    render_trader_cards_section(df_watch_display, "## 👀 מועמדות למעקב", mode="watch", max_cards=8)
                 else:
                     st.info("אין מועמדות מעקב כרגע.")
 
-            st.markdown("## 📊 טבלאות מלאות")
+            st.markdown("## 📊 טבלאות החלטה מקוצרות")
+            st.caption("כאן מופיעים רק השדות שצריך כדי לקבל החלטה. הפירוט הטכני המלא נמצא בהרחבות למטה.")
 
-            with st.expander("✅ פקודות פעולה — טבלה מלאה", expanded=show_tables_first):
+            with st.expander("✅ פקודות פעולה — טבלה מקוצרת", expanded=show_tables_first or not df_action_display.empty):
                 if not df_action_display.empty:
                     df_action_display = dedupe_dataframe_columns(df_action_display)
-                    cols = unique_existing_columns(action_cols, df_action_display)
-                    render_explainable_table(df_action_display[cols], cols, key_prefix="action_table")
+                    render_human_table(df_action_display, mode="action", key_prefix="action_human", height=260)
                 else:
                     st.write("אין פקודות פעולה.")
 
-            with st.expander("👀 מועמדות למעקב — טבלה מלאה", expanded=show_tables_first):
+            with st.expander("👀 מועמדות למעקב — טבלה מקוצרת", expanded=show_tables_first):
                 if not df_watch_display.empty:
                     df_watch_display = dedupe_dataframe_columns(df_watch_display)
-                    cols = unique_existing_columns(watch_cols, df_watch_display)
-                    render_explainable_table(df_watch_display[cols], cols, key_prefix="watch_table")
+                    render_human_table(df_watch_display, mode="watch", key_prefix="watch_human", height=360)
                 else:
                     st.write("אין מועמדות מעקב.")
 
-            with st.expander("🧹 לא רלוונטי כרגע / Ignore"):
+            with st.expander("🧹 לא רלוונטי כרגע / Ignore — טבלה מקוצרת", expanded=False):
                 if not df_ignore_display.empty:
                     df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
-                    cols = unique_existing_columns(ignore_cols, df_ignore_display)
-                    render_explainable_table(df_ignore_display[cols], cols, key_prefix="ignore_table")
+                    render_human_table(df_ignore_display, mode="ignore", key_prefix="ignore_human", height=360)
                 else:
                     st.write("אין מניות לא רלוונטיות.")
+
+            st.markdown("## 🔬 נתונים טכניים מלאים")
+            st.caption("לבדיקה ובקרה בלבד — לא המסך שממנו מקבלים החלטה.")
+            render_advanced_table(df_action_display, action_cols, "✅ פקודות פעולה — כל העמודות", "action_advanced")
+            render_advanced_table(df_watch_display, watch_cols, "👀 מעקב — כל העמודות", "watch_advanced")
+            render_advanced_table(df_ignore_display, ignore_cols, "🧹 Ignore — כל העמודות", "ignore_advanced")
 
             combined_radar = pd.concat([df_watch_display, df_ignore_display], ignore_index=True) if not df_watch_display.empty or not df_ignore_display.empty else pd.DataFrame()
 
