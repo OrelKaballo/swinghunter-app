@@ -15,8 +15,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V14.2 - RTL Wrapped Explanations", layout="wide")
-APP_VERSION = "V14.2-rtl-wrapped-explanations"
+st.set_page_config(page_title="SwingHunter V14.3 - Table Mode Fix", layout="wide")
+APP_VERSION = "V14.3-state-hover-tooltip"
 
 # ==========================================================
 # 1. Security
@@ -2644,7 +2644,7 @@ def _fmt_explain_value(value, suffix="", digits=1):
 
 def build_action_explanation(row: pd.Series) -> str:
     """
-    V14.1 Explainable Actions.
+    V14.3 Explainable Actions.
     Deterministic explanation only: no AI calls, no guesses.
     It translates the actual columns/flags into short Hebrew reasoning.
     READY/ACTION rows get a longer explanation; WATCH/IGNORE rows get a compact one.
@@ -2746,7 +2746,7 @@ def _format_table_value(value, col=""):
 def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: int = 250):
     """
     Streamlit native dataframe cannot reliably freeze columns or show per-cell tooltips.
-    This HTML table freezes the first column (Ticker) and puts the reasoning tooltip on Action.
+    This HTML table freezes the first column (Ticker) and puts the reasoning tooltip on State.
     It is intended for daily decision tables, not for editing.
     """
     if df is None or df.empty:
@@ -2779,15 +2779,14 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
         min-width: 1400px;
         width: max-content;
         font-size: 13px;
-        direction: rtl;
+        direction: ltr;
       }}
       #{table_id} th, #{table_id} td {{
         padding: 7px 10px;
         border-bottom: 1px solid rgba(49, 51, 63, 0.10);
         white-space: nowrap;
-        text-align: right;
+        text-align: left;
         vertical-align: top;
-        direction: rtl;
       }}
       #{table_id} th {{
         position: sticky;
@@ -2798,40 +2797,51 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
       }}
       #{table_id} th:first-child, #{table_id} td:first-child {{
         position: sticky;
-        right: 0;
+        left: 0;
         z-index: 4;
         background: #ffffff;
-        box-shadow: -2px 0 4px rgba(0,0,0,0.06);
+        box-shadow: 2px 0 4px rgba(0,0,0,0.06);
         font-weight: 700;
       }}
       #{table_id} th:first-child {{
         z-index: 5;
         background: #eef2f7;
       }}
-      #{table_id} td.sh-action-cell {{
+      #{table_id} td.sh-state-cell {{
         max-width: 220px;
-        overflow: hidden;
+        overflow: visible;
         text-overflow: ellipsis;
         cursor: help;
         border-bottom: 1px dotted #6b7280;
-        white-space: normal;
-        line-height: 1.45;
+        position: relative;
       }}
-      #{table_id} td.sh-explanation-cell {{
-        min-width: 420px;
-        max-width: 620px;
-        white-space: normal;
-        line-height: 1.55;
-        text-align: right;
-        direction: rtl;
-      }}
-      #{table_id} td.sh-explanation-cell div {{
-        margin-bottom: 4px;
-      }}
-      #{table_id} td.sh-action-cell::after {{
+      #{table_id} .sh-state-label::after {{
         content: "  ⓘ";
         color: #64748b;
         font-size: 11px;
+      }}
+      #{table_id} .sh-tooltip {{
+        display: none;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        min-width: 360px;
+        max-width: 560px;
+        white-space: pre-line;
+        direction: rtl;
+        text-align: right;
+        background: #111827;
+        color: #ffffff;
+        border-radius: 10px;
+        padding: 12px 14px;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.24);
+        z-index: 50;
+        line-height: 1.55;
+        font-size: 13px;
+        font-family: Arial, sans-serif;
+      }}
+      #{table_id} td.sh-state-cell:hover .sh-tooltip {{
+        display: block;
       }}
       #{table_id} tr:hover td {{
         background: #f9fafb;
@@ -2851,24 +2861,18 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
         for col in cols:
             val = _format_table_value(row.get(col, ""), col)
             val_html = html.escape(str(val))
-            if col == "Action":
-                cells.append(f'<td class="sh-action-cell" title="{explanation_title}">{val_html}</td>')
-            elif col == "Action Explanation":
-                # Keep the explanation readable inside the wide table: one reason per visual line.
-                parts = [html.escape(part.strip()) for part in str(val).split("\n") if part.strip()]
-                if len(parts) <= 1:
-                    # Fallback for older generated explanations that came as one long sentence.
-                    raw = str(val)
-                    parts = [html.escape(part.strip()) for part in raw.replace(". ", ".\n").split("\n") if part.strip()]
-                val_html_multiline = "".join(f"<div>{part}</div>" for part in parts)
-                cells.append(f'<td class="sh-explanation-cell">{val_html_multiline}</td>')
+            if col == "State":
+                cells.append(
+                    f'<td class="sh-state-cell"><span class="sh-state-label">{val_html}</span>'
+                    f'<div class="sh-tooltip">{explanation_title}</div></td>'
+                )
             else:
                 cells.append(f"<td>{val_html}</td>")
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     table_html = css + f'<div id="{table_id}" class="sh-table-wrap"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
 
-    # V14.1: render as a real HTML component instead of st.markdown.
+    # V14.3: render as a real HTML component instead of st.markdown.
     # In table-only mode Streamlit sometimes displayed the raw HTML string inside the expander.
     # components.html isolates the HTML/CSS in an iframe and reliably renders the sticky ticker column + Action tooltip.
     row_count = min(len(view), max_rows)
@@ -2883,7 +2887,7 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
                 "הצג הסבר מלא למניה",
                 options=tickers,
                 key=f"{key_prefix}_explain_select",
-                help="במחשב אפשר לרחף מעל תא 'Action'. בטלפון בחר טיקר כאן כדי לראות את ההסבר."
+                help="במחשב אפשר לרחף מעל תא 'State'. בטלפון בחר טיקר כאן כדי לראות את ההסבר."
             )
             explanation = view.loc[view["Ticker"].astype(str) == selected, "Action Explanation"].iloc[0]
             st.info(explanation)
@@ -3752,9 +3756,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.2 — RTL Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.3 — Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V14.2 מוסיפה תצוגת RTL קריאה לטבלאות המוסברות: עמודת Ticker קפואה, הסברים נשברים לשורות, ו-Hover/בחירת טיקר להצגת הסבר מלא. "
+        "V14.3 מוסיפה שכבת Explainable Actions מעל ה-Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, ובנוסף מקבלת הסבר מילולי ברור לפעולה/הימנעות. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
@@ -3812,7 +3816,7 @@ else:
             )
 
         action_cols = [
-            "Ticker", "Action", "Action Explanation", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Trade Mode", "Setup Type", "Ticker Class", "Current", "Buy Trigger", "Distance to Trigger %",
+            "Ticker", "Action", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Trade Mode", "Setup Type", "Ticker Class", "Current", "Buy Trigger", "Distance to Trigger %",
             "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
             "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal",
             "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
@@ -3821,7 +3825,7 @@ else:
         ]
 
         watch_cols = [
-            "Ticker", "Action", "Action Explanation", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Setup Type", "Ticker Class", "Current", "Next Action Price", "Distance to Action %",
+            "Ticker", "Action", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Setup Type", "Ticker Class", "Current", "Next Action Price", "Distance to Action %",
             "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger",
             "Pullback Watch Price", "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %",
             "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
@@ -3831,7 +3835,7 @@ else:
         ]
 
         ignore_cols = [
-            "Ticker", "Action", "Action Explanation", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Setup Type", "Ticker Class", "Current", "Why", "What We Need",
+            "Ticker", "Action", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Setup Type", "Ticker Class", "Current", "Why", "What We Need",
             "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
             "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
             "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
