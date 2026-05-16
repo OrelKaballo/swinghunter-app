@@ -14,7 +14,7 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V13.8 - Unified Portfolio Ledger", layout="wide")
+st.set_page_config(page_title="SwingHunter V14.0 - Explainable Driver-Aware", layout="wide")
 APP_VERSION = "V14.0-explainable-driver-aware"
 
 # ==========================================================
@@ -3722,9 +3722,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.9 — Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.0 — Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V13.9 מוסיפה שכבת Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה — נפט ל-XOM, ביטקוין ל-MARA, SMH לשבבים, KWEB לסין ו-QQQ למגה-טק. "
+        "V14.0 מוסיפה שכבת Explainable Actions מעל ה-Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, ובנוסף מקבלת הסבר מילולי ברור לפעולה/הימנעות. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
