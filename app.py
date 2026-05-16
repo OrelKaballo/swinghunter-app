@@ -10,12 +10,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V14.0 - Explainable Driver-Aware", layout="wide")
-APP_VERSION = "V14.0-explainable-driver-aware"
+st.set_page_config(page_title="SwingHunter V14.1 - Table Mode Fix", layout="wide")
+APP_VERSION = "V14.1-table-mode-fix"
 
 # ==========================================================
 # 1. Security
@@ -2643,7 +2644,7 @@ def _fmt_explain_value(value, suffix="", digits=1):
 
 def build_action_explanation(row: pd.Series) -> str:
     """
-    V14.0 Explainable Actions.
+    V14.1 Explainable Actions.
     Deterministic explanation only: no AI calls, no guesses.
     It translates the actual columns/flags into short Hebrew reasoning.
     READY/ACTION rows get a longer explanation; WATCH/IGNORE rows get a compact one.
@@ -2843,7 +2844,13 @@ def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: 
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     table_html = css + f'<div id="{table_id}" class="sh-table-wrap"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
-    st.markdown(table_html, unsafe_allow_html=True)
+
+    # V14.1: render as a real HTML component instead of st.markdown.
+    # In table-only mode Streamlit sometimes displayed the raw HTML string inside the expander.
+    # components.html isolates the HTML/CSS in an iframe and reliably renders the sticky ticker column + Action tooltip.
+    row_count = min(len(view), max_rows)
+    component_height = int(min(760, max(240, 88 + row_count * 34)))
+    components.html(table_html, height=component_height, scrolling=True)
 
     # Mobile / no-hover fallback: pick a ticker and read its full explanation below the table.
     if "Ticker" in view.columns and "Action Explanation" in view.columns:
@@ -3722,9 +3729,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.0 — Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V14.1 — Explainable Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V14.0 מוסיפה שכבת Explainable Actions מעל ה-Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, ובנוסף מקבלת הסבר מילולי ברור לפעולה/הימנעות. "
+        "V14.1 מוסיפה שכבת Explainable Actions מעל ה-Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, ובנוסף מקבלת הסבר מילולי ברור לפעולה/הימנעות. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
