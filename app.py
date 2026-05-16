@@ -15,7 +15,7 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="SwingHunter V13.8 - Unified Portfolio Ledger", layout="wide")
-APP_VERSION = "V13.8"
+APP_VERSION = "V14.0-explainable-driver-aware"
 
 # ==========================================================
 # 1. Security
@@ -62,6 +62,195 @@ HEAVY_SLOW_TICKERS = {
     'XOM','CVX','GE','BA','LIN','PEP',
     'DAL','UAL','BKNG','EXPE','ABNB'
 }
+
+
+# ==========================================================
+# 2A. Driver-aware map
+# ==========================================================
+# V13.9: every ticker can be compared with its main external driver.
+# The goal is not to predict the news. The goal is to avoid entering a stock
+# whose primary driver is moving against it, and to detect when a stock is strong
+# or weak relative to what should be moving it.
+DRIVER_PROFILES = {
+    # Oil / energy: driven first by crude oil and then by energy sector beta.
+    "XOM": {"category": "Oil macro", "driver": "CL=F", "driver_name": "WTI Crude Oil"},
+    "CVX": {"category": "Oil macro", "driver": "CL=F", "driver_name": "WTI Crude Oil"},
+
+    # Crypto proxies: not judged as ordinary equities without checking BTC.
+    "MARA": {"category": "Crypto proxy", "driver": "BTC-USD", "driver_name": "Bitcoin"},
+    "RIOT": {"category": "Crypto proxy", "driver": "BTC-USD", "driver_name": "Bitcoin"},
+    "COIN": {"category": "Crypto proxy", "driver": "BTC-USD", "driver_name": "Bitcoin"},
+    "MSTR": {"category": "Crypto proxy", "driver": "BTC-USD", "driver_name": "Bitcoin"},
+
+    # AI / semiconductors: compare with SMH to avoid chasing a weak chip name.
+    "NVDA": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "AMD": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "AVGO": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "TSM": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "ASML": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "ARM": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "QCOM": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "MU": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "MRVL": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "SMCI": {"category": "AI infrastructure", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "LRCX": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "AMAT": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "KLAC": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+    "TXN": {"category": "AI chips", "driver": "SMH", "driver_name": "Semiconductor ETF"},
+
+    # EV / AI hybrid: TSLA is not only car demand anymore, so compare first with QQQ.
+    "TSLA": {"category": "EV / AI hybrid", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+    "RIVN": {"category": "EV", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+
+    # China tech: affected by China internet risk more than US mega-tech.
+    "BABA": {"category": "China tech", "driver": "KWEB", "driver_name": "China Internet ETF"},
+    "BIDU": {"category": "China tech", "driver": "KWEB", "driver_name": "China Internet ETF"},
+    "JD": {"category": "China tech", "driver": "KWEB", "driver_name": "China Internet ETF"},
+
+    # Heavy cyclicals / industrials.
+    "CAT": {"category": "Industrial cyclical", "driver": "XLI", "driver_name": "Industrials ETF"},
+    "GE": {"category": "Industrial cyclical", "driver": "XLI", "driver_name": "Industrials ETF"},
+    "BA": {"category": "Industrial / aerospace", "driver": "XLI", "driver_name": "Industrials ETF"},
+    "LIN": {"category": "Industrial defensive", "driver": "XLI", "driver_name": "Industrials ETF"},
+
+    # Financials.
+    "JPM": {"category": "Financials", "driver": "XLF", "driver_name": "Financials ETF"},
+    "BAC": {"category": "Financials", "driver": "XLF", "driver_name": "Financials ETF"},
+    "GS": {"category": "Financials", "driver": "XLF", "driver_name": "Financials ETF"},
+    "MS": {"category": "Financials", "driver": "XLF", "driver_name": "Financials ETF"},
+    "V": {"category": "Financials / payments", "driver": "XLF", "driver_name": "Financials ETF"},
+    "MA": {"category": "Financials / payments", "driver": "XLF", "driver_name": "Financials ETF"},
+    "AXP": {"category": "Financials / payments", "driver": "XLF", "driver_name": "Financials ETF"},
+
+    # Healthcare.
+    "LLY": {"category": "Healthcare", "driver": "XLV", "driver_name": "Healthcare ETF"},
+    "NVO": {"category": "Healthcare", "driver": "XLV", "driver_name": "Healthcare ETF"},
+    "JNJ": {"category": "Healthcare", "driver": "XLV", "driver_name": "Healthcare ETF"},
+    "UNH": {"category": "Healthcare", "driver": "XLV", "driver_name": "Healthcare ETF"},
+    "PFE": {"category": "Healthcare", "driver": "XLV", "driver_name": "Healthcare ETF"},
+    "MRNA": {"category": "Healthcare", "driver": "XLV", "driver_name": "Healthcare ETF"},
+
+    # Airlines / travel.
+    "DAL": {"category": "Airlines / travel", "driver": "JETS", "driver_name": "Airline ETF"},
+    "UAL": {"category": "Airlines / travel", "driver": "JETS", "driver_name": "Airline ETF"},
+    "BKNG": {"category": "Travel", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+    "EXPE": {"category": "Travel", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+    "ABNB": {"category": "Travel", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+
+    # Retail / consumer.
+    "WMT": {"category": "Consumer staples", "driver": "XLP", "driver_name": "Consumer Staples ETF"},
+    "COST": {"category": "Consumer staples", "driver": "XLP", "driver_name": "Consumer Staples ETF"},
+    "MCD": {"category": "Consumer defensive", "driver": "XLP", "driver_name": "Consumer Staples ETF"},
+    "HD": {"category": "Consumer discretionary", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+    "TGT": {"category": "Consumer discretionary", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+    "SBUX": {"category": "Consumer discretionary", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+    "NKE": {"category": "Consumer discretionary", "driver": "XLY", "driver_name": "Consumer Discretionary ETF"},
+
+    # Software / cyber / internet growth.
+    "CRWD": {"category": "Cyber / software", "driver": "IGV", "driver_name": "Software ETF"},
+    "PANW": {"category": "Cyber / software", "driver": "IGV", "driver_name": "Software ETF"},
+    "DDOG": {"category": "Cloud software", "driver": "IGV", "driver_name": "Software ETF"},
+    "NET": {"category": "Cloud software", "driver": "IGV", "driver_name": "Software ETF"},
+    "ZS": {"category": "Cyber / software", "driver": "IGV", "driver_name": "Software ETF"},
+    "SNOW": {"category": "Cloud software", "driver": "IGV", "driver_name": "Software ETF"},
+    "MDB": {"category": "Cloud software", "driver": "IGV", "driver_name": "Software ETF"},
+    "PLTR": {"category": "AI software", "driver": "IGV", "driver_name": "Software ETF"},
+
+    # Mega tech defaults.
+    "AAPL": {"category": "Mega tech", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+    "MSFT": {"category": "Mega tech", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+    "AMZN": {"category": "Mega tech", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+    "META": {"category": "Mega tech", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+    "GOOGL": {"category": "Mega tech", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+    "NFLX": {"category": "Mega tech / streaming", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"},
+}
+
+DEFAULT_DRIVER_PROFILE = {"category": "General equity", "driver": "QQQ", "driver_name": "Nasdaq 100 ETF"}
+
+
+def get_driver_profile(ticker: str) -> dict:
+    return DRIVER_PROFILES.get(str(ticker).upper().strip(), DEFAULT_DRIVER_PROFILE)
+
+
+def pct_change_safe(series: pd.Series, periods: int) -> float:
+    try:
+        s = series.dropna()
+        if len(s) <= periods:
+            return np.nan
+        return (float(s.iloc[-1]) / float(s.iloc[-1 - periods]) - 1) * 100
+    except Exception:
+        return np.nan
+
+
+def compute_driver_metrics(stock_close: pd.Series, driver_close: pd.Series):
+    try:
+        if driver_close is None or driver_close.empty:
+            return {
+                "driver_1d": np.nan, "driver_5d": np.nan, "driver_20d": np.nan,
+                "stock_5d": np.nan, "stock_20d": np.nan, "relative_5d": np.nan,
+                "alignment": "NO DRIVER DATA", "note": "אין נתוני דרייבר"
+            }
+
+        common = stock_close.dropna().index.intersection(driver_close.dropna().index)
+        s = stock_close.loc[common].dropna()
+        d = driver_close.loc[common].dropna()
+        common = s.index.intersection(d.index)
+        s = s.loc[common]
+        d = d.loc[common]
+        if len(s) < 22 or len(d) < 22:
+            return {
+                "driver_1d": np.nan, "driver_5d": np.nan, "driver_20d": np.nan,
+                "stock_5d": np.nan, "stock_20d": np.nan, "relative_5d": np.nan,
+                "alignment": "NO DRIVER DATA", "note": "מעט מדי נתונים בדרייבר"
+            }
+
+        stock_1d = pct_change_safe(s, 1)
+        stock_5d = pct_change_safe(s, 5)
+        stock_20d = pct_change_safe(s, 20)
+        driver_1d = pct_change_safe(d, 1)
+        driver_5d = pct_change_safe(d, 5)
+        driver_20d = pct_change_safe(d, 20)
+        relative_5d = stock_5d - driver_5d if np.isfinite(stock_5d) and np.isfinite(driver_5d) else np.nan
+
+        # Interpret direction without pretending to know causality.
+        if not np.isfinite(driver_5d) or not np.isfinite(stock_5d):
+            alignment = "NO DRIVER DATA"
+            note = "אין מספיק מידע להשוואת דרייבר"
+        elif driver_5d >= 1.0 and stock_5d >= 0:
+            alignment = "ALIGNED"
+            note = "המניה עולה יחד עם הדרייבר"
+            if np.isfinite(relative_5d) and relative_5d >= 3:
+                alignment = "STOCK OUTPERFORMS DRIVER"
+                note = "המניה חזקה מהדרייבר שלה"
+        elif driver_5d <= -1.0 and stock_5d <= 0:
+            alignment = "ALIGNED DOWN"
+            note = "המניה יורדת יחד עם דרייבר חלש"
+        elif driver_5d >= 1.0 and stock_5d < 0:
+            alignment = "DRIVER DIVERGENCE"
+            note = "הדרייבר חיובי אבל המניה חלשה — אזהרה"
+        elif driver_5d <= -1.0 and stock_5d > 0:
+            alignment = "STOCK OUTPERFORMS DRIVER"
+            note = "המניה חזקה למרות דרייבר שלילי"
+        else:
+            alignment = "NEUTRAL"
+            note = "אין כיוון מובהק בדרייבר"
+
+        return {
+            "driver_1d": driver_1d,
+            "driver_5d": driver_5d,
+            "driver_20d": driver_20d,
+            "stock_5d": stock_5d,
+            "stock_20d": stock_20d,
+            "relative_5d": relative_5d,
+            "alignment": alignment,
+            "note": note,
+        }
+    except Exception as e:
+        return {
+            "driver_1d": np.nan, "driver_5d": np.nan, "driver_20d": np.nan,
+            "stock_5d": np.nan, "stock_20d": np.nan, "relative_5d": np.nan,
+            "alignment": "NO DRIVER DATA", "note": str(e)[:80]
+        }
 
 
 def ticker_class(ticker: str) -> str:
@@ -1304,6 +1493,7 @@ def evaluate_breakout_action_plan(
     o: pd.Series,
     qqq_slice: pd.Series,
     params: StrategyParams,
+    driver_close: pd.Series = None,
 ):
     """
     V12 practical output:
@@ -1315,6 +1505,17 @@ def evaluate_breakout_action_plan(
     """
     base = {
         "Ticker": ticker,
+        "Category": "",
+        "Primary Driver": "",
+        "Driver 1D %": np.nan,
+        "Driver 5D %": np.nan,
+        "Driver 20D %": np.nan,
+        "Stock 5D %": np.nan,
+        "Stock vs Driver 5D %": np.nan,
+        "Driver Alignment": "",
+        "Driver Note": "",
+        "Priced-In Risk": "",
+        "Action": "",
         "State": "IGNORE",
         "Setup Type": "Weak / Ignore",
         "Current": np.nan,
@@ -1564,6 +1765,29 @@ def evaluate_breakout_action_plan(
         pullback_watch = round(ema8 * 1.003, 2)
         pullback_deep = round(ema21 * 1.005, 2)
 
+        # V13.9 driver-aware context.
+        profile = get_driver_profile(ticker)
+        driver_metrics = compute_driver_metrics(c, driver_close) if driver_close is not None else compute_driver_metrics(c, pd.Series(dtype=float))
+
+        priced_in_flags = []
+        if run20 >= 30:
+            priced_in_flags.append("20D run > 30%")
+        if rsi >= 78:
+            priced_in_flags.append("RSI high")
+        if np.isfinite(trigger_dist) and trigger_dist < -0.25:
+            priced_in_flags.append("trigger already behind")
+        if np.isfinite(driver_metrics.get("relative_5d", np.nan)) and driver_metrics.get("relative_5d", 0) >= 8:
+            priced_in_flags.append("far ahead of driver")
+        if volume_ratio < 0.80 and run20 >= 15:
+            priced_in_flags.append("move on weak volume")
+
+        if not priced_in_flags:
+            priced_in_risk = "LOW / NOT OBVIOUS"
+        elif len(priced_in_flags) <= 2:
+            priced_in_risk = "MEDIUM — " + ", ".join(priced_in_flags)
+        else:
+            priced_in_risk = "HIGH — " + ", ".join(priced_in_flags[:4])
+
         if is_liquidity_purge:
             hidden_gem_signal = "ציד נזילות / מלכודת מוכרים"
         elif hugging_avwap and atr_pinch < 0.80:
@@ -1601,6 +1825,16 @@ def evaluate_breakout_action_plan(
             market_mood = "ניטרלית / מעקב"
 
         base.update({
+            "Category": profile.get("category", "General equity"),
+            "Primary Driver": f"{profile.get('driver', 'QQQ')} / {profile.get('driver_name', 'Nasdaq 100 ETF')}",
+            "Driver 1D %": round(driver_metrics.get("driver_1d", np.nan), 2) if np.isfinite(driver_metrics.get("driver_1d", np.nan)) else np.nan,
+            "Driver 5D %": round(driver_metrics.get("driver_5d", np.nan), 2) if np.isfinite(driver_metrics.get("driver_5d", np.nan)) else np.nan,
+            "Driver 20D %": round(driver_metrics.get("driver_20d", np.nan), 2) if np.isfinite(driver_metrics.get("driver_20d", np.nan)) else np.nan,
+            "Stock 5D %": round(driver_metrics.get("stock_5d", np.nan), 2) if np.isfinite(driver_metrics.get("stock_5d", np.nan)) else np.nan,
+            "Stock vs Driver 5D %": round(driver_metrics.get("relative_5d", np.nan), 2) if np.isfinite(driver_metrics.get("relative_5d", np.nan)) else np.nan,
+            "Driver Alignment": driver_metrics.get("alignment", ""),
+            "Driver Note": driver_metrics.get("note", ""),
+            "Priced-In Risk": priced_in_risk,
             "Current": round(last_p, 2),
             "Buy Trigger": breakout_trigger,
             "Next Action Price": breakout_trigger,
@@ -1951,6 +2185,18 @@ def evaluate_breakout_action_plan(
                 quality_notes = (quality_notes + " | " if quality_notes else "") + " | ".join(heavy_reasons)
                 exhaustion_risk = "MEDIUM"
 
+        # V13.9: driver-aware gate. Do not mark a setup READY if the stock's main driver is moving against it.
+        driver_alignment = driver_metrics.get("alignment", "")
+        if quality == "READY" and driver_alignment == "DRIVER DIVERGENCE":
+            quality = "NEAR READY"
+            quality_notes = (quality_notes + " | " if quality_notes else "") + "דרייבר ראשי לא מאשר את המהלך"
+            exhaustion_risk = "MEDIUM"
+
+        if quality == "READY" and str(priced_in_risk).startswith("HIGH"):
+            quality = "NEAR READY"
+            quality_notes = (quality_notes + " | " if quality_notes else "") + "סיכון שהמהלך כבר מתומחר"
+            exhaustion_risk = "HIGH"
+
         base["Action Quality"] = quality
         base["Quality Notes"] = quality_notes
         base["Exhaustion Risk"] = exhaustion_risk
@@ -1997,6 +2243,17 @@ def get_today_breakout_action_plan(params: StrategyParams):
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     qqq_slice = qqq["Close"].dropna()
+
+    # V13.9: download each external driver once per run.
+    driver_symbols = sorted({get_driver_profile(t).get("driver", "QQQ") for t in WATCHLIST})
+    driver_cache = {"QQQ": qqq_slice}
+    for sym in driver_symbols:
+        if sym == "QQQ":
+            continue
+        ddf = download_single(sym, "370d")
+        if not ddf.empty and "Close" in ddf.columns:
+            driver_cache[sym] = ddf["Close"].dropna()
+
     action_rows = []
     watch_rows = []
     ignore_rows = []
@@ -2008,7 +2265,9 @@ def get_today_breakout_action_plan(params: StrategyParams):
 
         try:
             c, h, l, v, o = df["Close"].dropna(), df["High"].dropna(), df["Low"].dropna(), df["Volume"].dropna(), df["Open"].dropna()
-            row = evaluate_breakout_action_plan(ticker, c, h, l, v, o, qqq_slice, params)
+            profile = get_driver_profile(ticker)
+            driver_close = driver_cache.get(profile.get("driver", "QQQ"), qqq_slice)
+            row = evaluate_breakout_action_plan(ticker, c, h, l, v, o, qqq_slice, params, driver_close=driver_close)
 
             state = row.get("State", "IGNORE")
             if state in ["BUY SETUP READY", "QUICK BURST READY"]:
@@ -2333,19 +2592,288 @@ def localize_daily_display(df: pd.DataFrame) -> pd.DataFrame:
             "PULLBACK": "שוק בתיקון",
             "BEAR": "שוק שלילי",
         },
+        "Driver Alignment": {
+            "ALIGNED": "מאושר מול דרייבר",
+            "ALIGNED DOWN": "יורדת עם דרייבר חלש",
+            "STOCK OUTPERFORMS DRIVER": "חזקה מהדרייבר",
+            "DRIVER DIVERGENCE": "סטייה מול דרייבר",
+            "NEUTRAL": "ניטרלי",
+            "NO DRIVER DATA": "אין נתוני דרייבר",
+        },
     }
 
     for col, mapping in mappings.items():
         if col in out.columns:
             out[col] = out[col].map(lambda x: mapping.get(x, x) if pd.notna(x) else x)
 
+    # V13.9: simple Hebrew action column for decision-making.
+    if "Action" in out.columns:
+        def _action_label(row):
+            state = str(row.get("State", ""))
+            align = str(row.get("Driver Alignment", ""))
+            pir = str(row.get("Priced-In Risk", ""))
+            if "מוכן לקנייה" in state:
+                return "אפשר לשקול פעולה"
+            if "כמעט מוכן" in state:
+                return "מעקב צמוד — לא פקודה"
+            if "סטייה" in align:
+                return "להיזהר — דרייבר לא מאשר"
+            if "HIGH" in pir or "גבוה" in pir:
+                return "להיזהר — ייתכן שמתומחר"
+            if "להמתין" in state or "מעקב" in state:
+                return "לחכות"
+            return "לא לגעת כרגע"
+        out["Action"] = out.apply(_action_label, axis=1)
+
     return out
 
+
+
+def _fmt_explain_value(value, suffix="", digits=1):
+    try:
+        if value is None or pd.isna(value):
+            return "לא זמין"
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return f"{float(value):.{digits}f}{suffix}"
+        text = str(value).strip()
+        return text if text else "לא זמין"
+    except Exception:
+        return "לא זמין"
+
+
+def build_action_explanation(row: pd.Series) -> str:
+    """
+    V14.0 Explainable Actions.
+    Deterministic explanation only: no AI calls, no guesses.
+    It translates the actual columns/flags into short Hebrew reasoning.
+    READY/ACTION rows get a longer explanation; WATCH/IGNORE rows get a compact one.
+    """
+    try:
+        ticker = str(row.get("Ticker", "")).upper().strip()
+        action = str(row.get("Action", "")).strip()
+        state = str(row.get("State", "")).strip()
+        setup = str(row.get("Setup Type", "")).strip()
+        category = str(row.get("Category", "")).strip() or "מניה כללית"
+        driver = str(row.get("Primary Driver", "")).strip() or "QQQ / שוק טכנולוגיה"
+        alignment = str(row.get("Driver Alignment", "")).strip() or "אין אישור דרייבר ברור"
+        priced = str(row.get("Priced-In Risk", "")).strip() or "לא סומן סיכון תמחור חריג"
+        why = str(row.get("Why", "")).strip()
+        need = str(row.get("What We Need", "")).strip()
+        quality = str(row.get("Quality Notes", "")).strip()
+
+        current = _fmt_explain_value(row.get("Current"), "$", 2)
+        trigger = _fmt_explain_value(row.get("Buy Trigger", row.get("Next Action Price")), "$", 2)
+        stop = _fmt_explain_value(row.get("Stop"), "$", 2)
+        risk = _fmt_explain_value(row.get("Risk %"), "%", 1)
+        score = _fmt_explain_value(row.get("Breakout Score"), "", 1)
+        rsi = _fmt_explain_value(row.get("RSI"), "", 1)
+        atr = _fmt_explain_value(row.get("ATR%"), "%", 1)
+        run20 = _fmt_explain_value(row.get("20D Run"), "%", 1)
+        rel = _fmt_explain_value(row.get("Stock vs Driver 5D %"), "%", 1)
+        dist = _fmt_explain_value(row.get("Distance to Action %", row.get("Distance to Trigger %")), "%", 1)
+        market_mood = str(row.get("Market Mood", "")).strip()
+        hidden = str(row.get("Hidden Gem Signal", "")).strip()
+
+        action_like = any(token in state for token in ["מוכן", "READY"]) or "פעולה" in action or "ACTION" in action
+        avoid_like = any(token in action for token in ["לא לגעת", "להיזהר", "AVOID"]) or any(token in state for token in ["לא רלוונטי", "IGNORE"])
+
+        if action_like:
+            lines = [
+                f"{ticker}: המערכת מסמנת אפשרות פעולה, לא קנייה אוטומטית.",
+                f"סטאפ: {setup}; תחום: {category}; דרייבר: {driver}.",
+                f"אישור דרייבר: {alignment}; חוזק מול הדרייבר ב-5 ימים: {rel}.",
+                f"מחיר נוכחי {current}; טריגר/מחיר פעולה {trigger}; מרחק לפעולה {dist}.",
+                f"סטופ {stop}; סיכון {risk}; יעד נבדק לפי 8%-12% / Quick Burst בהתאם למצב.",
+                f"RSI {rsi}, ATR {atr}, ריצה 20 יום {run20}, ציון פריצה {score}.",
+                f"סיכון תמחור: {priced}.",
+                f"הסטאפ מתבטל אם הדרייבר מתהפך, אם המחיר נכשל בטריגר, או אם נשברת רמת ההגנה. {quality or why or need}",
+            ]
+        elif avoid_like:
+            lines = [
+                f"{ticker}: כרגע לא פעולה — {action or state}.",
+                f"תחום: {category}; דרייבר: {driver}; אישור דרייבר: {alignment}.",
+                f"המספרים המרכזיים: RSI {rsi}, ATR {atr}, ריצה 20 יום {run20}, חוזק מול דרייבר {rel}.",
+                f"הסיבה המרכזית: {why or need or priced or 'אין מספיק איכות/טריגר נקי לפי חוקי המודל.'}",
+            ]
+        else:
+            lines = [
+                f"{ticker}: במעקב בלבד — {state or action}.",
+                f"סטאפ: {setup}; תחום: {category}; דרייבר: {driver}; אישור: {alignment}.",
+                f"המחיר/טריגר: {current} מול {trigger}; מרחק לפעולה {dist}; סיכון תמחור: {priced}.",
+                f"מה חסר: {need or why or quality or 'טריגר נקי, מחזור/דרייבר מאשר, או יחס סיכון-סיכוי טוב יותר.'}",
+            ]
+
+        if market_mood or hidden:
+            extra = ""
+            if market_mood:
+                extra += f" מצב שוק: {market_mood}."
+            if hidden:
+                extra += f" אות מיוחד: {hidden}."
+            lines[-1] = lines[-1] + extra
+
+        return "\n".join([f"{i+1}. {line}" for i, line in enumerate(lines)])
+    except Exception as e:
+        return f"לא ניתן לבנות הסבר לשורה הזאת: {str(e)[:120]}"
+
+
+def add_action_explanations(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["Action Explanation"] = out.apply(build_action_explanation, axis=1)
+    return out
+
+
+def _format_table_value(value, col=""):
+    try:
+        if value is None or pd.isna(value):
+            return ""
+        if isinstance(value, (float, np.floating)):
+            if "%" in str(col):
+                return f"{float(value):.2f}%"
+            if abs(float(value)) >= 100:
+                return f"{float(value):.2f}"
+            return f"{float(value):.2f}"
+        if isinstance(value, (int, np.integer)):
+            return str(value)
+        text = str(value)
+        return text
+    except Exception:
+        return str(value)
+
+
+def render_explainable_table(df: pd.DataFrame, cols, key_prefix: str, max_rows: int = 250):
+    """
+    Streamlit native dataframe cannot reliably freeze columns or show per-cell tooltips.
+    This HTML table freezes the first column (Ticker) and puts the reasoning tooltip on Action.
+    It is intended for daily decision tables, not for editing.
+    """
+    if df is None or df.empty:
+        st.write("אין נתונים להצגה.")
+        return
+
+    view = df.copy()
+    view = add_action_explanations(view)
+    cols = unique_existing_columns(cols, view)
+    if "Ticker" in view.columns:
+        cols = ["Ticker"] + [c for c in cols if c != "Ticker"]
+    if len(view) > max_rows:
+        st.caption(f"מציג {max_rows} מתוך {len(view)} שורות כדי לשמור על מהירות תצוגה.")
+        view = view.head(max_rows)
+
+    table_id = f"sh-table-{html.escape(str(key_prefix))}"
+    css = f"""
+    <style>
+      #{table_id}.sh-table-wrap {{
+        overflow-x: auto;
+        overflow-y: auto;
+        max-height: 650px;
+        border: 1px solid rgba(49, 51, 63, 0.18);
+        border-radius: 12px;
+        background: white;
+      }}
+      #{table_id} table {{
+        border-collapse: separate;
+        border-spacing: 0;
+        min-width: 1400px;
+        width: max-content;
+        font-size: 13px;
+        direction: ltr;
+      }}
+      #{table_id} th, #{table_id} td {{
+        padding: 7px 10px;
+        border-bottom: 1px solid rgba(49, 51, 63, 0.10);
+        white-space: nowrap;
+        text-align: left;
+        vertical-align: top;
+      }}
+      #{table_id} th {{
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        background: #f6f8fa;
+        font-weight: 700;
+      }}
+      #{table_id} th:first-child, #{table_id} td:first-child {{
+        position: sticky;
+        left: 0;
+        z-index: 4;
+        background: #ffffff;
+        box-shadow: 2px 0 4px rgba(0,0,0,0.06);
+        font-weight: 700;
+      }}
+      #{table_id} th:first-child {{
+        z-index: 5;
+        background: #eef2f7;
+      }}
+      #{table_id} td.sh-action-cell {{
+        max-width: 260px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: help;
+        border-bottom: 1px dotted #6b7280;
+      }}
+      #{table_id} td.sh-action-cell::after {{
+        content: "  ⓘ";
+        color: #64748b;
+        font-size: 11px;
+      }}
+      #{table_id} tr:hover td {{
+        background: #f9fafb;
+      }}
+      #{table_id} tr:hover td:first-child {{
+        background: #eef2f7;
+      }}
+    </style>
+    """
+
+    header = "".join(f"<th>{html.escape(str(col))}</th>" for col in cols)
+    body_rows = []
+    for _, row in view.iterrows():
+        explanation = str(row.get("Action Explanation", ""))
+        explanation_title = html.escape(explanation).replace("\n", "&#10;")
+        cells = []
+        for col in cols:
+            val = _format_table_value(row.get(col, ""), col)
+            val_html = html.escape(str(val))
+            if col == "Action":
+                cells.append(f'<td class="sh-action-cell" title="{explanation_title}">{val_html}</td>')
+            else:
+                cells.append(f"<td>{val_html}</td>")
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    table_html = css + f'<div id="{table_id}" class="sh-table-wrap"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    # Mobile / no-hover fallback: pick a ticker and read its full explanation below the table.
+    if "Ticker" in view.columns and "Action Explanation" in view.columns:
+        tickers = view["Ticker"].astype(str).tolist()
+        if tickers:
+            selected = st.selectbox(
+                "הצג הסבר מלא למניה",
+                options=tickers,
+                key=f"{key_prefix}_explain_select",
+                help="במחשב אפשר לרחף מעל תא 'Action'. בטלפון בחר טיקר כאן כדי לראות את ההסבר."
+            )
+            explanation = view.loc[view["Ticker"].astype(str) == selected, "Action Explanation"].iloc[0]
+            st.info(explanation)
 
 
 def get_column_config():
     return {
         "Ticker": st.column_config.TextColumn("Ticker", help="סימול המניה בבורסה, למשל AMD או TSLA."),
+        "Category": st.column_config.TextColumn("תחום", help="סיווג מניה לפי הדרייבר המרכזי שלה: נפט, קריפטו, שבבים, תוכנה, פיננסים וכו׳."),
+        "Primary Driver": st.column_config.TextColumn("דרייבר ראשי", help="הנכס/ETF שמולו בודקים האם המהלך של המניה מאושר: נפט, ביטקוין, SMH, QQQ וכו׳."),
+        "Driver 1D %": st.column_config.NumberColumn("דרייבר 1D", help="שינוי יומי בדרייבר הראשי.", format="%.2f%%"),
+        "Driver 5D %": st.column_config.NumberColumn("דרייבר 5D", help="שינוי 5 ימי מסחר בדרייבר הראשי.", format="%.2f%%"),
+        "Driver 20D %": st.column_config.NumberColumn("דרייבר 20D", help="שינוי 20 ימי מסחר בדרייבר הראשי.", format="%.2f%%"),
+        "Stock 5D %": st.column_config.NumberColumn("מניה 5D", help="שינוי 5 ימי מסחר במניה עצמה.", format="%.2f%%"),
+        "Stock vs Driver 5D %": st.column_config.NumberColumn("חוזק מול דרייבר", help="כמה המניה חזקה/חלשה ביחס לדרייבר שלה ב-5 ימים.", format="%.2f%%"),
+        "Driver Alignment": st.column_config.TextColumn("אישור דרייבר", help="האם המניה זזה יחד עם הדרייבר, חזקה ממנו, או מתנהגת נגדו."),
+        "Driver Note": st.column_config.TextColumn("הערת דרייבר", help="הסבר קצר להשוואת המניה מול הדרייבר."),
+        "Priced-In Risk": st.column_config.TextColumn("סיכון מתומחר", help="בודק האם המהלך כבר רץ יותר מדי לפי RSI, ריצה 20 יום, מרחק מהטריגר וחוזק מול הדרייבר."),
+        "Action": st.column_config.TextColumn("פעולה פשוטה", help="שורת החלטה פשוטה: פעולה / מעקב / לחכות / להיזהר. רחף מעל התא בטבלת ה-HTML כדי לראות הסבר."),
+        "Action Explanation": st.column_config.TextColumn("הסבר פעולה", help="הסבר מילולי דטרמיניסטי שמתרגם את המספרים והחוקים לסיבה ברורה."),
         "Action Now": st.column_config.TextColumn("מה לעשות עכשיו", help="הוראת פעולה יומית: PLACE LIMIT, PLACE STOP LIMIT, WAIT או SELL/HOLD."),
         "Order": st.column_config.TextColumn("סוג פקודה", help="BUY LIMIT = קנייה בירידה למחיר מסוים. BUY STOP LIMIT = קנייה רק אם המחיר פורץ למעלה לרמת הכניסה."),
         "Current": st.column_config.NumberColumn("מחיר נוכחי", help="המחיר האחרון שהמערכת משכה מ-Yahoo Finance.", format="%.2f"),
@@ -3194,10 +3722,10 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.8 — דשבורד פעולה חכם</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V13.9 — Driver-Aware Dashboard</h1>", unsafe_allow_html=True)
     st.info(
-        "V13.8 מוסיפה סינון איכות למניות כבדות: מניות כמו CAT לא יקבלו יעד 8%-12% כפקודת פעולה אם הן כבר אחרי ריצה עם סטופ רחב או יחס סיכון/יעד חלש. "
-        "המערכת מסכמת רווח/הפסד לתיק אמת בלבד וגם לאמת+וירטואלי, וממשיכה לתת HOLD/SELL לפי EMA21 ו-Trailing Stop."
+        "V13.9 מוסיפה שכבת Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה — נפט ל-XOM, ביטקוין ל-MARA, SMH לשבבים, KWEB לסין ו-QQQ למגה-טק. "
+        "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
     st.sidebar.header("הגדרות קצרות")
@@ -3254,7 +3782,7 @@ else:
             )
 
         action_cols = [
-            "Ticker", "State", "Trade Mode", "Setup Type", "Ticker Class", "Current", "Buy Trigger", "Distance to Trigger %",
+            "Ticker", "Action", "Action Explanation", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Trade Mode", "Setup Type", "Ticker Class", "Current", "Buy Trigger", "Distance to Trigger %",
             "Stop", "Risk %", "Quick Stop", "Quick Risk %", "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%", "RR 8%", "RR 12%",
             "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Why", "Market Mood", "Hidden Gem Signal",
             "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
@@ -3263,7 +3791,7 @@ else:
         ]
 
         watch_cols = [
-            "Ticker", "State", "Setup Type", "Ticker Class", "Current", "Next Action Price", "Distance to Action %",
+            "Ticker", "Action", "Action Explanation", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Setup Type", "Ticker Class", "Current", "Next Action Price", "Distance to Action %",
             "What We Need", "Why", "Breakout Score", "Action Quality", "Exhaustion Risk", "Quality Notes", "Buy Trigger",
             "Pullback Watch Price", "Pullback Deep Price", "Stop", "Risk %", "Quick Stop", "Quick Risk %",
             "Quick Target 4.5%", "Quick RR", "Target 8%", "Target 12%",
@@ -3273,7 +3801,7 @@ else:
         ]
 
         ignore_cols = [
-            "Ticker", "State", "Setup Type", "Ticker Class", "Current", "Why", "What We Need",
+            "Ticker", "Action", "Action Explanation", "Category", "Primary Driver", "Driver Alignment", "Stock vs Driver 5D %", "Driver 5D %", "Priced-In Risk", "State", "Setup Type", "Ticker Class", "Current", "Why", "What We Need",
             "Market Mood", "Hidden Gem Signal", "AVWAP", "Distance to AVWAP %", "Hugging AVWAP", "Liquidity Purge", "Purge Low", "Purge High",
             "Institutional Absorption", "Liquidity Void Above", "ZLEMA8", "Day Change %", "EMA21", "SMA200", "RS5", "RS20", "RSI", "ATR%",
             "TTM Squeeze", "Squeeze Momentum Rising", "Volume Dry-Up", "ATR Pinch", "VAR 15d", "Inside Day", "Tight Day", "20D Run", "Run Zone"
@@ -3299,9 +3827,9 @@ else:
 
             # Hebrew display/export labels are calculated from saved results on every rerender.
             # This means toggling table/card mode only changes the UI, not the scan results.
-            df_action_display = localize_daily_display(df_action)
-            df_watch_display = localize_daily_display(df_watch)
-            df_ignore_display = localize_daily_display(df_ignore)
+            df_action_display = add_action_explanations(localize_daily_display(df_action))
+            df_watch_display = add_action_explanations(localize_daily_display(df_watch))
+            df_ignore_display = add_action_explanations(localize_daily_display(df_ignore))
 
             total = len(df_action) + len(df_watch) + len(df_ignore)
             near_ready_count = 0
@@ -3345,7 +3873,7 @@ else:
                 if not df_action_display.empty:
                     df_action_display = dedupe_dataframe_columns(df_action_display)
                     cols = unique_existing_columns(action_cols, df_action_display)
-                    st.dataframe(df_action_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                    render_explainable_table(df_action_display[cols], cols, key_prefix="action_table")
                 else:
                     st.write("אין פקודות פעולה.")
 
@@ -3353,7 +3881,7 @@ else:
                 if not df_watch_display.empty:
                     df_watch_display = dedupe_dataframe_columns(df_watch_display)
                     cols = unique_existing_columns(watch_cols, df_watch_display)
-                    st.dataframe(df_watch_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                    render_explainable_table(df_watch_display[cols], cols, key_prefix="watch_table")
                 else:
                     st.write("אין מועמדות מעקב.")
 
@@ -3361,7 +3889,7 @@ else:
                 if not df_ignore_display.empty:
                     df_ignore_display = dedupe_dataframe_columns(df_ignore_display)
                     cols = unique_existing_columns(ignore_cols, df_ignore_display)
-                    st.dataframe(df_ignore_display[cols], use_container_width=True, hide_index=True, column_config=get_column_config())
+                    render_explainable_table(df_ignore_display[cols], cols, key_prefix="ignore_table")
                 else:
                     st.write("אין מניות לא רלוונטיות.")
 
