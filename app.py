@@ -15,8 +15,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V15.3 - Position-Aware Audit", layout="wide")
-APP_VERSION = "V15.3-position-aware-audit"
+st.set_page_config(page_title="SwingHunter V16.0 - Disciplined Trade Lifecycle", layout="wide")
+APP_VERSION = "V16.0-disciplined-trade-lifecycle"
 
 # ==========================================================
 # 1. Security
@@ -272,6 +272,103 @@ def is_hidden_gem_setup(setup_type: str) -> bool:
         "ZLEMA Burst",
         "Coiled Breakout",
     ]
+
+
+# ==========================================================
+# 2B. V16.0 Disciplined trade model
+# ==========================================================
+FAST_SWING_CATEGORIES = {
+    "EV / AI hybrid", "EV", "AI chips", "AI infrastructure", "AI software",
+    "Cyber / software", "Cloud software", "Mega tech", "Mega tech / streaming",
+    "China tech", "Crypto proxy"
+}
+
+SLOW_TRADE_CATEGORIES = {
+    "Oil macro", "Financials", "Financials / payments", "Consumer staples",
+    "Consumer defensive", "Consumer discretionary", "Industrial defensive",
+    "Industrial cyclical", "Industrial / aerospace", "Airlines / travel", "Travel",
+    "Healthcare"
+}
+
+EVENT_OR_DRIVER_STRICT_CATEGORIES = {"Oil macro", "Crypto proxy", "China tech", "Airlines / travel"}
+
+
+def target_profile_for_category(category: str) -> dict:
+    """
+    V16.0: יעד לא יכול להיות אחיד לכל מניה.
+    Fast swing names are tested for 8%-12%; heavy/slow names are treated as 3%-6% trades.
+    """
+    cat = str(category or "")
+    if cat in SLOW_TRADE_CATEGORIES:
+        return {
+            "universe": "SLOW / SMALL TARGET",
+            "primary_target_pct": 4.5,
+            "stretch_target_pct": 6.5,
+            "max_ready_risk_pct": 4.8,
+            "min_rr": 1.15,
+            "note": "מניה כבדה/איטית — לא יעד 8%-12% כברירת מחדל"
+        }
+    return {
+        "universe": "FAST SWING",
+        "primary_target_pct": 8.0,
+        "stretch_target_pct": 12.0,
+        "max_ready_risk_pct": 7.0,
+        "min_rr": 1.35,
+        "note": "מתאימה יותר למודל סווינג 8%-12%"
+    }
+
+
+def entry_validity_days_for_setup(setup_type: str, category: str) -> int:
+    st = str(setup_type or "")
+    cat = str(category or "")
+    if "Quick" in st:
+        return 1
+    if st in ["Liquidity Purge", "AVWAP Squeeze", "Void Squeeze", "Squeeze Burst", "ZLEMA Burst", "Coiled Breakout"]:
+        return 4
+    if st == "Base Breakout":
+        return 5
+    if st == "Momentum Breakout":
+        return 3
+    if cat in SLOW_TRADE_CATEGORIES:
+        return 2
+    return 3
+
+
+def driver_gate_blocks_action(category: str, alignment: str, driver_5d: float, stock_5d: float) -> tuple[bool, str]:
+    """
+    Driver-aware is a gate, not just an informational column.
+    Do not allow action when the primary driver clearly disagrees with the stock.
+    """
+    cat = str(category or "")
+    align = str(alignment or "")
+
+    if align == "DRIVER DIVERGENCE":
+        return True, "דרייבר ראשי חיובי אבל המניה חלשה — אין Action"
+
+    if cat in EVENT_OR_DRIVER_STRICT_CATEGORIES:
+        if align in ["NO DRIVER DATA", "ALIGNED DOWN"]:
+            return True, "קטגוריה תלויה בדרייבר, והדרייבר לא מאשר"
+        if np.isfinite(driver_5d) and driver_5d < -1.0:
+            return True, "הדרייבר שלילי ב-5 ימים — לא נכנסים לונג"
+        if cat in ["Oil macro", "Crypto proxy"] and np.isfinite(driver_5d) and driver_5d < 0.75:
+            return True, "דרייבר חלש מדי לטרייד חדש בקטגוריה הזו"
+
+    return False, ""
+
+
+def build_position_management_rule(entry: float, stop: float, target_pct: float, setup_type: str) -> str:
+    try:
+        t1 = entry * (1 + target_pct / 100)
+        protect_60 = entry * (1 + target_pct * 0.60 / 100)
+        protect_80 = entry * (1 + target_pct * 0.80 / 100)
+        return (
+            f"כניסה {entry:.2f}; יעד ראשי {t1:.2f}. "
+            f"ב-60% מהיעד (~{protect_60:.2f}) להעביר סטופ לפחות לברייק-איבן/מעל EMA8. "
+            f"ב-80% מהיעד (~{protect_80:.2f}) לשקול מימוש חלקי או trailing tight. "
+            f"סטופ ראשוני {stop:.2f}. לא מחכים עיוור ליעד אם המניה מחזירה מעל חצי מהרווח."
+        )
+    except Exception:
+        return "ניהול פוזיציה: להגן על רווחים כשהמניה משיגה 60%-80% מהיעד."
 
 
 NOTIONAL_PER_TRADE = 1000.0
@@ -1517,6 +1614,13 @@ def evaluate_breakout_action_plan(
         "Driver Note": "",
         "Priced-In Risk": "",
         "Action": "",
+        "Trade Universe": "",
+        "Primary Target %": np.nan,
+        "Stretch Target %": np.nan,
+        "Primary Target": np.nan,
+        "Stretch Target": np.nan,
+        "Entry Validity Days": np.nan,
+        "Position Management Rule": "",
         "State": "IGNORE",
         "Setup Type": "Weak / Ignore",
         "Current": np.nan,
@@ -1789,6 +1893,10 @@ def evaluate_breakout_action_plan(
         else:
             priced_in_risk = "HIGH — " + ", ".join(priced_in_flags[:4])
 
+        target_profile = target_profile_for_category(profile.get("category", "General equity"))
+        primary_target_pct = target_profile["primary_target_pct"]
+        stretch_target_pct = target_profile["stretch_target_pct"]
+
         if is_liquidity_purge:
             hidden_gem_signal = "ציד נזילות / מלכודת מוכרים"
         elif hugging_avwap and atr_pinch < 0.80:
@@ -1836,6 +1944,9 @@ def evaluate_breakout_action_plan(
             "Driver Alignment": driver_metrics.get("alignment", ""),
             "Driver Note": driver_metrics.get("note", ""),
             "Priced-In Risk": priced_in_risk,
+            "Trade Universe": target_profile["universe"],
+            "Primary Target %": primary_target_pct,
+            "Stretch Target %": stretch_target_pct,
             "Current": round(last_p, 2),
             "Buy Trigger": breakout_trigger,
             "Next Action Price": breakout_trigger,
@@ -2034,11 +2145,10 @@ def evaluate_breakout_action_plan(
         stop = round(stop, 2)
         risk_pct = (entry - stop) / entry * 100
         quick_target = round(entry * 1.045, 2)
-        quick_target = round(entry * 1.045, 2)
-        target8 = round(entry * 1.08, 2)
-        target12 = round(entry * 1.12, 2)
-        rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
-        rr12 = 12 / risk_pct if risk_pct > 0 else np.nan
+        target8 = round(entry * (1 + primary_target_pct / 100), 2)
+        target12 = round(entry * (1 + stretch_target_pct / 100), 2)
+        rr8 = primary_target_pct / risk_pct if risk_pct > 0 else np.nan
+        rr12 = stretch_target_pct / risk_pct if risk_pct > 0 else np.nan
 
         # V12.3: Strict R/R enforcement for Cheat Entry.
         # If the early entry is not actually tight, revert to standard trigger.
@@ -2056,11 +2166,10 @@ def evaluate_breakout_action_plan(
             stop = round(stop, 2)
             risk_pct = (entry - stop) / entry * 100
             quick_target = round(entry * 1.045, 2)
-            quick_target = round(entry * 1.045, 2)
-            target8 = round(entry * 1.08, 2)
-            target12 = round(entry * 1.12, 2)
-            rr8 = 8 / risk_pct if risk_pct > 0 else np.nan
-            rr12 = 12 / risk_pct if risk_pct > 0 else np.nan
+            target8 = round(entry * (1 + primary_target_pct / 100), 2)
+            target12 = round(entry * (1 + stretch_target_pct / 100), 2)
+            rr8 = primary_target_pct / risk_pct if risk_pct > 0 else np.nan
+            rr12 = stretch_target_pct / risk_pct if risk_pct > 0 else np.nan
 
         base["Setup Type"] = setup_type
         trigger_dist = (entry / last_p - 1) * 100
@@ -2071,6 +2180,7 @@ def evaluate_breakout_action_plan(
             "Distance to Trigger %": round(trigger_dist, 2),
             "Distance to Action %": round(trigger_dist, 2),
             "Breakout Watch Price": round(entry, 2),
+            "Entry Validity Days": entry_validity_days_for_setup(setup_type, profile.get("category", "")),
         })
 
         quick_ready, quick_stop, quick_risk_pct, quick_rr, quick_notes = evaluate_quick_burst_candidate(
@@ -2094,6 +2204,9 @@ def evaluate_breakout_action_plan(
             "Quick Holding Plan": "1-5 trading days / take profit near +4.5%" if quick_ready else quick_notes,
             "Target 8%": target8,
             "Target 12%": target12,
+            "Primary Target": target8,
+            "Stretch Target": target12,
+            "Position Management Rule": build_position_management_rule(entry, stop, primary_target_pct, setup_type),
             "RR 8%": round(rr8, 2) if np.isfinite(rr8) else np.nan,
             "RR 12%": round(rr12, 2) if np.isfinite(rr12) else np.nan,
             "Breakout Score": score,
@@ -2112,21 +2225,23 @@ def evaluate_breakout_action_plan(
             )
             return base
 
-        # Good watch candidate but not actionable yet.
-        if trigger_dist > 3:
+        # V16.0: late-entry guard. If the trigger is too far above current price,
+        # we often enter after too much of the move is already gone.
+        max_trigger_distance = 2.2 if target_profile["universe"] == "FAST SWING" else 1.5
+        if trigger_dist > max_trigger_distance:
             base.update(
                 State="WAIT FOR BREAKOUT",
-                **{"What We Need": "Breakout closer than 3%"},
-                Why="מועמדת מעניינת, אבל הפריצה לא מספיק קרובה"
+                **{"What We Need": f"Trigger closer than {max_trigger_distance:.1f}%"},
+                Why="הטריגר רחוק מדי ביחס ליעד; מחכים להתקרבות/בסיס חדש ולא רודפים אחרי פריצה מאוחרת"
             )
             return base
 
-        # Too high risk for target 8%-12%.
-        if risk_pct > 8:
+        # V16.0: risk must fit the target profile. Heavy names cannot get wide stops for small targets.
+        if risk_pct > target_profile["max_ready_risk_pct"]:
             base.update(
                 State="WAIT FOR BREAKOUT",
                 **{"What We Need": "Tighter risk / closer base"},
-                Why=f"הטריגר קרוב, אבל הסטופ רחב מדי ({risk_pct:.1f}%)"
+                Why=f"הסיכון רחב מדי למודל היעד של המניה ({risk_pct:.1f}% מול מקסימום {target_profile['max_ready_risk_pct']:.1f}%)"
             )
             return base
 
@@ -2140,14 +2255,15 @@ def evaluate_breakout_action_plan(
             )
             return base
 
-        # V12.4: Quick Burst can be actionable with a different objective.
+        # V16.0: Quick Burst stays as high-priority watch, not an automatic trade.
+        # Audit showed it often identifies movement but fails as an executable order.
         if quick_ready and score >= 52:
             base.update(
-                State="QUICK BURST READY",
-                **{"What We Need": "Place quick stop-limit order"},
-                **{"Trade Mode": "QUICK BURST"},
-                Why=f"יעד קצר 4.5% עם סטופ קצר ו-R/R סביר: {quick_notes}",
-                **{"Action Quality": "READY", "Quality Notes": quick_notes, "Exhaustion Risk": "LOW"}
+                State="NEAR READY",
+                **{"What We Need": "Quick setup detected — manual confirmation / intraday base"},
+                **{"Trade Mode": "QUICK BURST WATCH"},
+                Why=f"Quick Burst מזוהה, אבל V16 לא הופך אותו אוטומטית לטרייד עד שיש אישור ידני/מחזור תוך־יומי: {quick_notes}",
+                **{"Action Quality": "NEAR READY", "Quality Notes": quick_notes, "Exhaustion Risk": "MEDIUM"}
             )
             return base
 
@@ -2158,6 +2274,40 @@ def evaluate_breakout_action_plan(
                 State=state,
                 **{"What We Need": "Higher readiness score / or Quick Burst conditions"},
                 Why=f"קרובה לטריגר, אבל איכות הסטאפ עדיין לא מספקת ({score:.1f}); Quick: {quick_notes}"
+            )
+            return base
+
+        # V16.0: driver gate is hard. If the main driver does not approve, do not produce action.
+        block_driver, driver_block_reason = driver_gate_blocks_action(
+            profile.get("category", ""), driver_metrics.get("alignment", ""),
+            driver_metrics.get("driver_5d", np.nan), driver_metrics.get("stock_5d", np.nan)
+        )
+        if block_driver:
+            base.update(
+                State="NEAR READY",
+                **{"What We Need": "Driver confirmation"},
+                Why=driver_block_reason,
+                **{"Action Quality": "NEAR READY", "Quality Notes": driver_block_reason, "Exhaustion Risk": "MEDIUM"}
+            )
+            return base
+
+        # V16.0: weak confirmation volume is not allowed for READY.
+        if volume_ratio < 0.85 and setup_type not in ["Liquidity Purge", "AVWAP Squeeze", "Coiled Breakout", "Squeeze Burst", "Void Squeeze"]:
+            base.update(
+                State="NEAR READY",
+                **{"What We Need": "Volume confirmation"},
+                Why=f"מחזור חלש ביחס לממוצע ({volume_ratio:.2f}) — המהלך לא מקבל Action בלי אישור מחזור",
+                **{"Action Quality": "NEAR READY", "Quality Notes": "Weak volume blocks READY", "Exhaustion Risk": "MEDIUM"}
+            )
+            return base
+
+        # V16.0: late move guard. Strong stocks after big 20D runs should reset or pull back.
+        if run20 > 25 and setup_type in ["Momentum Breakout", "Base Breakout"]:
+            base.update(
+                State="WAIT FOR PULLBACK",
+                **{"What We Need": "Pullback / reset after strong run"},
+                Why=f"המניה כבר רצה {run20:.1f}% ב-20 יום; לא מאשרים פריצה מאוחרת כ-Action",
+                **{"Action Quality": "WATCH", "Quality Notes": "Late breakout blocked", "Exhaustion Risk": "HIGH"}
             )
             return base
 
@@ -2184,6 +2334,14 @@ def evaluate_breakout_action_plan(
             if heavy_reasons:
                 quality = "NEAR READY"
                 quality_notes = (quality_notes + " | " if quality_notes else "") + " | ".join(heavy_reasons)
+                exhaustion_risk = "MEDIUM"
+
+        # V16.0: heavy/slow stocks do not receive 8%-12% READY labels by default.
+        # They can be candidates only for smaller target model and only with driver strength + clean risk.
+        if quality == "READY" and target_profile["universe"] == "SLOW / SMALL TARGET":
+            if not (driver_metrics.get("alignment", "") in ["ALIGNED", "STOCK OUTPERFORMS DRIVER"] and volume_ratio >= 1.0 and risk_pct <= target_profile["max_ready_risk_pct"] and rr8 >= target_profile["min_rr"]):
+                quality = "NEAR READY"
+                quality_notes = (quality_notes + " | " if quality_notes else "") + "מניה כבדה: נדרשת התאמה ליעד קטן, דרייבר מאשר, מחזור, וסיכון קצר"
                 exhaustion_risk = "MEDIUM"
 
         # V13.9: driver-aware gate. Do not mark a setup READY if the stock's main driver is moving against it.
@@ -2214,7 +2372,7 @@ def evaluate_breakout_action_plan(
             base.update(
                 State="BUY SETUP READY",
                 **{"What We Need": "Place stop-limit order"},
-                Why="טריגר קרוב + איכות פעולה מספקת ליעד 8%-12%"
+                Why=f"טריגר קרוב + דרייבר/מחזור/סיכון מאשרים. יעד ראשי לפי פרופיל: {primary_target_pct:.1f}%"
             )
             return base
 
@@ -4562,9 +4720,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.3 — Position-Aware Audit</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V16.0 — Disciplined Trade Lifecycle</h1>", unsafe_allow_html=True)
     st.info(
-        "V15.3 משדרגת את Audit Lab: ההמלצה המקורית ננעלת, תוקף פקודת הכניסה נקבע לפי סוג הסטאפ, ובדיקת התוצאה משתמשת גם בנתוני תוך־יומי כשאפשר כדי לדמות כניסה/סטופ/יעד בצורה ריאלית יותר. "
+        "V16.0 מקשיחה את מודל ההחלטה עצמו: פחות המלצות, יותר משמעת. דרייבר חיצוני הוא שער כניסה, מניות כבדות לא מקבלות יעד 8%-12% אוטומטי, מחזור חלש/ריצה מאוחרת מורידים פעולה ל-Watch, ונוספו שדות לניהול פוזיציה אחרי כניסה. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
