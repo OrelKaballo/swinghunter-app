@@ -15,8 +15,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V15.0 - Trader UX", layout="wide")
-APP_VERSION = "V15.0-trader-ux"
+st.set_page_config(page_title="SwingHunter V15.3 - Position-Aware Audit", layout="wide")
+APP_VERSION = "V15.3-position-aware-audit"
 
 # ==========================================================
 # 1. Security
@@ -2328,6 +2328,104 @@ def _safe_panel_series(panel: pd.DataFrame, field: str, symbol: str) -> pd.Serie
         return pd.Series(dtype=float)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_audit_intraday_data(extra_days: int = 70, interval: str = "60m"):
+    """Download intraday data for realistic audit sequencing.
+
+    Yahoo usually supplies recent intraday data only. If unavailable, the audit
+    falls back to daily OHLC. This is used only for replay sequencing, not for
+    the scanner signal itself.
+    """
+    driver_symbols = sorted({get_driver_profile(t).get("driver", "QQQ") for t in WATCHLIST})
+    symbols = sorted(set(WATCHLIST + driver_symbols + ["QQQ"]))
+    end = datetime.now()
+    start = end - timedelta(days=extra_days)
+    try:
+        return yf.download(
+            symbols,
+            start=start,
+            end=end,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            group_by="column",
+            threads=True,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _safe_intraday_frame(panel: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Return OHLC intraday frame for a symbol from a yfinance multi-panel."""
+    try:
+        if panel is None or panel.empty or not isinstance(panel.columns, pd.MultiIndex):
+            return pd.DataFrame()
+        if "Close" in panel.columns.get_level_values(0):
+            cols = {}
+            for f in ["Open", "High", "Low", "Close", "Volume"]:
+                if f in panel.columns.get_level_values(0) and symbol in panel[f].columns:
+                    cols[f] = panel[f][symbol]
+            return pd.DataFrame(cols).dropna(how="all")
+        if "Close" in panel.columns.get_level_values(1):
+            return panel[symbol][["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _bars_for_trade_date(intraday_panel: pd.DataFrame, ticker: str, trade_date) -> pd.DataFrame:
+    """Intraday bars for one trading date. Uses exchange-date matching."""
+    df = _safe_intraday_frame(intraday_panel, ticker)
+    if df.empty:
+        return pd.DataFrame()
+    try:
+        target_date = trade_date.date() if hasattr(trade_date, "date") else pd.to_datetime(trade_date).date()
+        idx_dates = pd.Series(df.index).dt.date.values
+        out = df.loc[idx_dates == target_date].copy()
+        return out.dropna(how="all")
+    except Exception:
+        try:
+            target_date = pd.to_datetime(trade_date).date()
+            return df[df.index.date == target_date].copy().dropna(how="all")
+        except Exception:
+            return pd.DataFrame()
+
+
+def _checkpoint_bars_for_date(intraday_panel: pd.DataFrame, ticker: str, trade_date) -> pd.DataFrame:
+    """Return open / one-third / two-thirds / close checkpoints for sequencing.
+
+    We keep this intentionally light: not tick-perfect, but much closer than a
+    daily candle. If intraday is missing, caller falls back to daily OHLC.
+    """
+    bars = _bars_for_trade_date(intraday_panel, ticker, trade_date)
+    if bars.empty:
+        return pd.DataFrame()
+    n = len(bars)
+    picks = sorted(set([0, max(0, n // 3), max(0, (2 * n) // 3), n - 1]))
+    return bars.iloc[picks].copy()
+
+
+def _audit_order_valid_days_from_row(row: dict) -> int:
+    """Dynamic order validity based on the original setup.
+
+    The point is to lock the first recommendation instead of recalculating a new
+    trigger every day. Quick setups expire quickly; base/breakout setups get a
+    few days to mature.
+    """
+    state = str(row.get("State", ""))
+    setup_type = str(row.get("Setup Type", ""))
+    hidden = str(row.get("Hidden Gem Signal", ""))
+    if state == "QUICK BURST READY":
+        return 1
+    if "Base" in setup_type or "Coiled" in setup_type or "Squeeze" in hidden:
+        return 5
+    if "Breakout" in setup_type or "Momentum" in setup_type:
+        return 3
+    if "Pullback" in setup_type:
+        return 3
+    return 3
+
+
 def _first_hit_index(series_high: pd.Series, trigger: float):
     try:
         hits = series_high[series_high >= trigger]
@@ -2390,15 +2488,17 @@ def _assess_signal_outcome(
     data_as_of,
     row: dict,
     forward_days: int = 5,
-    order_valid_days: int = 1,
+    order_valid_days: int = None,
+    intraday_panel: pd.DataFrame = None,
 ):
     """
-    Realistic replay:
-    - The scan decision is made before the decision_date session, using data_as_of = previous close.
-    - Only BUY SETUP READY / QUICK BURST READY are treated as actual trade recommendations.
-    - A stop-limit buy order is valid for order_valid_days sessions.
-    - If filled, outcome is tracked until first target/stop, or until forward_days expires.
-    - If target and stop are both hit in the same daily candle, we mark it conservative/ambiguous as stop first.
+    Position-aware realistic replay:
+    - Scan decision is made before decision_date, using previous close only.
+    - The original recommendation is LOCKED: entry/stop/target do not move forward daily.
+    - Order validity is decided by setup type, unless explicitly supplied.
+    - Fill/outcome sequencing uses intraday checkpoints when available:
+      open / one-third / two-thirds / close. Fallback is daily OHLC.
+    - If target and stop are touched in the same checkpoint/daily bar, the audit is conservative.
     """
     h_all = _safe_panel_series(panel, "High", ticker)
     l_all = _safe_panel_series(panel, "Low", ticker)
@@ -2407,21 +2507,29 @@ def _assess_signal_outcome(
     if h_all.empty or l_all.empty or o_all.empty or c_all.empty:
         return {}
 
-    future_idx = c_all.index[c_all.index >= decision_date][:forward_days]
-    if len(future_idx) == 0:
-        return {}
-
-    current = safe_float(row.get("Current", np.nan))
     plan = _audit_trade_plan_from_row(row)
+    current = safe_float(row.get("Current", np.nan))
+
+    if order_valid_days is None:
+        order_valid_days = _audit_order_valid_days_from_row(row)
+    order_valid_days = max(1, int(order_valid_days))
+    forward_days = max(1, int(forward_days))
+
+    # Need enough sessions for order validity + post-fill management.
+    all_future_idx = c_all.index[c_all.index >= decision_date][:(order_valid_days + forward_days + 2)]
+    if len(all_future_idx) == 0:
+        return {}
 
     # Research rows are deliberately not counted as trades.
     if plan is None:
+        future_idx = all_future_idx[:forward_days]
         future_high = h_all.loc[future_idx]
         future_low = l_all.loc[future_idx]
         future_close = c_all.loc[future_idx]
         ref = current
         return {
             "Actionable Trade": False,
+            "Order Valid Days": np.nan,
             "Order Filled": False,
             "Entry Date": "",
             "Entry Price": np.nan,
@@ -2432,11 +2540,14 @@ def _assess_signal_outcome(
             "Forward Close %": round((future_close.iloc[-1] / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
             "MFE %": round((future_high.max() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
             "MAE %": round((future_low.min() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "Peak Profit Giveback %": np.nan,
+            "Progress To Target %": np.nan,
             "Hit Target": False,
             "Hit 8%": False,
             "Hit 12%": False,
             "Hit Stop": False,
             "Audit Note": "מצב מעקב בלבד — לא נספר כעסקה אמיתית.",
+            "Fill Check Mode": "research-only",
         }
 
     entry_trigger = plan["entry"]
@@ -2445,122 +2556,194 @@ def _assess_signal_outcome(
     target = plan["target"]
     target12 = plan["target12"]
 
-    # 1) Fill simulation: stop-limit order valid for N sessions.
-    fill_date = None
+    def build_bars_for_dates(dates):
+        rows = []
+        used_intraday = False
+        for d in dates:
+            cp = _checkpoint_bars_for_date(intraday_panel, ticker, d) if intraday_panel is not None else pd.DataFrame()
+            if not cp.empty:
+                used_intraday = True
+                for ts, br in cp.iterrows():
+                    rows.append({
+                        "session": d,
+                        "ts": ts,
+                        "open": safe_float(br.get("Open", np.nan)),
+                        "high": safe_float(br.get("High", np.nan)),
+                        "low": safe_float(br.get("Low", np.nan)),
+                        "close": safe_float(br.get("Close", np.nan)),
+                        "source": "intraday-checkpoints",
+                    })
+            else:
+                rows.append({
+                    "session": d,
+                    "ts": pd.to_datetime(d),
+                    "open": safe_float(o_all.loc[d], np.nan),
+                    "high": safe_float(h_all.loc[d], np.nan),
+                    "low": safe_float(l_all.loc[d], np.nan),
+                    "close": safe_float(c_all.loc[d], np.nan),
+                    "source": "daily-fallback",
+                })
+        return rows, used_intraday
+
+    # 1) Fill simulation: original stop-limit order valid for dynamic N sessions.
+    order_idx = all_future_idx[:order_valid_days]
+    order_bars, used_intraday = build_bars_for_dates(order_idx)
+    fill_session = None
+    fill_ts = None
     fill_price = np.nan
-    order_idx = future_idx[:max(1, int(order_valid_days))]
-    for d in order_idx:
-        op = safe_float(o_all.loc[d], np.nan)
-        hi = safe_float(h_all.loc[d], np.nan)
-        if not np.isfinite(op) or not np.isfinite(hi):
+    cancelled = False
+    cancel_session = None
+    cancel_reason = ""
+
+    for br in order_bars:
+        op, hi, lo = br["open"], br["high"], br["low"]
+        if not np.isfinite(op) or not np.isfinite(hi) or not np.isfinite(lo):
             continue
-        if op > limit_price:
-            # Gap too far above limit. Do not chase.
-            continue
+
+        # If the setup breaks below the original stop before triggering, cancel the stale recommendation.
+        if lo <= stop and hi < entry_trigger:
+            cancelled = True
+            cancel_session = br["session"]
+            cancel_reason = "ORDER CANCELLED / INVALIDATED BEFORE FILL"
+            break
+
         if hi >= entry_trigger:
-            candidate_fill = max(op, entry_trigger)
+            # Stop-limit: avoid chasing big gaps above the limit.
+            if op > limit_price and lo > limit_price:
+                continue
+            candidate_fill = max(min(max(op, entry_trigger), limit_price), entry_trigger)
             if candidate_fill <= limit_price:
-                fill_date = d
+                fill_session = br["session"]
+                fill_ts = br["ts"]
                 fill_price = float(candidate_fill)
                 break
 
-    if fill_date is None:
+    if fill_session is None:
+        future_idx = all_future_idx[:min(len(all_future_idx), forward_days)]
         future_high = h_all.loc[future_idx]
         future_low = l_all.loc[future_idx]
         future_close = c_all.loc[future_idx]
         ref = current if np.isfinite(current) and current > 0 else entry_trigger
         return {
             "Actionable Trade": True,
+            "Order Valid Days": order_valid_days,
+            "Valid Until": _as_date_str(order_idx[-1]) if len(order_idx) else "",
             "Order Filled": False,
             "Entry Date": "",
             "Entry Price": np.nan,
-            "Exit Date": "",
+            "Exit Date": _as_date_str(cancel_session) if cancel_session is not None else "",
             "Exit Price": np.nan,
-            "Exit Reason": "ORDER NOT FILLED",
+            "Exit Reason": cancel_reason if cancelled else "ORDER NOT FILLED",
             "Trade Return %": np.nan,
             "Forward Close %": round((future_close.iloc[-1] / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
             "MFE %": round((future_high.max() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
             "MAE %": round((future_low.min() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "Peak Profit Giveback %": np.nan,
+            "Progress To Target %": np.nan,
             "Hit Target": False,
             "Hit 8%": False,
             "Hit 12%": False,
             "Hit Stop": False,
-            "Audit Note": "הייתה המלצה לפעולה, אבל פקודת הכניסה לא התמלאה בחלון שהוגדר.",
+            "Audit Note": "ההמלצה המקורית ננעלה, אבל הטריגר לא התמלא בתוקף הדינמי." if not cancelled else "הסטאפ נשבר לפני שהטריגר התמלא.",
+            "Fill Check Mode": "intraday checkpoints" if used_intraday else "daily fallback",
         }
 
-    # 2) Outcome simulation from fill date onward.
-    eval_idx = future_idx[future_idx >= fill_date]
-    exit_date = None
+    # 2) Outcome simulation from fill timestamp onward, for forward_days sessions from the fill session.
+    fill_pos_list = [i for i, d in enumerate(all_future_idx) if d == fill_session]
+    fill_pos = fill_pos_list[0] if fill_pos_list else 0
+    eval_dates = all_future_idx[fill_pos:fill_pos + forward_days]
+    eval_bars, used_intraday_eval = build_bars_for_dates(eval_dates)
+    eval_bars = [br for br in eval_bars if pd.to_datetime(br["ts"]) >= pd.to_datetime(fill_ts)]
+    if not eval_bars:
+        eval_bars, used_intraday_eval = build_bars_for_dates(eval_dates)
+
+    exit_session = None
+    exit_ts = None
     exit_price = np.nan
     exit_reason = "OPEN / TIME EXIT"
     hit_target = False
     hit_stop = False
     hit12 = False
     ambiguous = False
+    peak_high = fill_price
+    trough_low = fill_price
 
-    for d in eval_idx:
-        hi = safe_float(h_all.loc[d], np.nan)
-        lo = safe_float(l_all.loc[d], np.nan)
-        cl = safe_float(c_all.loc[d], np.nan)
+    for br in eval_bars:
+        hi, lo, cl = br["high"], br["low"], br["close"]
         if not np.isfinite(hi) or not np.isfinite(lo):
             continue
+        peak_high = max(peak_high, hi)
+        trough_low = min(trough_low, lo)
 
         target_hit_today = hi >= target
         stop_hit_today = lo <= stop
         target12_hit_today = np.isfinite(target12) and hi >= target12
-
         if target12_hit_today and not stop_hit_today:
             hit12 = True
 
-        # Conservative daily-bar ambiguity: if both touched same day, count stop first.
         if target_hit_today and stop_hit_today:
             ambiguous = True
-            exit_date = d
+            exit_session = br["session"]
+            exit_ts = br["ts"]
             exit_price = stop
-            exit_reason = "STOP FIRST (DAILY AMBIGUOUS)"
+            exit_reason = "STOP FIRST (CHECKPOINT AMBIGUOUS)"
             hit_stop = True
             break
         if stop_hit_today:
-            exit_date = d
+            exit_session = br["session"]
+            exit_ts = br["ts"]
             exit_price = stop
             exit_reason = "STOP"
             hit_stop = True
             break
         if target_hit_today:
-            exit_date = d
+            exit_session = br["session"]
+            exit_ts = br["ts"]
             exit_price = target
             exit_reason = f"TARGET {plan['target_label']}"
             hit_target = True
             hit12 = bool(hit12 or target12_hit_today)
             break
 
-    if exit_date is None:
-        exit_date = eval_idx[-1]
-        exit_price = safe_float(c_all.loc[exit_date], np.nan)
+    if exit_session is None:
+        last_bar = eval_bars[-1]
+        exit_session = last_bar["session"]
+        exit_ts = last_bar["ts"]
+        exit_price = safe_float(last_bar["close"], np.nan)
         exit_reason = "TIME EXIT / FORWARD CLOSE"
 
-    eval_high = h_all.loc[eval_idx]
-    eval_low = l_all.loc[eval_idx]
-    eval_close = c_all.loc[eval_idx]
     ret = (exit_price / fill_price - 1) * 100 if np.isfinite(exit_price) and np.isfinite(fill_price) and fill_price > 0 else np.nan
+    mfe = (peak_high / fill_price - 1) * 100 if fill_price > 0 else np.nan
+    mae = (trough_low / fill_price - 1) * 100 if fill_price > 0 else np.nan
+    current_profit = ret if np.isfinite(ret) else np.nan
+    giveback = (mfe - current_profit) if np.isfinite(mfe) and np.isfinite(current_profit) else np.nan
+    target_pct = (target / fill_price - 1) * 100 if fill_price > 0 else np.nan
+    progress = (mfe / target_pct * 100) if np.isfinite(mfe) and np.isfinite(target_pct) and target_pct > 0 else np.nan
 
     return {
         "Actionable Trade": True,
+        "Order Valid Days": order_valid_days,
+        "Valid Until": _as_date_str(order_idx[-1]) if len(order_idx) else "",
         "Order Filled": True,
-        "Entry Date": _as_date_str(fill_date),
+        "Entry Date": _as_date_str(fill_session),
+        "Entry Time": str(fill_ts),
         "Entry Price": round(fill_price, 2),
-        "Exit Date": _as_date_str(exit_date),
+        "Exit Date": _as_date_str(exit_session),
+        "Exit Time": str(exit_ts),
         "Exit Price": round(exit_price, 2) if np.isfinite(exit_price) else np.nan,
         "Exit Reason": exit_reason,
         "Trade Return %": round(ret, 2) if np.isfinite(ret) else np.nan,
-        "Forward Close %": round((eval_close.iloc[-1] / fill_price - 1) * 100, 2) if fill_price > 0 else np.nan,
-        "MFE %": round((eval_high.max() / fill_price - 1) * 100, 2) if fill_price > 0 else np.nan,
-        "MAE %": round((eval_low.min() / fill_price - 1) * 100, 2) if fill_price > 0 else np.nan,
+        "Forward Close %": round(ret, 2) if np.isfinite(ret) else np.nan,
+        "MFE %": round(mfe, 2) if np.isfinite(mfe) else np.nan,
+        "MAE %": round(mae, 2) if np.isfinite(mae) else np.nan,
+        "Peak Profit Giveback %": round(giveback, 2) if np.isfinite(giveback) else np.nan,
+        "Progress To Target %": round(progress, 1) if np.isfinite(progress) else np.nan,
         "Hit Target": bool(hit_target),
         "Hit 8%": bool(hit_target),
         "Hit 12%": bool(hit12),
         "Hit Stop": bool(hit_stop),
-        "Audit Note": "שמרני: אם יעד וסטופ נגעו באותו נר יומי, נספר כסטופ קודם." if ambiguous else "",
+        "Audit Note": "שמרני: אם יעד וסטופ נגעו באותו checkpoint, נספר כסטופ קודם." if ambiguous else "ההמלצה המקורית ננעלה ונוהלה כפוזיציה עד יעד/סטופ/תום חלון.",
+        "Fill Check Mode": "intraday checkpoints" if (used_intraday or used_intraday_eval) else "daily fallback",
     }
 
 
@@ -2569,7 +2752,6 @@ def run_recent_signal_audit(
     lookback_days: int = 10,
     forward_days: int = 5,
     include_watch: bool = True,
-    order_valid_days: int = 1,
 ):
     """
     True replay audit:
@@ -2577,6 +2759,7 @@ def run_recent_signal_audit(
     Then it simulates what would happen from that decision date forward.
     """
     panel = fetch_audit_data()
+    intraday_panel = fetch_audit_intraday_data(extra_days=max(70, int(lookback_days + forward_days + 20)))
     if panel is None or panel.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -2639,7 +2822,8 @@ def run_recent_signal_audit(
                     data_as_of,
                     row,
                     forward_days=forward_days,
-                    order_valid_days=order_valid_days,
+                    order_valid_days=None,
+                    intraday_panel=intraday_panel,
                 )
                 rows.append({
                     "Decision Date": _as_date_str(decision_date),
@@ -4378,9 +4562,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.2 — Trader UX + Realistic Audit Replay</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.3 — Position-Aware Audit</h1>", unsafe_allow_html=True)
     st.info(
-        "V15.2 מתקנת את Audit Lab כך שהסריקה משתמשת רק בנתוני סוף היום הקודם ומדמה פקודות כניסה/יעד/סטופ בצורה שמרנית: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
+        "V15.3 משדרגת את Audit Lab: ההמלצה המקורית ננעלת, תוקף פקודת הכניסה נקבע לפי סוג הסטאפ, ובדיקת התוצאה משתמשת גם בנתוני תוך־יומי כשאפשר כדי לדמות כניסה/סטופ/יעד בצורה ריאלית יותר. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
@@ -4580,7 +4764,7 @@ else:
         with a2:
             forward_days = st.slider("כמה ימים קדימה לבדוק תוצאה", 2, 15, 5, 1)
         with a3:
-            order_valid_days = st.slider("תוקף פקודת כניסה בימים", 1, 5, 1, 1, help="כמה ימי מסחר פקודת הכניסה נשארת בתוקף. 1 = רק אותו יום, הכי שמרני.")
+            st.info("תוקף פקודת הכניסה נקבע אוטומטית לפי סוג הסטאפ: Quick = יום אחד, Breakout = כ-3 ימים, Base/Squeeze = עד 5 ימים.")
         with a4:
             include_watch = st.toggle("כלול גם Watch / Near Ready", value=False, help="כבוי = בודק רק המלצות פעולה אמיתיות. דלוק = מוסיף שורות מחקר, אבל לא סופר אותן כעסקאות.")
 
@@ -4591,7 +4775,6 @@ else:
                     lookback_days=int(audit_days),
                     forward_days=int(forward_days),
                     include_watch=bool(include_watch),
-                    order_valid_days=int(order_valid_days),
                 )
                 st.session_state["audit_df"] = audit_df
                 st.session_state["audit_summary"] = audit_summary
