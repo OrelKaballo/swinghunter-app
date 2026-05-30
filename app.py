@@ -2299,7 +2299,248 @@ def get_today_breakout_action_plan(params: StrategyParams):
     if not df_ignore.empty:
         df_ignore = df_ignore.sort_values(["State", "Ticker"], ascending=[True, True])
 
+
     return df_action, df_watch, df_ignore
+
+
+# ==========================================================
+# 7B. Signal Audit Lab - replay recent scans vs actual outcome
+# ==========================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_audit_data(extra_days: int = 460):
+    """Download one multi-ticker panel for the replay audit."""
+    driver_symbols = sorted({get_driver_profile(t).get("driver", "QQQ") for t in WATCHLIST})
+    symbols = sorted(set(WATCHLIST + driver_symbols + ["QQQ"]))
+    end = datetime.now()
+    start = end - timedelta(days=extra_days)
+    return yf.download(symbols, start=start, end=end, progress=False, auto_adjust=False, group_by="column")
+
+
+def _safe_panel_series(panel: pd.DataFrame, field: str, symbol: str) -> pd.Series:
+    try:
+        if isinstance(panel.columns, pd.MultiIndex):
+            if field in panel.columns.get_level_values(0):
+                return panel[field][symbol].dropna()
+            # fallback for reversed multiindex
+            if field in panel.columns.get_level_values(1):
+                return panel[symbol][field].dropna()
+        return pd.Series(dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _first_hit_index(series_high: pd.Series, trigger: float):
+    try:
+        hits = series_high[series_high >= trigger]
+        return hits.index[0] if len(hits) else None
+    except Exception:
+        return None
+
+
+def _assess_signal_outcome(panel: pd.DataFrame, ticker: str, signal_date, row: dict, forward_days: int = 5):
+    """
+    Assesses what happened AFTER the signal. It does not pretend to be a broker fill engine.
+    For action states we check whether the buy trigger was reached, then target/stop order.
+    """
+    h_all = _safe_panel_series(panel, "High", ticker)
+    l_all = _safe_panel_series(panel, "Low", ticker)
+    c_all = _safe_panel_series(panel, "Close", ticker)
+    if h_all.empty or c_all.empty or signal_date not in c_all.index:
+        return {}
+
+    future_idx = c_all.index[c_all.index > signal_date][:forward_days]
+    if len(future_idx) == 0:
+        return {}
+
+    trigger = safe_float(row.get("Buy Trigger", np.nan))
+    current = safe_float(row.get("Current", np.nan))
+    stop = safe_float(row.get("Stop", np.nan))
+    target8 = safe_float(row.get("Target 8%", np.nan))
+    target12 = safe_float(row.get("Target 12%", np.nan))
+    state = str(row.get("State", ""))
+
+    if not np.isfinite(trigger) or trigger <= 0:
+        trigger = current
+
+    future_high = h_all.loc[future_idx]
+    future_low = l_all.loc[future_idx]
+    future_close = c_all.loc[future_idx]
+
+    triggered = False
+    trigger_date = None
+    if state in ["BUY SETUP READY", "QUICK BURST READY"]:
+        # If trigger is at/below current, assume actionable immediately from next session.
+        if np.isfinite(current) and trigger <= current * 1.003:
+            triggered = True
+            trigger_date = future_idx[0]
+            entry = trigger
+        else:
+            hit = _first_hit_index(future_high, trigger)
+            triggered = hit is not None
+            trigger_date = hit
+            entry = trigger
+    else:
+        # Watch states are audited as "did it mature / move anyway", using current as reference.
+        entry = current
+
+    if not triggered and state in ["BUY SETUP READY", "QUICK BURST READY"]:
+        return {
+            "Triggered": False,
+            "Trigger Date": "",
+            "Outcome": "NOT TRIGGERED",
+            "Forward Close %": round((future_close.iloc[-1] / current - 1) * 100, 2) if np.isfinite(current) else np.nan,
+            "MFE %": round((future_high.max() / current - 1) * 100, 2) if np.isfinite(current) else np.nan,
+            "MAE %": round((future_low.min() / current - 1) * 100, 2) if np.isfinite(current) else np.nan,
+            "Hit 8%": False,
+            "Hit 12%": False,
+            "Hit Stop": False,
+        }
+
+    # Only evaluate from trigger date onward for actionable signals.
+    if trigger_date is not None and trigger_date in future_idx:
+        eval_idx = future_idx[future_idx >= trigger_date]
+        eval_high = h_all.loc[eval_idx]
+        eval_low = l_all.loc[eval_idx]
+        eval_close = c_all.loc[eval_idx]
+    else:
+        eval_idx = future_idx
+        eval_high = future_high
+        eval_low = future_low
+        eval_close = future_close
+
+    hit8_date = _first_hit_index(eval_high, target8) if np.isfinite(target8) else None
+    hit12_date = _first_hit_index(eval_high, target12) if np.isfinite(target12) else None
+    stop_date = None
+    if np.isfinite(stop):
+        lows = eval_low[eval_low <= stop]
+        stop_date = lows.index[0] if len(lows) else None
+
+    def before_or_none(a, b):
+        if a is None:
+            return False
+        if b is None:
+            return True
+        return a <= b
+
+    hit8_before_stop = before_or_none(hit8_date, stop_date)
+    hit12_before_stop = before_or_none(hit12_date, stop_date)
+    stop_before_8 = before_or_none(stop_date, hit8_date)
+
+    if hit12_before_stop:
+        outcome = "TARGET 12 BEFORE STOP"
+    elif hit8_before_stop:
+        outcome = "TARGET 8 BEFORE STOP"
+    elif stop_before_8:
+        outcome = "STOP BEFORE TARGET"
+    else:
+        outcome = "OPEN / NO HIT"
+
+    return {
+        "Triggered": bool(triggered or state not in ["BUY SETUP READY", "QUICK BURST READY"]),
+        "Trigger Date": str(trigger_date.date()) if hasattr(trigger_date, "date") else "",
+        "Outcome": outcome,
+        "Forward Close %": round((eval_close.iloc[-1] / entry - 1) * 100, 2) if np.isfinite(entry) else np.nan,
+        "MFE %": round((eval_high.max() / entry - 1) * 100, 2) if np.isfinite(entry) else np.nan,
+        "MAE %": round((eval_low.min() / entry - 1) * 100, 2) if np.isfinite(entry) else np.nan,
+        "Hit 8%": bool(hit8_before_stop),
+        "Hit 12%": bool(hit12_before_stop),
+        "Hit Stop": bool(stop_before_8),
+    }
+
+
+def run_recent_signal_audit(params: StrategyParams, lookback_days: int = 10, forward_days: int = 5, include_watch: bool = True):
+    panel = fetch_audit_data()
+    if panel is None or panel.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    qqq_close = _safe_panel_series(panel, "Close", "QQQ")
+    if qqq_close.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Use dates with enough past data and enough future candles for outcome.
+    all_dates = list(qqq_close.index)
+    if len(all_dates) < 260:
+        return pd.DataFrame(), pd.DataFrame()
+
+    end_pos = len(all_dates) - 1
+    start_pos = max(220, end_pos - lookback_days - forward_days)
+    decision_positions = range(start_pos, max(start_pos, end_pos - 1))
+
+    driver_symbols = sorted({get_driver_profile(t).get("driver", "QQQ") for t in WATCHLIST})
+    driver_cache_full = {sym: _safe_panel_series(panel, "Close", sym) for sym in driver_symbols}
+    driver_cache_full["QQQ"] = qqq_close
+
+    rows = []
+    for pos in decision_positions:
+        signal_date = all_dates[pos]
+        qqq_slice = qqq_close.loc[:signal_date].dropna()
+        if len(qqq_slice) < 220:
+            continue
+
+        for ticker in WATCHLIST:
+            try:
+                c = _safe_panel_series(panel, "Close", ticker).loc[:signal_date].dropna()
+                h = _safe_panel_series(panel, "High", ticker).loc[:signal_date].dropna()
+                l = _safe_panel_series(panel, "Low", ticker).loc[:signal_date].dropna()
+                v = _safe_panel_series(panel, "Volume", ticker).loc[:signal_date].dropna()
+                o = _safe_panel_series(panel, "Open", ticker).loc[:signal_date].dropna()
+                if len(c) < 220 or len(h) < 220 or len(l) < 220:
+                    continue
+                profile = get_driver_profile(ticker)
+                d_full = driver_cache_full.get(profile.get("driver", "QQQ"), qqq_close)
+                driver_slice = d_full.loc[:signal_date].dropna() if not d_full.empty else qqq_slice
+                row = evaluate_breakout_action_plan(ticker, c, h, l, v, o, qqq_slice, params, driver_close=driver_slice)
+                state = row.get("State", "IGNORE")
+                action = row.get("Action", "")
+                keep = state in ["BUY SETUP READY", "QUICK BURST READY"] or (include_watch and state in ["NEAR READY", "WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH", "MISSED / WAIT RESET"])
+                if not keep:
+                    continue
+                outcome = _assess_signal_outcome(panel, ticker, signal_date, row, forward_days=forward_days)
+                rows.append({
+                    "Signal Date": signal_date.strftime("%Y-%m-%d"),
+                    "Ticker": ticker,
+                    "State": state,
+                    "Action": action,
+                    "Category": row.get("Category", ""),
+                    "Primary Driver": row.get("Primary Driver", ""),
+                    "Driver Alignment": row.get("Driver Alignment", ""),
+                    "Priced-In Risk": row.get("Priced-In Risk", ""),
+                    "Current": row.get("Current", np.nan),
+                    "Buy Trigger": row.get("Buy Trigger", np.nan),
+                    "Stop": row.get("Stop", np.nan),
+                    "Target 8%": row.get("Target 8%", np.nan),
+                    "Target 12%": row.get("Target 12%", np.nan),
+                    "Risk %": row.get("Risk %", np.nan),
+                    "RR 8%": row.get("RR 8%", np.nan),
+                    "Breakout Score": row.get("Breakout Score", np.nan),
+                    "RSI": row.get("RSI", np.nan),
+                    "ATR%": row.get("ATR%", np.nan),
+                    "20D Run": row.get("20D Run", np.nan),
+                    "Why": row.get("Why", ""),
+                    **outcome,
+                })
+            except Exception:
+                continue
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, pd.DataFrame()
+
+    summary = df.groupby("State", as_index=False).agg(
+        Signals=("Ticker", "count"),
+        Triggered=("Triggered", "sum"),
+        Avg_Fwd_Close=("Forward Close %", "mean"),
+        Avg_MFE=("MFE %", "mean"),
+        Avg_MAE=("MAE %", "mean"),
+        Hit8=("Hit 8%", "sum"),
+        Hit12=("Hit 12%", "sum"),
+        Stops=("Hit Stop", "sum"),
+    )
+    summary["Hit8 %"] = (summary["Hit8"] / summary["Signals"] * 100).round(1)
+    summary["Stop %"] = (summary["Stops"] / summary["Signals"] * 100).round(1)
+    for col in ["Avg_Fwd_Close", "Avg_MFE", "Avg_MAE"]:
+        summary[col] = summary[col].round(2)
+    return df.sort_values(["Signal Date", "State", "Breakout Score"], ascending=[False, True, False]), summary
 
 
 def get_today_actions(params: StrategyParams):
@@ -3987,9 +4228,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.0 — Trader UX Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.1 — Trader UX + Audit Lab</h1>", unsafe_allow_html=True)
     st.info(
-        "V14.3 מוסיפה הסברי פעולה ב-Hover על עמודת State מעל שכבת Driver-Aware: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
+        "V15.1 מוסיפה Audit Lab לבדיקת שבועיים אחורה: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
@@ -4014,7 +4255,7 @@ else:
 
     params = StrategyParams(max_risk_pct=max_risk_pct, position_pct=position_pct)
 
-    tab_daily, tab_portfolio, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "🔬 בדיקת בנק"])
+    tab_daily, tab_portfolio, tab_audit, tab_backtest = st.tabs(["🚀 מה עושים היום", "💼 תיק השקעות", "🧯 Audit שבועיים", "🔬 בדיקת בנק"])
 
     with tab_daily:
         inject_modern_css()
@@ -4174,6 +4415,78 @@ else:
                 use_container_width=True
             )
 
+
+    with tab_audit:
+        inject_modern_css()
+        st.markdown("## 🧯 Audit Lab — בדיקת המלצות מול מה שקרה בפועל")
+        st.caption(
+            "המטרה כאן היא לא להוכיח שהמודל צדק, אלא למצוא איפה הוא טעה: האם הוא רדף אחרי מניות חמות מדי, "
+            "האם הדרייבר לא אישר, האם הסטופ רחב מדי, והאם פקודות פעולה באמת נתנו המשך." 
+        )
+
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            audit_days = st.slider("כמה ימי מסחר לבדוק אחורה", 5, 20, 10, 1)
+        with a2:
+            forward_days = st.slider("כמה ימים קדימה לבדוק תוצאה", 2, 10, 5, 1)
+        with a3:
+            include_watch = st.toggle("כלול גם Watch / Near Ready", value=True)
+
+        if st.button("🔎 הרץ Audit Replay", type="primary", use_container_width=True):
+            with st.spinner("משחזר מה הסורק היה רואה בכל יום ובודק מה קרה אחר כך..."):
+                audit_df, audit_summary = run_recent_signal_audit(
+                    params,
+                    lookback_days=int(audit_days),
+                    forward_days=int(forward_days),
+                    include_watch=bool(include_watch),
+                )
+                st.session_state["audit_df"] = audit_df
+                st.session_state["audit_summary"] = audit_summary
+                st.session_state["audit_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if "audit_df" not in st.session_state:
+            st.info("לחץ על הכפתור כדי לבדוק את השבועיים האחרונים. זה ימשוך דאטה מחדש ויכול לקחת דקה.")
+        else:
+            audit_df = st.session_state["audit_df"]
+            audit_summary = st.session_state["audit_summary"]
+            st.caption(f"Audit אחרון: {st.session_state.get('audit_last_run', '—')}")
+
+            if audit_df.empty:
+                st.warning("לא נמצאו סיגנלים בתקופה שנבחרה.")
+            else:
+                st.markdown("### סיכום לפי סוג State")
+                st.dataframe(audit_summary, use_container_width=True, hide_index=True, column_config=get_column_config())
+
+                st.markdown("### כל הסיגנלים ומה קרה אחריהם")
+                main_cols = [
+                    "Signal Date", "Ticker", "State", "Action", "Category", "Primary Driver", "Driver Alignment", "Priced-In Risk",
+                    "Current", "Buy Trigger", "Stop", "Target 8%", "Risk %", "RR 8%", "Breakout Score",
+                    "Triggered", "Outcome", "Forward Close %", "MFE %", "MAE %", "Hit 8%", "Hit Stop", "Why"
+                ]
+                main_cols = unique_existing_columns(main_cols, audit_df)
+                st.dataframe(audit_df[main_cols], use_container_width=True, hide_index=True, height=520, column_config=get_column_config())
+
+                st.markdown("### כישלונות לבדיקה ידנית")
+                fails = audit_df[
+                    audit_df["Outcome"].astype(str).isin(["STOP BEFORE TARGET", "OPEN / NO HIT", "NOT TRIGGERED"])
+                ].copy()
+                if fails.empty:
+                    st.success("לא נמצאו כישלונות ברורים לפי ההגדרה הזו.")
+                else:
+                    st.dataframe(fails[main_cols], use_container_width=True, hide_index=True, height=360, column_config=get_column_config())
+
+                st.download_button(
+                    "⬇️ הורד Audit CSV",
+                    audit_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"swinghunter_{APP_VERSION}_audit_replay.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+                st.info(
+                    "איך לקרוא את זה: אם State מסוים נותן הרבה 'OPEN / NO HIT' או 'STOP BEFORE TARGET', הוא לא פסול אוטומטית — "
+                    "אבל צריך לפתוח את השורות ולבדוק מה חזר על עצמו: RSI גבוה, ריצה 20D גבוהה, Driver Alignment חלש, או R/R לא מספיק."
+                )
 
     with tab_portfolio:
         inject_modern_css()
