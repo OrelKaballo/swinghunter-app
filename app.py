@@ -15,8 +15,8 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="SwingHunter V16.0 - Disciplined Trade Lifecycle", layout="wide")
-APP_VERSION = "V16.0-disciplined-trade-lifecycle"
+st.set_page_config(page_title="SwingHunter V16.3 - Open Positions First", layout="wide")
+APP_VERSION = "V16.3-open-positions-first"
 
 # ==========================================================
 # 1. Security
@@ -3073,16 +3073,23 @@ def get_today_actions(params: StrategyParams):
 # ==========================================================
 # 8. Exit / Position Management Dashboard
 # ==========================================================
-def analyze_open_position(ticker: str, entry_price: float, entry_date, initial_stop: float = np.nan):
+def analyze_open_position(
+    ticker: str,
+    entry_price: float,
+    entry_date,
+    initial_stop: float = np.nan,
+    target_pct: float = 10.0,
+    target_price: float = np.nan,
+):
     """
-    Reconstructs the current exit status for a real open position.
-    Required:
-    - ticker
-    - entry price
-    - entry date
-    Optional:
-    - initial stop. If missing, uses entry * (1 - max_risk_pct) is NOT available here,
-      so caller should pass one when possible.
+    V16.1 Position Memory / Position Manager.
+
+    This is not a new-entry scanner. It manages an existing position:
+    - remembers the user's actual entry
+    - calculates current P/L, peak profit (MFE), worst drawdown (MAE)
+    - tracks progress toward the user's target
+    - raises protection once the trade has delivered a meaningful part of the target
+    - warns when a trade gave back too much profit
     """
     df = download_single(ticker, "370d")
     if df.empty or len(df) < 30:
@@ -3114,48 +3121,97 @@ def analyze_open_position(ticker: str, entry_price: float, entry_date, initial_s
     last_low = float(l.iloc[-1])
     last_date = c.index[-1].strftime("%Y-%m-%d")
 
-    # EMA21 trail is reconstructed only from dates after entry.
-    hist_from_entry = c[c.index >= entry_date]
-    if len(hist_from_entry) < 2:
-        hist_from_entry = c.iloc[-25:]
+    # User target fallback.
+    target_pct = safe_float(target_pct, 10.0)
+    if not np.isfinite(target_pct) or target_pct <= 0:
+        target_pct = 10.0
+
+    target_price = safe_float(target_price, np.nan)
+    if not np.isfinite(target_price) or target_price <= 0:
+        target_price = entry_price * (1 + target_pct / 100.0)
+    else:
+        target_pct = (target_price / entry_price - 1) * 100
 
     ema21_series = c.ewm(span=21, adjust=False).mean()
     ema21_now = float(ema21_series.iloc[-1])
 
-    # Initial stop fallback if user did not enter one.
     if not np.isfinite(initial_stop) or initial_stop <= 0:
-        initial_stop = entry_price * 0.905  # fallback = 9.5% risk
+        initial_stop = entry_price * 0.925  # V16.1 fallback = 7.5% risk, less loose than old 9.5%
 
-    # Reconstruct trailing stop from entry date onward:
-    # trail never moves down, it is max(initial_stop, EMA21*0.995 since entry).
+    after_entry_mask = c.index >= entry_date
+    c_after = c[after_entry_mask]
+    h_after = h[h.index >= entry_date]
+    l_after = l[l.index >= entry_date]
     ema_after_entry = ema21_series[ema21_series.index >= entry_date]
-    if len(ema_after_entry) == 0:
+
+    if len(c_after) == 0:
+        c_after = c.iloc[-25:]
+        h_after = h.iloc[-25:]
+        l_after = l.iloc[-25:]
         ema_after_entry = ema21_series.iloc[-25:]
 
-    trail_series = (ema_after_entry * 0.995).cummax()
-    trail_stop = max(float(initial_stop), float(trail_series.iloc[-1]))
-
+    # MFE / MAE since entry.
+    max_high = float(h_after.max()) if len(h_after) else last_close
+    min_low = float(l_after.min()) if len(l_after) else last_close
+    mfe_pct = (max_high / entry_price - 1) * 100
+    mae_pct = (min_low / entry_price - 1) * 100
     pnl_pct = (last_close / entry_price - 1) * 100
+    progress_to_target = (pnl_pct / target_pct * 100) if target_pct > 0 else np.nan
+    peak_progress = (mfe_pct / target_pct * 100) if target_pct > 0 else np.nan
+    giveback_pct = max(0.0, mfe_pct - pnl_pct)
+    giveback_from_peak_pct = (giveback_pct / mfe_pct * 100) if mfe_pct > 0 else 0.0
 
-    # Two exit signals:
-    # 1. Hard/trailing stop touched intraday.
-    # 2. Daily close below EMA21*0.995.
+    # Basic EMA trail.
+    if len(ema_after_entry) == 0:
+        ema_after_entry = ema21_series.iloc[-25:]
+    ema_trail = float((ema_after_entry * 0.995).cummax().iloc[-1])
+
+    # V16.1 dynamic protection:
+    # Once a trade delivers a meaningful part of the target, we stop treating it like day 1.
+    target_profit_dollars = target_price - entry_price
+    dynamic_stop = float(initial_stop)
+
+    if peak_progress >= 60:
+        dynamic_stop = max(dynamic_stop, entry_price)  # do not let a 60% target-progress trade become a loser
+    if peak_progress >= 75:
+        dynamic_stop = max(dynamic_stop, entry_price + target_profit_dollars * 0.25)
+    if peak_progress >= 90:
+        dynamic_stop = max(dynamic_stop, entry_price + target_profit_dollars * 0.50)
+
+    protection_stop = max(dynamic_stop, ema_trail)
     close_exit_level = ema21_now * 0.995
+    current_protection_stop = max(protection_stop, close_exit_level)
+    distance_to_protection = (last_close / current_protection_stop - 1) * 100 if current_protection_stop > 0 else np.nan
 
-    if last_low <= trail_stop:
-        action = "SELL / STOP HIT"
+    # Decision logic: protect gains first; do not let a 7% move round-trip to stop.
+    status = "HOLD"
+    action = "HOLD"
+    reason = "המגמה עדיין לא נשברה והטרייד לא הגיע לאזור החלטה."
+
+    if last_low <= protection_stop:
         status = "EXIT"
-        reason = "המחיר היומי נגע בסטופ/Trailing Stop"
+        action = "SELL / PROTECTION STOP HIT"
+        reason = "המחיר נגע בסטופ ההגנה הדינמי / trailing stop."
     elif last_close < close_exit_level:
-        action = "SELL AT CLOSE / NEXT OPEN"
         status = "EXIT"
-        reason = "הסגירה מתחת EMA21"
-    else:
-        action = "HOLD"
-        status = "HOLD"
-        reason = "המגמה עדיין לא נשברה"
-
-    distance_to_exit = (last_close / trail_stop - 1) * 100 if trail_stop > 0 else np.nan
+        action = "SELL AT CLOSE / NEXT OPEN"
+        reason = "הסגירה מתחת EMA21*0.995 — המומנטום נשבר."
+    elif pnl_pct >= target_pct:
+        status = "TARGET"
+        action = "TAKE PROFIT"
+        reason = "הפוזיציה הגיעה ליעד שהוגדר. לא להמשיך מתוך חמדנות בלי תוכנית חדשה."
+    elif progress_to_target >= 85:
+        status = "PROTECT"
+        action = "TAKE PARTIAL / TIGHT TRAIL"
+        reason = "הפוזיציה השיגה מעל 85% מהיעד. כדאי לממש חלק או להצמיד סטופ."
+    elif peak_progress >= 70 and giveback_from_peak_pct >= 40:
+        status = "PROTECT"
+        action = "PROTECT GAINS / CONSIDER EXIT"
+        reason = "הפוזיציה כבר נתנה רוב מהיעד והחזירה מעל 40% מהרווח מהשיא. לא לתת לזה להפוך לסטופ."
+    elif progress_to_target >= 60:
+        status = "PROTECT"
+        action = "RAISE STOP / HOLD"
+        reason = "הפוזיציה השיגה מעל 60% מהיעד. צריך להגן על הרווח, לא לחכות עיוור ליעד מלא."
 
     return {
         "Ticker": ticker,
@@ -3166,13 +3222,22 @@ def analyze_open_position(ticker: str, entry_price: float, entry_date, initial_s
         "Entry": round(entry_price, 2),
         "Current": round(last_close, 2),
         "PnL %": round(pnl_pct, 2),
+        "Target %": round(target_pct, 2),
+        "Target Price": round(target_price, 2),
+        "Progress To Target %": round(progress_to_target, 1) if np.isfinite(progress_to_target) else np.nan,
+        "MFE %": round(mfe_pct, 2),
+        "MAE %": round(mae_pct, 2),
+        "Peak Progress %": round(peak_progress, 1) if np.isfinite(peak_progress) else np.nan,
+        "Profit Giveback %": round(giveback_pct, 2),
+        "Giveback From Peak %": round(giveback_from_peak_pct, 1),
         "Initial Stop": round(initial_stop, 2),
         "EMA21": round(ema21_now, 2),
         "Exit Close Level": round(close_exit_level, 2),
-        "Trailing Stop": round(trail_stop, 2),
-        "Current Protection Stop": round(max(trail_stop, close_exit_level), 2),
-        "Profit Checkpoint": round(max(entry_price * 1.15, last_close * 1.05), 2),
-        "Distance to Trail %": round(distance_to_exit, 2),
+        "Trailing Stop": round(ema_trail, 2),
+        "Dynamic Protection Stop": round(dynamic_stop, 2),
+        "Current Protection Stop": round(current_protection_stop, 2),
+        "Profit Checkpoint": round(target_price, 2),
+        "Distance to Trail %": round(distance_to_protection, 2) if np.isfinite(distance_to_protection) else np.nan,
     }
 
 
@@ -3227,6 +3292,7 @@ def analyze_virtual_portfolio(df_positions: pd.DataFrame):
             "Action": status.get("Action", ""),
             "Reason": status.get("Reason", ""),
             "Trailing Stop": status.get("Trailing Stop", np.nan),
+            "Dynamic Protection Stop": status.get("Dynamic Protection Stop", np.nan),
             "Current Protection Stop": status.get("Current Protection Stop", np.nan),
             "Profit Checkpoint": status.get("Profit Checkpoint", np.nan),
             "Distance to Trail %": status.get("Distance to Trail %", np.nan),
@@ -3748,19 +3814,22 @@ def empty_ledger():
         "Quantity": pd.Series(dtype="float64"),
         "Price": pd.Series(dtype="float64"),
         "Initial Stop": pd.Series(dtype="float64"),
+        "Target %": pd.Series(dtype="float64"),
+        "Target Price": pd.Series(dtype="float64"),
+        "Setup Source": pd.Series(dtype="string"),
         "Note": pd.Series(dtype="string"),
     })
 
 
 def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
-    required = ["Date", "Account", "Action", "Ticker", "Quantity", "Price", "Initial Stop", "Note"]
+    required = ["Date", "Account", "Action", "Ticker", "Quantity", "Price", "Initial Stop", "Target %", "Target Price", "Setup Source", "Note"]
     if df is None or len(df) == 0:
         return empty_ledger()
 
     out = df.copy()
     for col in required:
         if col not in out.columns:
-            out[col] = "" if col in ["Date", "Account", "Action", "Ticker", "Note"] else 0.0
+            out[col] = "" if col in ["Date", "Account", "Action", "Ticker", "Setup Source", "Note"] else 0.0
 
     out = out[required].copy()
 
@@ -3769,11 +3838,14 @@ def normalize_ledger(df: pd.DataFrame) -> pd.DataFrame:
     out["Account"] = out["Account"].fillna("").astype(str).replace({"real": "אמת", "virtual": "וירטואלי", "REAL": "אמת", "VIRTUAL": "וירטואלי"}).str.strip()
     out["Action"] = out["Action"].fillna("").astype(str).replace({"buy": "BUY", "sell": "SELL", "קניה": "BUY", "מכירה": "SELL"}).str.upper().str.strip()
     out["Ticker"] = out["Ticker"].fillna("").astype(str).str.upper().str.strip()
+    out["Setup Source"] = out["Setup Source"].fillna("").astype(str)
     out["Note"] = out["Note"].fillna("").astype(str)
 
     out["Quantity"] = pd.to_numeric(out["Quantity"], errors="coerce").fillna(0.0).astype(float)
     out["Price"] = pd.to_numeric(out["Price"], errors="coerce").fillna(0.0).astype(float)
     out["Initial Stop"] = pd.to_numeric(out["Initial Stop"], errors="coerce").fillna(0.0).astype(float)
+    out["Target %"] = pd.to_numeric(out["Target %"], errors="coerce").fillna(10.0).astype(float)
+    out["Target Price"] = pd.to_numeric(out["Target Price"], errors="coerce").fillna(0.0).astype(float)
 
     return out.reset_index(drop=True)
 
@@ -3790,6 +3862,9 @@ def ledger_to_holdings(ledger: pd.DataFrame):
         qty = safe_float(tx["Quantity"], 0)
         price = safe_float(tx["Price"], 0)
         stop = safe_float(tx["Initial Stop"], 0)
+        target_pct = safe_float(tx.get("Target %", 10.0), 10.0)
+        target_price = safe_float(tx.get("Target Price", 0.0), 0.0)
+        setup_source = str(tx.get("Setup Source", "")).strip()
         date = tx["Date"]
 
         if not ticker or qty <= 0 or price <= 0 or action not in ["BUY", "SELL"]:
@@ -3804,6 +3879,9 @@ def ledger_to_holdings(ledger: pd.DataFrame):
                 "Cost Basis": 0.0,
                 "Avg Entry": 0.0,
                 "Initial Stop Total": 0.0,
+                "Target % Total": 0.0,
+                "Target Price Total": 0.0,
+                "Setup Source": "",
                 "First Entry Date": date,
                 "Realized PnL": 0.0,
             }
@@ -3817,6 +3895,12 @@ def ledger_to_holdings(ledger: pd.DataFrame):
             pos["Cost Basis"] += qty * price
             if stop > 0:
                 pos["Initial Stop Total"] += qty * stop
+            if target_pct > 0:
+                pos["Target % Total"] += qty * target_pct
+            if target_price > 0:
+                pos["Target Price Total"] += qty * target_price
+            if setup_source:
+                pos["Setup Source"] = setup_source
             pos["Quantity"] += qty
             pos["Avg Entry"] = pos["Cost Basis"] / pos["Quantity"] if pos["Quantity"] > 0 else 0
 
@@ -3835,8 +3919,14 @@ def ledger_to_holdings(ledger: pd.DataFrame):
             pos["Realized PnL"] += realized
             pos["Cost Basis"] -= qty * avg_entry
 
-            if pos["Quantity"] > 0 and pos["Initial Stop Total"] > 0:
-                pos["Initial Stop Total"] *= max(0.0, (pos["Quantity"] - qty) / pos["Quantity"])
+            if pos["Quantity"] > 0:
+                reduce_ratio = max(0.0, (pos["Quantity"] - qty) / pos["Quantity"])
+                if pos["Initial Stop Total"] > 0:
+                    pos["Initial Stop Total"] *= reduce_ratio
+                if pos.get("Target % Total", 0) > 0:
+                    pos["Target % Total"] *= reduce_ratio
+                if pos.get("Target Price Total", 0) > 0:
+                    pos["Target Price Total"] *= reduce_ratio
 
             pos["Quantity"] -= qty
             if pos["Quantity"] <= 1e-9:
@@ -3844,6 +3934,8 @@ def ledger_to_holdings(ledger: pd.DataFrame):
                 pos["Cost Basis"] = 0.0
                 pos["Avg Entry"] = 0.0
                 pos["Initial Stop Total"] = 0.0
+                pos["Target % Total"] = 0.0
+                pos["Target Price Total"] = 0.0
             else:
                 pos["Avg Entry"] = pos["Cost Basis"] / pos["Quantity"]
 
@@ -3851,6 +3943,8 @@ def ledger_to_holdings(ledger: pd.DataFrame):
     for pos in state.values():
         if pos["Quantity"] > 0:
             avg_stop = (pos["Initial Stop Total"] / pos["Quantity"]) if pos["Initial Stop Total"] > 0 else 0.0
+            avg_target_pct = (pos.get("Target % Total", 0.0) / pos["Quantity"]) if pos.get("Target % Total", 0.0) > 0 else 10.0
+            avg_target_price = (pos.get("Target Price Total", 0.0) / pos["Quantity"]) if pos.get("Target Price Total", 0.0) > 0 else 0.0
             rows.append({
                 "Account": pos["Account"],
                 "Ticker": pos["Ticker"],
@@ -3858,6 +3952,9 @@ def ledger_to_holdings(ledger: pd.DataFrame):
                 "Avg Entry": pos["Avg Entry"],
                 "Entry Date": pos["First Entry Date"],
                 "Initial Stop": avg_stop,
+                "Target %": avg_target_pct,
+                "Target Price": avg_target_price,
+                "Setup Source": pos.get("Setup Source", ""),
                 "Cost": pos["Cost Basis"],
                 "Realized PnL": pos["Realized PnL"],
             })
@@ -3876,7 +3973,9 @@ def analyze_unified_portfolio(ledger: pd.DataFrame):
             row["Ticker"],
             safe_float(row["Avg Entry"]),
             row["Entry Date"],
-            safe_float(row["Initial Stop"])
+            safe_float(row["Initial Stop"]),
+            safe_float(row.get("Target %", 10.0), 10.0),
+            safe_float(row.get("Target Price", 0.0), 0.0),
         )
 
         current = safe_float(status.get("Current", np.nan))
@@ -3898,9 +3997,19 @@ def analyze_unified_portfolio(ledger: pd.DataFrame):
             "Open PnL $": round(open_pnl, 2) if np.isfinite(open_pnl) else np.nan,
             "Open PnL %": round(open_pnl_pct, 2) if np.isfinite(open_pnl_pct) else np.nan,
             "Realized PnL": round(safe_float(row["Realized PnL"]), 2),
+            "Target %": status.get("Target %", row.get("Target %", np.nan)),
+            "Target Price": status.get("Target Price", row.get("Target Price", np.nan)),
+            "Progress To Target %": status.get("Progress To Target %", np.nan),
+            "MFE %": status.get("MFE %", np.nan),
+            "MAE %": status.get("MAE %", np.nan),
+            "Peak Progress %": status.get("Peak Progress %", np.nan),
+            "Profit Giveback %": status.get("Profit Giveback %", np.nan),
+            "Giveback From Peak %": status.get("Giveback From Peak %", np.nan),
+            "Setup Source": row.get("Setup Source", ""),
             "Action": status.get("Action", ""),
             "Reason": status.get("Reason", ""),
             "Trailing Stop": status.get("Trailing Stop", np.nan),
+            "Dynamic Protection Stop": status.get("Dynamic Protection Stop", np.nan),
             "Current Protection Stop": status.get("Current Protection Stop", np.nan),
             "Profit Checkpoint": status.get("Profit Checkpoint", np.nan),
             "Distance to Trail %": status.get("Distance to Trail %", np.nan),
@@ -3997,6 +4106,9 @@ def get_ledger_column_config():
         "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=0.01, help="כמות מניות בפעולה."),
         "Price": st.column_config.NumberColumn("Price", min_value=0.0, step=0.01, help="מחיר הביצוע בפועל."),
         "Initial Stop": st.column_config.NumberColumn("Initial Stop", min_value=0.0, step=0.01, help="סטופ התחלתי להגנה. אפשר להשאיר 0 אם לא הוגדר."),
+        "Target %": st.column_config.NumberColumn("Target %", min_value=0.0, step=0.5, help="יעד אחוזי לניהול הפוזיציה. למשל 10 עבור יעד 10%."),
+        "Target Price": st.column_config.NumberColumn("Target Price", min_value=0.0, step=0.01, help="יעד מחיר ידני. אם 0, המערכת תחשב לפי Target %."),
+        "Setup Source": st.column_config.TextColumn("Setup Source", help="מקור הכניסה: ידני / Scanner / TSLA style וכו׳."),
         "Note": st.column_config.TextColumn("Note", help="הערה חופשית — למשל סיבה לכניסה או יציאה."),
     }
 
@@ -4008,6 +4120,234 @@ def reset_profile_ledger(profile: str):
     return empty_ledger()
 
 
+def get_open_position_map(profile: str):
+    """Return currently open tickers for a profile.
+
+    Used by the daily screen so a ticker already in the user's portfolio is not
+    shown as a fresh entry idea. It is still visible, but treated as an open
+    position with an Exit button.
+    """
+    ledger = load_profile_ledger(profile)
+    holdings, _ = ledger_to_holdings(ledger)
+    if holdings is None or holdings.empty:
+        return {}
+    out = {}
+    for _, row in holdings.iterrows():
+        ticker = str(row.get("Ticker", "")).upper().strip()
+        if ticker:
+            out[ticker] = row.to_dict()
+    return out
+
+
+def add_buy_transaction(profile: str, account: str, ticker: str, qty: float, price: float, stop: float, target_pct: float, target_price: float, note: str = ""):
+    ledger_now = load_profile_ledger(profile)
+    new_row = pd.DataFrame([{
+        "Date": datetime.now().strftime("%Y-%m-%d"),
+        "Account": account,
+        "Action": "BUY",
+        "Ticker": str(ticker).upper().strip(),
+        "Quantity": float(qty),
+        "Price": float(price),
+        "Initial Stop": float(stop or 0.0),
+        "Target %": float(target_pct or 10.0),
+        "Target Price": float(target_price or 0.0),
+        "Setup Source": "Daily Scan / Inline Entry",
+        "Note": note or "Inline entry from daily scan",
+    }])
+    ledger_now = normalize_ledger(pd.concat([ledger_now, new_row], ignore_index=True))
+    save_profile_ledger(profile, ledger_now)
+
+
+def close_position_from_daily(profile: str, account: str, ticker: str, qty: float, price: float):
+    """Append a SELL transaction to stop tracking an open position.
+
+    The user said exit price is not important for the model; nevertheless the
+    ledger needs a positive price to close quantity, so we use the current scan
+    price as a practical placeholder.
+    """
+    ledger_now = load_profile_ledger(profile)
+    new_row = pd.DataFrame([{
+        "Date": datetime.now().strftime("%Y-%m-%d"),
+        "Account": account or "אמת",
+        "Action": "SELL",
+        "Ticker": str(ticker).upper().strip(),
+        "Quantity": float(qty),
+        "Price": float(price),
+        "Initial Stop": 0.0,
+        "Target %": 0.0,
+        "Target Price": 0.0,
+        "Setup Source": "Daily Scan / Inline Exit",
+        "Note": "Tracking closed from daily scan screen",
+    }])
+    ledger_now = normalize_ledger(pd.concat([ledger_now, new_row], ignore_index=True))
+    save_profile_ledger(profile, ledger_now)
+
+
+def mark_open_positions_in_scan(df: pd.DataFrame, open_map: dict) -> pd.DataFrame:
+    if df is None or df.empty or not open_map:
+        return df
+    out = df.copy()
+    for idx, row in out.iterrows():
+        ticker = str(row.get("Ticker", "")).upper().strip()
+        if ticker in open_map:
+            if "Action" in out.columns:
+                out.at[idx, "Action"] = "בפוזיציה — אין פקודת כניסה"
+            if "State" in out.columns:
+                out.at[idx, "State"] = "OPEN POSITION"
+            if "What We Need" in out.columns:
+                out.at[idx, "What We Need"] = "ניהול פוזיציה קיימת, לא כניסה חדשה"
+            if "Why" in out.columns:
+                out.at[idx, "Why"] = "הטיקר כבר פתוח בתיק הפעיל ולכן הסורק לא אמור לתת לו פקודת כניסה נוספת."
+    return out
+
+def build_open_positions_daily_rows(open_map: dict, scan_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Build rows for open positions so they are shown first on the daily screen.
+
+    The daily workflow must start with what the user already owns. If a ticker is
+    open in the active portfolio, it should be managed before showing fresh ideas,
+    and it should not receive a new entry order.
+    """
+    if not open_map:
+        return pd.DataFrame()
+
+    scan = pd.DataFrame() if scan_df is None else scan_df.copy()
+    rows = []
+
+    for ticker, held in open_map.items():
+        ticker = str(ticker).upper().strip()
+        if not ticker:
+            continue
+
+        base = {}
+        if not scan.empty and "Ticker" in scan.columns:
+            matches = scan[scan["Ticker"].astype(str).str.upper().str.strip() == ticker]
+            if not matches.empty:
+                base = matches.iloc[0].to_dict()
+
+        avg_entry = safe_float(held.get("Avg Entry", np.nan), np.nan)
+        qty = safe_float(held.get("Quantity", 0.0), 0.0)
+        stop = safe_float(held.get("Initial Stop", 0.0), 0.0)
+        target_pct = safe_float(held.get("Target %", 10.0), 10.0)
+        target_price = safe_float(held.get("Target Price", 0.0), 0.0)
+        if (not np.isfinite(target_price) or target_price <= 0) and np.isfinite(avg_entry) and avg_entry > 0:
+            target_price = avg_entry * (1 + target_pct / 100)
+
+        # Prefer scanner current price if the ticker exists in today's scan.
+        current = safe_float(base.get("Current", np.nan), np.nan)
+
+        base.update({
+            "Ticker": ticker,
+            "State": "OPEN POSITION",
+            "Action": "בפוזיציה — ניהול קודם",
+            "Current": current,
+            "Buy Trigger": avg_entry,
+            "Next Action Price": avg_entry,
+            "Primary Target": target_price,
+            "Target 8%": target_price,
+            "Target 12%": target_price,
+            "Stop": stop if np.isfinite(stop) and stop > 0 else base.get("Stop", np.nan),
+            "Primary Target %": target_pct,
+            "What We Need": "קודם מנהלים את הפוזיציה הקיימת; לא מקבלים פקודת כניסה חדשה על אותה מניה.",
+            "Why": "הטיקר כבר פתוח בתיק הפעיל. המסך היומי מציג פוזיציות פתוחות לפני רעיונות חדשים כדי להגן על רווחים ולמנוע כניסה כפולה.",
+            "Category": base.get("Category", "Open position"),
+            "Primary Driver": base.get("Primary Driver", ""),
+            "Driver Alignment": base.get("Driver Alignment", ""),
+            "Priced-In Risk": base.get("Priced-In Risk", ""),
+            "Quantity": qty,
+            "Avg Entry": avg_entry,
+            "Open Account": held.get("Account", "אמת"),
+        })
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+def render_inline_position_actions(df: pd.DataFrame, profile: str, title: str, max_rows: int = 12):
+    """Render a compact actionable list with inline Enter/Exit controls.
+
+    This is intentionally separate from the big tables: the daily workflow should
+    let the user say "I entered" right next to the ticker, and later "I exited"
+    without going to the portfolio tab.
+    """
+    st.markdown(title)
+    if df is None or df.empty:
+        st.caption("אין מניות להצגה באזור הזה.")
+        return
+
+    open_map = get_open_position_map(profile)
+    rows = df.drop_duplicates(subset=["Ticker"], keep="first").head(max_rows).reset_index(drop=True)
+
+    for i, row in rows.iterrows():
+        ticker = str(row.get("Ticker", "")).upper().strip()
+        if not ticker:
+            continue
+        current = safe_float(row.get("Current", np.nan), np.nan)
+        trigger = safe_float(row.get("Buy Trigger", row.get("Next Action Price", np.nan)), np.nan)
+        target = safe_float(row.get("Primary Target", row.get("Target 8%", np.nan)), np.nan)
+        stop = safe_float(row.get("Stop", row.get("Quick Stop", np.nan)), np.nan)
+        target_pct = safe_float(row.get("Primary Target %", 10.0), 10.0)
+        action = str(row.get("Action", "")).strip()
+        state = str(row.get("State", "")).strip()
+
+        is_open = ticker in open_map
+        box = st.container(border=True)
+        with box:
+            c1, c2, c3, c4, c5, c6 = st.columns([1.0, 1.6, 1.0, 1.0, 1.0, 1.35])
+            c1.markdown(f"**{ticker}**")
+            c2.caption(f"{state or action}")
+            c3.metric("נוכחי", _fmt_value(current, digits=2))
+            c4.metric("כניסה/טריגר", _fmt_value(trigger, digits=2))
+            c5.metric("יעד", _fmt_value(target, digits=2))
+
+            if is_open:
+                held = open_map[ticker]
+                qty = safe_float(held.get("Quantity", 0.0), 0.0)
+                avg_entry = safe_float(held.get("Avg Entry", np.nan), np.nan)
+                pnl_pct = (current / avg_entry - 1) * 100 if np.isfinite(current) and np.isfinite(avg_entry) and avg_entry > 0 else np.nan
+                c6.markdown(f"✅ **בפוזיציה**  \nכמות: {qty:g}  \nכניסה: {_fmt_value(avg_entry)}  \nP/L: {_fmt_value(pnl_pct, suffix='%', digits=2)}")
+                if c6.button("יצאתי / הפסק מעקב", key=f"inline_exit_{profile}_{ticker}_{i}", use_container_width=True):
+                    close_price = current if np.isfinite(current) and current > 0 else avg_entry
+                    close_position_from_daily(profile, str(held.get("Account", "אמת")), ticker, qty, close_price)
+                    st.success(f"{ticker} נסגרה מהמעקב בתיק {profile}.")
+                    st.rerun()
+            else:
+                if c6.button("נכנסתי", key=f"inline_enter_btn_{profile}_{ticker}_{i}", use_container_width=True):
+                    st.session_state["inline_entry_ticker"] = ticker
+                    st.session_state["inline_entry_profile"] = profile
+                    st.session_state["inline_entry_defaults"] = {
+                        "current": float(current) if np.isfinite(current) else 0.0,
+                        "stop": float(stop) if np.isfinite(stop) else 0.0,
+                        "target_pct": float(target_pct) if np.isfinite(target_pct) and target_pct > 0 else 10.0,
+                        "target": float(target) if np.isfinite(target) else 0.0,
+                        "setup": str(row.get("Setup Type", "")),
+                    }
+
+            if st.session_state.get("inline_entry_ticker") == ticker and st.session_state.get("inline_entry_profile") == profile:
+                defaults = st.session_state.get("inline_entry_defaults", {})
+                st.markdown("##### הזנת כניסה בפועל")
+                f1, f2, f3, f4, f5 = st.columns([1, 1, 1, 1, 1.2])
+                account = f1.selectbox("סוג", ["אמת", "וירטואלי"], key=f"inline_account_{profile}_{ticker}_{i}")
+                qty = f2.number_input("כמות", min_value=0.0, step=0.01, key=f"inline_qty_{profile}_{ticker}_{i}")
+                price = f3.number_input("שער כניסה", min_value=0.0, value=float(defaults.get("current", 0.0)), step=0.01, key=f"inline_price_{profile}_{ticker}_{i}")
+                stp = f4.number_input("סטופ", min_value=0.0, value=float(defaults.get("stop", 0.0)), step=0.01, key=f"inline_stop_{profile}_{ticker}_{i}")
+                tgt_pct = f5.number_input("יעד %", min_value=0.0, value=float(defaults.get("target_pct", 10.0)), step=0.5, key=f"inline_target_pct_{profile}_{ticker}_{i}")
+                g1, g2 = st.columns([1, 1])
+                if g1.button("שמור כניסה", key=f"inline_save_entry_{profile}_{ticker}_{i}", use_container_width=True):
+                    if qty <= 0 or price <= 0:
+                        st.error("צריך כמות ושער כניסה תקינים.")
+                    else:
+                        target_price = price * (1 + tgt_pct / 100) if tgt_pct > 0 else float(defaults.get("target", 0.0))
+                        add_buy_transaction(profile, account, ticker, qty, price, stp, tgt_pct, target_price, note=f"Inline entry; setup={defaults.get('setup','')}")
+                        st.session_state.pop("inline_entry_ticker", None)
+                        st.session_state.pop("inline_entry_profile", None)
+                        st.session_state.pop("inline_entry_defaults", None)
+                        st.success(f"{ticker} נוספה למעקב. בהרצה הבאה לא תקבל פקודת כניסה חדשה עליה, אלא ניהול פוזיציה.")
+                        st.rerun()
+                if g2.button("בטל", key=f"inline_cancel_entry_{profile}_{ticker}_{i}", use_container_width=True):
+                    st.session_state.pop("inline_entry_ticker", None)
+                    st.session_state.pop("inline_entry_profile", None)
+                    st.session_state.pop("inline_entry_defaults", None)
+                    st.rerun()
 
 
 # ==========================================================
@@ -4720,9 +5060,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V16.0 — Disciplined Trade Lifecycle</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V16.3 — Open Positions First</h1>", unsafe_allow_html=True)
     st.info(
-        "V16.0 מקשיחה את מודל ההחלטה עצמו: פחות המלצות, יותר משמעת. דרייבר חיצוני הוא שער כניסה, מניות כבדות לא מקבלות יעד 8%-12% אוטומטי, מחזור חלש/ריצה מאוחרת מורידים פעולה ל-Watch, ונוספו שדות לניהול פוזיציה אחרי כניסה. "
+        "V16.1 מוסיפה Position Memory: אם נכנסת למניה בפועל, מזינים שער/כמות/יעד/סטופ והיא עוברת לניהול פוזיציה יומי נפרד. המערכת מחשבת התקדמות ליעד, MFE/MAE, החזרת רווחים וסטופ הגנה דינמי — גם אם המניה כבר לא מופיעה בסורק היומי. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
@@ -4829,6 +5169,28 @@ else:
             df_watch_display = add_action_explanations(localize_daily_display(df_watch))
             df_ignore_display = add_action_explanations(localize_daily_display(df_ignore))
 
+            # V16.2: choose active portfolio on the daily screen, because the scanner
+            # must know whether a ticker is already open before showing entry controls.
+            daily_profile = st.selectbox(
+                "תיק פעיל לניהול כניסות/יציאות מהמסך הזה",
+                ["user1", "user2", "user3"],
+                key="daily_inline_profile",
+                help="אם סימנת שנכנסת למניה, היא תישמר לתיק הזה ותמשיך להופיע במעקב גם בהרצות הבאות."
+            )
+            open_position_map = get_open_position_map(daily_profile)
+
+            # V16.3: open positions must be the first thing the user sees after a scan.
+            # Use the full scan universe to show the freshest available context for held tickers,
+            # but do not let held tickers appear again as new entry ideas.
+            df_all_display_for_positions = pd.concat(
+                [df_action_display, df_watch_display, df_ignore_display],
+                ignore_index=True
+            ) if (not df_action_display.empty or not df_watch_display.empty or not df_ignore_display.empty) else pd.DataFrame()
+            df_open_positions_display = build_open_positions_daily_rows(open_position_map, df_all_display_for_positions)
+
+            df_action_display = mark_open_positions_in_scan(df_action_display, open_position_map)
+            df_watch_display = mark_open_positions_in_scan(df_watch_display, open_position_map)
+
             total = len(df_action) + len(df_watch) + len(df_ignore)
             near_ready_count = 0
             pullback_count = 0
@@ -4850,6 +5212,31 @@ else:
                 st.success(f"יש {len(df_action_display)} פקודות פעולה: {tickers}")
             else:
                 st.warning("אין כרגע פקודת קנייה נקייה. זה לא כישלון — המודל פשוט לא מצא כניסה מספיק איכותית.")
+
+            # V16.3: Position management first. New ideas come only after current holdings.
+            if not df_open_positions_display.empty:
+                render_inline_position_actions(
+                    df_open_positions_display,
+                    daily_profile,
+                    "## 💼 קודם כל: פוזיציות פתוחות לניהול",
+                    max_rows=20
+                )
+
+            # V16.2/V16.3: Inline entry controls for new ideas only.
+            inline_candidates = pd.concat([df_action_display, df_watch_display], ignore_index=True) if (not df_action_display.empty or not df_watch_display.empty) else pd.DataFrame()
+            if not inline_candidates.empty and open_position_map:
+                inline_candidates = inline_candidates[~inline_candidates["Ticker"].astype(str).str.upper().str.strip().isin(open_position_map.keys())]
+            if not inline_candidates.empty:
+                render_inline_position_actions(
+                    inline_candidates,
+                    daily_profile,
+                    "## 🎛️ רעיונות חדשים — נכנסתי",
+                    max_rows=14
+                )
+
+            # V16.1 legacy expander removed in V16.2. Entry/exit is now inline above.
+
+            # Legacy quick-entry expander removed in V16.2.
 
             if not show_tables_first:
                 render_trader_cards_section(df_action_display, "## ✅ פקודות פעולה", mode="action", max_cards=6)
@@ -5034,8 +5421,9 @@ else:
                 else:
                     st.warning("סמן קודם 'אשר איפוס'.")
 
-        st.markdown("### הוספת פעולה")
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        st.markdown("### הוספת פעולה / נכנסתי")
+        st.caption("V16.1: כשאתה מוסיף BUY, המניה נכנסת לזיכרון פוזיציות. בכל הרצה ננתח אותה בנפרד גם אם היא כבר לא מופיעה בסורק היומי.")
+        c1, c2, c3, c4, c5 = st.columns(5)
 
         with c1:
             account = st.selectbox("תיק", ["אמת", "וירטואלי"], key="tx_account")
@@ -5046,13 +5434,21 @@ else:
         with c4:
             qty = st.number_input("כמות", min_value=0.0, step=0.01, key="tx_qty")
         with c5:
-            price = st.number_input("מחיר", min_value=0.0, step=0.01, key="tx_price")
+            price = st.number_input("מחיר ביצוע", min_value=0.0, step=0.01, key="tx_price")
+
+        c6, c7, c8, c9 = st.columns(4)
         with c6:
             initial_stop = st.number_input("Initial Stop", min_value=0.0, step=0.01, key="tx_stop")
+        with c7:
+            target_pct = st.number_input("Target %", min_value=0.0, value=10.0, step=0.5, key="tx_target_pct")
+        with c8:
+            target_price = st.number_input("Target Price", min_value=0.0, step=0.01, key="tx_target_price", help="אפשר להשאיר 0 ואז המערכת תחשב לפי Target %")
+        with c9:
+            setup_source = st.text_input("Setup Source", value="Manual", key="tx_setup_source")
 
         note = st.text_input("הערה", value="", key="tx_note")
 
-        if st.button("➕ הוסף פעולה ליומן", use_container_width=True):
+        if st.button("➕ הוסף פעולה ליומן / התחל מעקב", use_container_width=True):
             if not ticker or qty <= 0 or price <= 0:
                 st.error("צריך Ticker, כמות ומחיר תקינים.")
             else:
@@ -5064,11 +5460,14 @@ else:
                     "Quantity": qty,
                     "Price": price,
                     "Initial Stop": initial_stop,
+                    "Target %": target_pct,
+                    "Target Price": target_price,
+                    "Setup Source": setup_source,
                     "Note": note,
                 }])
                 st.session_state["ledger"] = normalize_ledger(pd.concat([st.session_state["ledger"], new_row], ignore_index=True))
                 save_profile_ledger(profile, st.session_state["ledger"])
-                st.success("הפעולה נוספה ונשמרה.")
+                st.success("הפעולה נוספה ונשמרה. אם זו BUY פתוחה, היא תופיע בניהול פוזיציות בכל הרצה.")
 
         st.markdown("### יומן פעולות")
         ledger_df_for_editor = normalize_ledger(st.session_state["ledger"]).copy()
@@ -5125,8 +5524,9 @@ else:
                 cols = [
                     "Account", "Ticker", "Action", "Reason", "Quantity", "Avg Entry", "Current",
                     "Market Value", "Open PnL $", "Open PnL %", "Realized PnL",
-                    "Trailing Stop", "Current Protection Stop", "Profit Checkpoint", "Distance to Trail %", "EMA21", "Exit Close Level",
-                    "Initial Stop", "Entry Date", "Last Date"
+                    "Target %", "Target Price", "Progress To Target %", "MFE %", "MAE %", "Profit Giveback %", "Giveback From Peak %",
+                    "Trailing Stop", "Dynamic Protection Stop", "Current Protection Stop", "Profit Checkpoint", "Distance to Trail %", "EMA21", "Exit Close Level",
+                    "Initial Stop", "Setup Source", "Entry Date", "Last Date"
                 ]
                 df_portfolio = dedupe_dataframe_columns(df_portfolio)
                 cols = unique_existing_columns(cols, df_portfolio)
