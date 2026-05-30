@@ -2304,11 +2304,11 @@ def get_today_breakout_action_plan(params: StrategyParams):
 
 
 # ==========================================================
-# 7B. Signal Audit Lab - replay recent scans vs actual outcome
+# 7B. Signal Audit Lab - realistic daily replay audit
 # ==========================================================
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_audit_data(extra_days: int = 460):
-    """Download one multi-ticker panel for the replay audit."""
+def fetch_audit_data(extra_days: int = 520):
+    """Download one multi-ticker panel for replay audit."""
     driver_symbols = sorted({get_driver_profile(t).get("driver", "QQQ") for t in WATCHLIST})
     symbols = sorted(set(WATCHLIST + driver_symbols + ["QQQ"]))
     end = datetime.now()
@@ -2321,7 +2321,6 @@ def _safe_panel_series(panel: pd.DataFrame, field: str, symbol: str) -> pd.Serie
         if isinstance(panel.columns, pd.MultiIndex):
             if field in panel.columns.get_level_values(0):
                 return panel[field][symbol].dropna()
-            # fallback for reversed multiindex
             if field in panel.columns.get_level_values(1):
                 return panel[symbol][field].dropna()
         return pd.Series(dtype=float)
@@ -2337,118 +2336,246 @@ def _first_hit_index(series_high: pd.Series, trigger: float):
         return None
 
 
-def _assess_signal_outcome(panel: pd.DataFrame, ticker: str, signal_date, row: dict, forward_days: int = 5):
-    """
-    Assesses what happened AFTER the signal. It does not pretend to be a broker fill engine.
-    For action states we check whether the buy trigger was reached, then target/stop order.
-    """
-    h_all = _safe_panel_series(panel, "High", ticker)
-    l_all = _safe_panel_series(panel, "Low", ticker)
-    c_all = _safe_panel_series(panel, "Close", ticker)
-    if h_all.empty or c_all.empty or signal_date not in c_all.index:
-        return {}
+def _as_date_str(x):
+    return str(x.date()) if hasattr(x, "date") else str(x)
 
-    future_idx = c_all.index[c_all.index > signal_date][:forward_days]
-    if len(future_idx) == 0:
-        return {}
 
-    trigger = safe_float(row.get("Buy Trigger", np.nan))
-    current = safe_float(row.get("Current", np.nan))
-    stop = safe_float(row.get("Stop", np.nan))
-    target8 = safe_float(row.get("Target 8%", np.nan))
-    target12 = safe_float(row.get("Target 12%", np.nan))
+def _audit_trade_plan_from_row(row: dict):
+    """
+    Converts a scanner row into a concrete audit trade plan.
+    Only true actionable states are tradable. WATCH/NEAR/WAIT remain research rows.
+    """
     state = str(row.get("State", ""))
+    if state not in ["BUY SETUP READY", "QUICK BURST READY"]:
+        return None
 
-    if not np.isfinite(trigger) or trigger <= 0:
-        trigger = current
+    entry = safe_float(row.get("Buy Trigger", np.nan))
+    if not np.isfinite(entry) or entry <= 0:
+        entry = safe_float(row.get("Next Action Price", np.nan))
+    if not np.isfinite(entry) or entry <= 0:
+        return None
 
-    future_high = h_all.loc[future_idx]
-    future_low = l_all.loc[future_idx]
-    future_close = c_all.loc[future_idx]
-
-    triggered = False
-    trigger_date = None
-    if state in ["BUY SETUP READY", "QUICK BURST READY"]:
-        # If trigger is at/below current, assume actionable immediately from next session.
-        if np.isfinite(current) and trigger <= current * 1.003:
-            triggered = True
-            trigger_date = future_idx[0]
-            entry = trigger
-        else:
-            hit = _first_hit_index(future_high, trigger)
-            triggered = hit is not None
-            trigger_date = hit
-            entry = trigger
+    if state == "QUICK BURST READY":
+        target = safe_float(row.get("Quick Target 4.5%", np.nan))
+        stop = safe_float(row.get("Quick Stop", np.nan))
+        target_label = "QUICK 4.5%"
+        if not np.isfinite(target) or target <= 0:
+            target = entry * 1.045
     else:
-        # Watch states are audited as "did it mature / move anyway", using current as reference.
-        entry = current
+        target = safe_float(row.get("Target 8%", np.nan))
+        stop = safe_float(row.get("Stop", np.nan))
+        target_label = "SWING 8%"
+        if not np.isfinite(target) or target <= 0:
+            target = entry * 1.08
 
-    if not triggered and state in ["BUY SETUP READY", "QUICK BURST READY"]:
-        return {
-            "Triggered": False,
-            "Trigger Date": "",
-            "Outcome": "NOT TRIGGERED",
-            "Forward Close %": round((future_close.iloc[-1] / current - 1) * 100, 2) if np.isfinite(current) else np.nan,
-            "MFE %": round((future_high.max() / current - 1) * 100, 2) if np.isfinite(current) else np.nan,
-            "MAE %": round((future_low.min() / current - 1) * 100, 2) if np.isfinite(current) else np.nan,
-            "Hit 8%": False,
-            "Hit 12%": False,
-            "Hit Stop": False,
-        }
-
-    # Only evaluate from trigger date onward for actionable signals.
-    if trigger_date is not None and trigger_date in future_idx:
-        eval_idx = future_idx[future_idx >= trigger_date]
-        eval_high = h_all.loc[eval_idx]
-        eval_low = l_all.loc[eval_idx]
-        eval_close = c_all.loc[eval_idx]
-    else:
-        eval_idx = future_idx
-        eval_high = future_high
-        eval_low = future_low
-        eval_close = future_close
-
-    hit8_date = _first_hit_index(eval_high, target8) if np.isfinite(target8) else None
-    hit12_date = _first_hit_index(eval_high, target12) if np.isfinite(target12) else None
-    stop_date = None
-    if np.isfinite(stop):
-        lows = eval_low[eval_low <= stop]
-        stop_date = lows.index[0] if len(lows) else None
-
-    def before_or_none(a, b):
-        if a is None:
-            return False
-        if b is None:
-            return True
-        return a <= b
-
-    hit8_before_stop = before_or_none(hit8_date, stop_date)
-    hit12_before_stop = before_or_none(hit12_date, stop_date)
-    stop_before_8 = before_or_none(stop_date, hit8_date)
-
-    if hit12_before_stop:
-        outcome = "TARGET 12 BEFORE STOP"
-    elif hit8_before_stop:
-        outcome = "TARGET 8 BEFORE STOP"
-    elif stop_before_8:
-        outcome = "STOP BEFORE TARGET"
-    else:
-        outcome = "OPEN / NO HIT"
+    target12 = safe_float(row.get("Target 12%", np.nan))
+    if not np.isfinite(stop) or stop <= 0 or stop >= entry:
+        return None
 
     return {
-        "Triggered": bool(triggered or state not in ["BUY SETUP READY", "QUICK BURST READY"]),
-        "Trigger Date": str(trigger_date.date()) if hasattr(trigger_date, "date") else "",
-        "Outcome": outcome,
-        "Forward Close %": round((eval_close.iloc[-1] / entry - 1) * 100, 2) if np.isfinite(entry) else np.nan,
-        "MFE %": round((eval_high.max() / entry - 1) * 100, 2) if np.isfinite(entry) else np.nan,
-        "MAE %": round((eval_low.min() / entry - 1) * 100, 2) if np.isfinite(entry) else np.nan,
-        "Hit 8%": bool(hit8_before_stop),
-        "Hit 12%": bool(hit12_before_stop),
-        "Hit Stop": bool(stop_before_8),
+        "state": state,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "target12": float(target12) if np.isfinite(target12) else np.nan,
+        "target_label": target_label,
+        "limit": float(entry) * 1.006,  # Stop-limit tolerance. Avoid chasing gap-ups.
     }
 
 
-def run_recent_signal_audit(params: StrategyParams, lookback_days: int = 10, forward_days: int = 5, include_watch: bool = True):
+def _assess_signal_outcome(
+    panel: pd.DataFrame,
+    ticker: str,
+    decision_date,
+    data_as_of,
+    row: dict,
+    forward_days: int = 5,
+    order_valid_days: int = 1,
+):
+    """
+    Realistic replay:
+    - The scan decision is made before the decision_date session, using data_as_of = previous close.
+    - Only BUY SETUP READY / QUICK BURST READY are treated as actual trade recommendations.
+    - A stop-limit buy order is valid for order_valid_days sessions.
+    - If filled, outcome is tracked until first target/stop, or until forward_days expires.
+    - If target and stop are both hit in the same daily candle, we mark it conservative/ambiguous as stop first.
+    """
+    h_all = _safe_panel_series(panel, "High", ticker)
+    l_all = _safe_panel_series(panel, "Low", ticker)
+    o_all = _safe_panel_series(panel, "Open", ticker)
+    c_all = _safe_panel_series(panel, "Close", ticker)
+    if h_all.empty or l_all.empty or o_all.empty or c_all.empty:
+        return {}
+
+    future_idx = c_all.index[c_all.index >= decision_date][:forward_days]
+    if len(future_idx) == 0:
+        return {}
+
+    current = safe_float(row.get("Current", np.nan))
+    plan = _audit_trade_plan_from_row(row)
+
+    # Research rows are deliberately not counted as trades.
+    if plan is None:
+        future_high = h_all.loc[future_idx]
+        future_low = l_all.loc[future_idx]
+        future_close = c_all.loc[future_idx]
+        ref = current
+        return {
+            "Actionable Trade": False,
+            "Order Filled": False,
+            "Entry Date": "",
+            "Entry Price": np.nan,
+            "Exit Date": "",
+            "Exit Price": np.nan,
+            "Exit Reason": "RESEARCH ONLY / NO TRADE",
+            "Trade Return %": np.nan,
+            "Forward Close %": round((future_close.iloc[-1] / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "MFE %": round((future_high.max() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "MAE %": round((future_low.min() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "Hit Target": False,
+            "Hit 8%": False,
+            "Hit 12%": False,
+            "Hit Stop": False,
+            "Audit Note": "מצב מעקב בלבד — לא נספר כעסקה אמיתית.",
+        }
+
+    entry_trigger = plan["entry"]
+    limit_price = plan["limit"]
+    stop = plan["stop"]
+    target = plan["target"]
+    target12 = plan["target12"]
+
+    # 1) Fill simulation: stop-limit order valid for N sessions.
+    fill_date = None
+    fill_price = np.nan
+    order_idx = future_idx[:max(1, int(order_valid_days))]
+    for d in order_idx:
+        op = safe_float(o_all.loc[d], np.nan)
+        hi = safe_float(h_all.loc[d], np.nan)
+        if not np.isfinite(op) or not np.isfinite(hi):
+            continue
+        if op > limit_price:
+            # Gap too far above limit. Do not chase.
+            continue
+        if hi >= entry_trigger:
+            candidate_fill = max(op, entry_trigger)
+            if candidate_fill <= limit_price:
+                fill_date = d
+                fill_price = float(candidate_fill)
+                break
+
+    if fill_date is None:
+        future_high = h_all.loc[future_idx]
+        future_low = l_all.loc[future_idx]
+        future_close = c_all.loc[future_idx]
+        ref = current if np.isfinite(current) and current > 0 else entry_trigger
+        return {
+            "Actionable Trade": True,
+            "Order Filled": False,
+            "Entry Date": "",
+            "Entry Price": np.nan,
+            "Exit Date": "",
+            "Exit Price": np.nan,
+            "Exit Reason": "ORDER NOT FILLED",
+            "Trade Return %": np.nan,
+            "Forward Close %": round((future_close.iloc[-1] / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "MFE %": round((future_high.max() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "MAE %": round((future_low.min() / ref - 1) * 100, 2) if np.isfinite(ref) and ref > 0 else np.nan,
+            "Hit Target": False,
+            "Hit 8%": False,
+            "Hit 12%": False,
+            "Hit Stop": False,
+            "Audit Note": "הייתה המלצה לפעולה, אבל פקודת הכניסה לא התמלאה בחלון שהוגדר.",
+        }
+
+    # 2) Outcome simulation from fill date onward.
+    eval_idx = future_idx[future_idx >= fill_date]
+    exit_date = None
+    exit_price = np.nan
+    exit_reason = "OPEN / TIME EXIT"
+    hit_target = False
+    hit_stop = False
+    hit12 = False
+    ambiguous = False
+
+    for d in eval_idx:
+        hi = safe_float(h_all.loc[d], np.nan)
+        lo = safe_float(l_all.loc[d], np.nan)
+        cl = safe_float(c_all.loc[d], np.nan)
+        if not np.isfinite(hi) or not np.isfinite(lo):
+            continue
+
+        target_hit_today = hi >= target
+        stop_hit_today = lo <= stop
+        target12_hit_today = np.isfinite(target12) and hi >= target12
+
+        if target12_hit_today and not stop_hit_today:
+            hit12 = True
+
+        # Conservative daily-bar ambiguity: if both touched same day, count stop first.
+        if target_hit_today and stop_hit_today:
+            ambiguous = True
+            exit_date = d
+            exit_price = stop
+            exit_reason = "STOP FIRST (DAILY AMBIGUOUS)"
+            hit_stop = True
+            break
+        if stop_hit_today:
+            exit_date = d
+            exit_price = stop
+            exit_reason = "STOP"
+            hit_stop = True
+            break
+        if target_hit_today:
+            exit_date = d
+            exit_price = target
+            exit_reason = f"TARGET {plan['target_label']}"
+            hit_target = True
+            hit12 = bool(hit12 or target12_hit_today)
+            break
+
+    if exit_date is None:
+        exit_date = eval_idx[-1]
+        exit_price = safe_float(c_all.loc[exit_date], np.nan)
+        exit_reason = "TIME EXIT / FORWARD CLOSE"
+
+    eval_high = h_all.loc[eval_idx]
+    eval_low = l_all.loc[eval_idx]
+    eval_close = c_all.loc[eval_idx]
+    ret = (exit_price / fill_price - 1) * 100 if np.isfinite(exit_price) and np.isfinite(fill_price) and fill_price > 0 else np.nan
+
+    return {
+        "Actionable Trade": True,
+        "Order Filled": True,
+        "Entry Date": _as_date_str(fill_date),
+        "Entry Price": round(fill_price, 2),
+        "Exit Date": _as_date_str(exit_date),
+        "Exit Price": round(exit_price, 2) if np.isfinite(exit_price) else np.nan,
+        "Exit Reason": exit_reason,
+        "Trade Return %": round(ret, 2) if np.isfinite(ret) else np.nan,
+        "Forward Close %": round((eval_close.iloc[-1] / fill_price - 1) * 100, 2) if fill_price > 0 else np.nan,
+        "MFE %": round((eval_high.max() / fill_price - 1) * 100, 2) if fill_price > 0 else np.nan,
+        "MAE %": round((eval_low.min() / fill_price - 1) * 100, 2) if fill_price > 0 else np.nan,
+        "Hit Target": bool(hit_target),
+        "Hit 8%": bool(hit_target),
+        "Hit 12%": bool(hit12),
+        "Hit Stop": bool(hit_stop),
+        "Audit Note": "שמרני: אם יעד וסטופ נגעו באותו נר יומי, נספר כסטופ קודם." if ambiguous else "",
+    }
+
+
+def run_recent_signal_audit(
+    params: StrategyParams,
+    lookback_days: int = 10,
+    forward_days: int = 5,
+    include_watch: bool = True,
+    order_valid_days: int = 1,
+):
+    """
+    True replay audit:
+    For each decision date, scan uses ONLY data through the previous close.
+    Then it simulates what would happen from that decision date forward.
+    """
     panel = fetch_audit_data()
     if panel is None or panel.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -2457,47 +2584,66 @@ def run_recent_signal_audit(params: StrategyParams, lookback_days: int = 10, for
     if qqq_close.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Use dates with enough past data and enough future candles for outcome.
     all_dates = list(qqq_close.index)
     if len(all_dates) < 260:
         return pd.DataFrame(), pd.DataFrame()
 
-    end_pos = len(all_dates) - 1
-    start_pos = max(220, end_pos - lookback_days - forward_days)
-    decision_positions = range(start_pos, max(start_pos, end_pos - 1))
+    # Need a previous close for the signal and enough future days for the outcome.
+    end_decision_pos = len(all_dates) - 1 - forward_days
+    start_decision_pos = max(221, end_decision_pos - lookback_days + 1)
+    if start_decision_pos > end_decision_pos:
+        return pd.DataFrame(), pd.DataFrame()
+    decision_positions = range(start_decision_pos, end_decision_pos + 1)
 
     driver_symbols = sorted({get_driver_profile(t).get("driver", "QQQ") for t in WATCHLIST})
     driver_cache_full = {sym: _safe_panel_series(panel, "Close", sym) for sym in driver_symbols}
     driver_cache_full["QQQ"] = qqq_close
 
+    actionable_states = ["BUY SETUP READY", "QUICK BURST READY"]
+    research_states = ["NEAR READY", "WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH", "MISSED / WAIT RESET"]
+
     rows = []
     for pos in decision_positions:
-        signal_date = all_dates[pos]
-        qqq_slice = qqq_close.loc[:signal_date].dropna()
+        decision_date = all_dates[pos]
+        data_as_of = all_dates[pos - 1]
+        qqq_slice = qqq_close.loc[:data_as_of].dropna()
         if len(qqq_slice) < 220:
             continue
 
         for ticker in WATCHLIST:
             try:
-                c = _safe_panel_series(panel, "Close", ticker).loc[:signal_date].dropna()
-                h = _safe_panel_series(panel, "High", ticker).loc[:signal_date].dropna()
-                l = _safe_panel_series(panel, "Low", ticker).loc[:signal_date].dropna()
-                v = _safe_panel_series(panel, "Volume", ticker).loc[:signal_date].dropna()
-                o = _safe_panel_series(panel, "Open", ticker).loc[:signal_date].dropna()
-                if len(c) < 220 or len(h) < 220 or len(l) < 220:
+                c = _safe_panel_series(panel, "Close", ticker).loc[:data_as_of].dropna()
+                h = _safe_panel_series(panel, "High", ticker).loc[:data_as_of].dropna()
+                l = _safe_panel_series(panel, "Low", ticker).loc[:data_as_of].dropna()
+                v = _safe_panel_series(panel, "Volume", ticker).loc[:data_as_of].dropna()
+                o = _safe_panel_series(panel, "Open", ticker).loc[:data_as_of].dropna()
+                if len(c) < 220 or len(h) < 220 or len(l) < 220 or len(o) < 220:
                     continue
+
                 profile = get_driver_profile(ticker)
                 d_full = driver_cache_full.get(profile.get("driver", "QQQ"), qqq_close)
-                driver_slice = d_full.loc[:signal_date].dropna() if not d_full.empty else qqq_slice
+                driver_slice = d_full.loc[:data_as_of].dropna() if not d_full.empty else qqq_slice
+
                 row = evaluate_breakout_action_plan(ticker, c, h, l, v, o, qqq_slice, params, driver_close=driver_slice)
                 state = row.get("State", "IGNORE")
                 action = row.get("Action", "")
-                keep = state in ["BUY SETUP READY", "QUICK BURST READY"] or (include_watch and state in ["NEAR READY", "WAIT FOR BREAKOUT", "WAIT FOR PULLBACK", "TURNAROUND WATCH", "MISSED / WAIT RESET"])
+
+                keep = state in actionable_states or (include_watch and state in research_states)
                 if not keep:
                     continue
-                outcome = _assess_signal_outcome(panel, ticker, signal_date, row, forward_days=forward_days)
+
+                outcome = _assess_signal_outcome(
+                    panel,
+                    ticker,
+                    decision_date,
+                    data_as_of,
+                    row,
+                    forward_days=forward_days,
+                    order_valid_days=order_valid_days,
+                )
                 rows.append({
-                    "Signal Date": signal_date.strftime("%Y-%m-%d"),
+                    "Decision Date": _as_date_str(decision_date),
+                    "Data As Of": _as_date_str(data_as_of),
                     "Ticker": ticker,
                     "State": state,
                     "Action": action,
@@ -2505,9 +2651,10 @@ def run_recent_signal_audit(params: StrategyParams, lookback_days: int = 10, for
                     "Primary Driver": row.get("Primary Driver", ""),
                     "Driver Alignment": row.get("Driver Alignment", ""),
                     "Priced-In Risk": row.get("Priced-In Risk", ""),
-                    "Current": row.get("Current", np.nan),
+                    "Current As Of Prev Close": row.get("Current", np.nan),
                     "Buy Trigger": row.get("Buy Trigger", np.nan),
                     "Stop": row.get("Stop", np.nan),
+                    "Quick Target 4.5%": row.get("Quick Target 4.5%", np.nan),
                     "Target 8%": row.get("Target 8%", np.nan),
                     "Target 12%": row.get("Target 12%", np.nan),
                     "Risk %": row.get("Risk %", np.nan),
@@ -2528,20 +2675,23 @@ def run_recent_signal_audit(params: StrategyParams, lookback_days: int = 10, for
 
     summary = df.groupby("State", as_index=False).agg(
         Signals=("Ticker", "count"),
-        Triggered=("Triggered", "sum"),
+        Actionable=("Actionable Trade", "sum"),
+        Orders_Filled=("Order Filled", "sum"),
+        Avg_Trade_Return=("Trade Return %", "mean"),
         Avg_Fwd_Close=("Forward Close %", "mean"),
         Avg_MFE=("MFE %", "mean"),
         Avg_MAE=("MAE %", "mean"),
-        Hit8=("Hit 8%", "sum"),
+        Hit_Target=("Hit Target", "sum"),
         Hit12=("Hit 12%", "sum"),
         Stops=("Hit Stop", "sum"),
     )
-    summary["Hit8 %"] = (summary["Hit8"] / summary["Signals"] * 100).round(1)
-    summary["Stop %"] = (summary["Stops"] / summary["Signals"] * 100).round(1)
-    for col in ["Avg_Fwd_Close", "Avg_MFE", "Avg_MAE"]:
+    summary["Fill %"] = (summary["Orders_Filled"] / summary["Signals"].replace(0, np.nan) * 100).round(1)
+    summary["Target %"] = (summary["Hit_Target"] / summary["Orders_Filled"].replace(0, np.nan) * 100).round(1)
+    summary["Stop %"] = (summary["Stops"] / summary["Orders_Filled"].replace(0, np.nan) * 100).round(1)
+    for col in ["Avg_Trade_Return", "Avg_Fwd_Close", "Avg_MFE", "Avg_MAE"]:
         summary[col] = summary[col].round(2)
-    return df.sort_values(["Signal Date", "State", "Breakout Score"], ascending=[False, True, False]), summary
 
+    return df.sort_values(["Decision Date", "State", "Breakout Score"], ascending=[False, True, False]), summary
 
 def get_today_actions(params: StrategyParams):
     qqq = download_single("QQQ", "370d")
@@ -4228,9 +4378,9 @@ if not st.session_state["authenticated"]:
             st.error("סיסמה שגויה. אם לא הגדרת Secrets, ברירת המחדל היא 1234")
 
 else:
-    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.1 — Trader UX + Audit Lab</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🎯 SwingHunter V15.2 — Trader UX + Realistic Audit Replay</h1>", unsafe_allow_html=True)
     st.info(
-        "V15.1 מוסיפה Audit Lab לבדיקת שבועיים אחורה: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
+        "V15.2 מתקנת את Audit Lab כך שהסריקה משתמשת רק בנתוני סוף היום הקודם ומדמה פקודות כניסה/יעד/סטופ בצורה שמרנית: כל מניה נבדקת מול הדרייבר המרכזי שלה, וההסבר המילולי נשאר מחוץ לעמודות הטבלה כדי לשמור על תצוגה נקייה. "
         "המערכת מסמנת סטייה מול דרייבר, סיכון שהמהלך כבר מתומחר, ועמודת פעולה פשוטה כדי לא לרדוף אחרי מהלך שכבר קרה."
     )
 
@@ -4420,17 +4570,19 @@ else:
         inject_modern_css()
         st.markdown("## 🧯 Audit Lab — בדיקת המלצות מול מה שקרה בפועל")
         st.caption(
-            "המטרה כאן היא לא להוכיח שהמודל צדק, אלא למצוא איפה הוא טעה: האם הוא רדף אחרי מניות חמות מדי, "
-            "האם הדרייבר לא אישר, האם הסטופ רחב מדי, והאם פקודות פעולה באמת נתנו המשך." 
+            "המטרה כאן היא לדמות משתמש אמיתי: הסריקה משתמשת רק בנתוני סוף היום הקודם, פקודות הכניסה נבדקות מהיום הבא, ואז נבדק יעד/סטופ באופן שמרני. "
+            "כך נבדוק האם הדרייבר אישר, האם הסטופ רחב מדי, והאם פקודות פעולה באמת נתנו המשך." 
         )
 
-        a1, a2, a3 = st.columns(3)
+        a1, a2, a3, a4 = st.columns(4)
         with a1:
-            audit_days = st.slider("כמה ימי מסחר לבדוק אחורה", 5, 20, 10, 1)
+            audit_days = st.slider("כמה ימי מסחר לבדוק אחורה", 5, 30, 10, 1)
         with a2:
-            forward_days = st.slider("כמה ימים קדימה לבדוק תוצאה", 2, 10, 5, 1)
+            forward_days = st.slider("כמה ימים קדימה לבדוק תוצאה", 2, 15, 5, 1)
         with a3:
-            include_watch = st.toggle("כלול גם Watch / Near Ready", value=True)
+            order_valid_days = st.slider("תוקף פקודת כניסה בימים", 1, 5, 1, 1, help="כמה ימי מסחר פקודת הכניסה נשארת בתוקף. 1 = רק אותו יום, הכי שמרני.")
+        with a4:
+            include_watch = st.toggle("כלול גם Watch / Near Ready", value=False, help="כבוי = בודק רק המלצות פעולה אמיתיות. דלוק = מוסיף שורות מחקר, אבל לא סופר אותן כעסקאות.")
 
         if st.button("🔎 הרץ Audit Replay", type="primary", use_container_width=True):
             with st.spinner("משחזר מה הסורק היה רואה בכל יום ובודק מה קרה אחר כך..."):
@@ -4439,6 +4591,7 @@ else:
                     lookback_days=int(audit_days),
                     forward_days=int(forward_days),
                     include_watch=bool(include_watch),
+                    order_valid_days=int(order_valid_days),
                 )
                 st.session_state["audit_df"] = audit_df
                 st.session_state["audit_summary"] = audit_summary
@@ -4459,16 +4612,17 @@ else:
 
                 st.markdown("### כל הסיגנלים ומה קרה אחריהם")
                 main_cols = [
-                    "Signal Date", "Ticker", "State", "Action", "Category", "Primary Driver", "Driver Alignment", "Priced-In Risk",
-                    "Current", "Buy Trigger", "Stop", "Target 8%", "Risk %", "RR 8%", "Breakout Score",
-                    "Triggered", "Outcome", "Forward Close %", "MFE %", "MAE %", "Hit 8%", "Hit Stop", "Why"
+                    "Decision Date", "Data As Of", "Ticker", "State", "Action", "Category", "Primary Driver", "Driver Alignment", "Priced-In Risk",
+                    "Current As Of Prev Close", "Buy Trigger", "Stop", "Quick Target 4.5%", "Target 8%", "Target 12%", "Risk %", "RR 8%", "Breakout Score",
+                    "Actionable Trade", "Order Filled", "Entry Date", "Entry Price", "Exit Date", "Exit Price", "Exit Reason", "Trade Return %",
+                    "Forward Close %", "MFE %", "MAE %", "Hit Target", "Hit 12%", "Hit Stop", "Audit Note", "Why"
                 ]
                 main_cols = unique_existing_columns(main_cols, audit_df)
                 st.dataframe(audit_df[main_cols], use_container_width=True, hide_index=True, height=520, column_config=get_column_config())
 
                 st.markdown("### כישלונות לבדיקה ידנית")
                 fails = audit_df[
-                    audit_df["Outcome"].astype(str).isin(["STOP BEFORE TARGET", "OPEN / NO HIT", "NOT TRIGGERED"])
+                    audit_df["Exit Reason"].astype(str).isin(["STOP", "STOP FIRST (DAILY AMBIGUOUS)", "TIME EXIT / FORWARD CLOSE", "ORDER NOT FILLED"])
                 ].copy()
                 if fails.empty:
                     st.success("לא נמצאו כישלונות ברורים לפי ההגדרה הזו.")
